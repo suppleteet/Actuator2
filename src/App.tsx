@@ -47,6 +47,14 @@ function normalizePositiveScale(scale: Vec3): Vec3 {
   };
 }
 
+function composeMatrix(position: Vec3, rotation: Quat, scale: Vec3): Matrix4 {
+  return new Matrix4().compose(
+    new Vector3(position.x, position.y, position.z),
+    new Quaternion(rotation.x, rotation.y, rotation.z, rotation.w),
+    new Vector3(scale.x, scale.y, scale.z),
+  );
+}
+
 const ROOT_ACTUATOR: ActuatorEntity = {
   id: "act_root",
   parentId: null,
@@ -465,28 +473,56 @@ export default function App() {
     nextActuatorIndexRef.current += 1;
 
     const id = `act_${index.toString().padStart(4, "0")}`;
-    const row = Math.floor((index - 1) / 6);
-    const column = (index - 1) % 6;
-
-    const actuator: ActuatorEntity = {
-      id,
-      parentId: ROOT_ACTUATOR.id,
-      type: "custom",
-      shape: "box",
-      transform: {
-        position: {
-          x: -1.5 + column * 0.6,
-          y: 0.6 + row * 0.32,
-          z: -0.35 - row * 0.2,
-        },
-        rotation: { x: 0, y: 0, z: 0, w: 1 },
-        scale: { x: 1, y: 1, z: 1 },
-      },
-      size: { x: 0.4, y: 0.4, z: 0.4 },
-    };
 
     commitEditorChange((previous) => ({
-      actuators: [...previous.actuators, actuator],
+      actuators: (() => {
+        const parent =
+          previous.actuators.find((actuator) => actuator.id === previous.selectedActuatorId) ??
+          previous.actuators.find((actuator) => actuator.id === ROOT_ACTUATOR.id) ??
+          ROOT_ACTUATOR;
+
+        const parentRotation = new Quaternion(
+          parent.transform.rotation.x,
+          parent.transform.rotation.y,
+          parent.transform.rotation.z,
+          parent.transform.rotation.w,
+        );
+        const parentPosition = new Vector3(
+          parent.transform.position.x,
+          parent.transform.position.y,
+          parent.transform.position.z,
+        );
+
+        const childSize = { x: 0.4, y: 0.4, z: 0.4 };
+        const parentHalfHeight = (parent.size.y * parent.transform.scale.y) / 2;
+        const childHalfHeight = childSize.y / 2;
+        const endOffset = new Vector3(0, parentHalfHeight + childHalfHeight + 0.08, 0).applyQuaternion(parentRotation);
+        const spawnPosition = parentPosition.add(endOffset);
+
+        const actuator: ActuatorEntity = {
+          id,
+          parentId: parent.id,
+          type: "custom",
+          shape: "box",
+          transform: {
+            position: {
+              x: spawnPosition.x,
+              y: spawnPosition.y,
+              z: spawnPosition.z,
+            },
+            rotation: {
+              x: parentRotation.x,
+              y: parentRotation.y,
+              z: parentRotation.z,
+              w: parentRotation.w,
+            },
+            scale: { x: 1, y: 1, z: 1 },
+          },
+          size: childSize,
+        };
+
+        return [...previous.actuators, actuator];
+      })(),
       selectedActuatorId: id,
     }));
   }
@@ -557,9 +593,26 @@ export default function App() {
     const normalizedScale = normalizePositiveScale(scale);
     setEditorState((previous) => ({
       ...previous,
-      actuators: previous.actuators.map((actuator) =>
-        actuator.id === id
-          ? {
+      actuators: (() => {
+        const moved = previous.actuators.find((actuator) => actuator.id === id);
+        if (moved === undefined) return previous.actuators;
+
+        const movedOldMatrix = composeMatrix(moved.transform.position, moved.transform.rotation, moved.transform.scale);
+        const movedNewMatrix = composeMatrix(position, rotation, normalizedScale);
+        const deltaMatrix = movedNewMatrix.clone().multiply(movedOldMatrix.clone().invert());
+
+        function isDescendant(candidateId: string): boolean {
+          let current = previous.actuators.find((actuator) => actuator.id === candidateId);
+          while (current !== undefined && current.parentId !== null) {
+            if (current.parentId === id) return true;
+            current = previous.actuators.find((actuator) => actuator.id === current?.parentId);
+          }
+          return false;
+        }
+
+        return previous.actuators.map((actuator) => {
+          if (actuator.id === id) {
+            return {
               ...actuator,
               transform: {
                 ...actuator.transform,
@@ -567,9 +620,43 @@ export default function App() {
                 rotation: { ...rotation },
                 scale: normalizedScale,
               },
-            }
-          : actuator,
-      ),
+            };
+          }
+
+          if (!isDescendant(actuator.id)) return actuator;
+
+          const childMatrix = composeMatrix(actuator.transform.position, actuator.transform.rotation, actuator.transform.scale);
+          const childNextMatrix = deltaMatrix.clone().multiply(childMatrix);
+
+          const childPosition = new Vector3();
+          const childRotation = new Quaternion();
+          const childScale = new Vector3();
+          childNextMatrix.decompose(childPosition, childRotation, childScale);
+
+          return {
+            ...actuator,
+            transform: {
+              ...actuator.transform,
+              position: {
+                x: childPosition.x,
+                y: childPosition.y,
+                z: childPosition.z,
+              },
+              rotation: {
+                x: childRotation.x,
+                y: childRotation.y,
+                z: childRotation.z,
+                w: childRotation.w,
+              },
+              scale: normalizePositiveScale({
+                x: childScale.x,
+                y: childScale.y,
+                z: childScale.z,
+              }),
+            },
+          };
+        });
+      })(),
     }));
   }
 
