@@ -4,6 +4,7 @@ import { Physics, RigidBody } from "@react-three/rapier";
 import { TransformControls } from "@react-three/drei";
 import { XR, createXRStore, useXR } from "@react-three/xr";
 import { Matrix4, Object3D, Quaternion, Vector3 } from "three";
+import { PlaybackClock, createSyntheticRecording, evaluateClipAtTime, type SyntheticClip } from "./animation/recorder";
 
 const xrStore = createXRStore({
   offerSession: false,
@@ -416,6 +417,17 @@ function SceneContent({
   );
 }
 
+type PlaybackDriverProps = {
+  onStep: (deltaSec: number) => void;
+};
+
+function PlaybackDriver({ onStep }: PlaybackDriverProps) {
+  useFrame((_, delta) => {
+    onStep(delta);
+  });
+  return null;
+}
+
 export default function App() {
   const canUseWebXR = typeof navigator !== "undefined" && "xr" in navigator;
   const createdAtRef = useRef(new Date().toISOString());
@@ -432,6 +444,10 @@ export default function App() {
   const [gizmoMode, setGizmoMode] = useState<GizmoMode>("translate");
   const [gizmoSpace, setGizmoSpace] = useState<"world" | "local">("world");
   const [pivotMode, setPivotMode] = useState<PivotMode>("object");
+  const [syntheticClip, setSyntheticClip] = useState<SyntheticClip | null>(null);
+  const [playbackState, setPlaybackState] = useState<"stopped" | "playing">("stopped");
+  const [playbackTimeSec, setPlaybackTimeSec] = useState(0);
+  const playbackClockRef = useRef<PlaybackClock | null>(null);
   const transformStartSnapshotRef = useRef<EditorState | null>(null);
 
   const actuators = editorState.actuators;
@@ -681,6 +697,74 @@ export default function App() {
     });
   }
 
+  function applyClipAtTime(clip: SyntheticClip, timeSec: number) {
+    const samples = evaluateClipAtTime(clip, timeSec);
+    setEditorState((previous) => ({
+      ...previous,
+      actuators: previous.actuators.map((actuator) => {
+        const sample = samples.get(actuator.id);
+        if (sample === undefined) return actuator;
+        return {
+          ...actuator,
+          transform: {
+            ...actuator.transform,
+            position: { ...sample.position },
+            rotation: { ...sample.rotation },
+            scale: normalizePositiveScale(sample.scale),
+          },
+        };
+      }),
+    }));
+    setPlaybackTimeSec(timeSec);
+  }
+
+  function recordSynthetic() {
+    const clip = createSyntheticRecording(actuators, {
+      fps: 30,
+      durationSec: 4,
+      clipId: "clip_synthetic_001",
+    });
+    setSyntheticClip(clip);
+    playbackClockRef.current = new PlaybackClock(clip.fps, clip.durationSec);
+    setPlaybackState("stopped");
+    applyClipAtTime(clip, 0);
+  }
+
+  function playSynthetic() {
+    if (syntheticClip === null) return;
+    if (playbackClockRef.current === null) {
+      playbackClockRef.current = new PlaybackClock(syntheticClip.fps, syntheticClip.durationSec);
+    }
+    playbackClockRef.current.start();
+    setPlaybackState("playing");
+    setPlaybackTimeSec(0);
+    applyClipAtTime(syntheticClip, 0);
+  }
+
+  function stopSynthetic() {
+    playbackClockRef.current?.stop();
+    setPlaybackState("stopped");
+    setPlaybackTimeSec(0);
+    if (syntheticClip !== null) {
+      applyClipAtTime(syntheticClip, 0);
+    }
+  }
+
+  function onPlaybackStep(deltaSec: number) {
+    if (syntheticClip === null) return;
+    const clock = playbackClockRef.current;
+    if (clock === null || !clock.isPlaying()) return;
+
+    const steppedTimes = clock.tick(deltaSec);
+    for (const timeSec of steppedTimes) {
+      applyClipAtTime(syntheticClip, timeSec);
+    }
+
+    if (!clock.isPlaying()) {
+      setPlaybackState("stopped");
+    }
+  }
+
   const serializedScene = useMemo(() => {
     const sortedActuators = [...actuators].sort((a, b) => a.id.localeCompare(b.id));
     return JSON.stringify(
@@ -717,15 +801,15 @@ export default function App() {
           },
         ],
         playback: {
-          fps: 60,
-          durationSec: 10,
-          activeClipId: null,
+          fps: syntheticClip?.fps ?? 60,
+          durationSec: syntheticClip?.durationSec ?? 10,
+          activeClipId: syntheticClip?.clipId ?? null,
         },
       },
       null,
       2,
     );
-  }, [actuators]);
+  }, [actuators, syntheticClip]);
 
   useEffect(() => {
     function isTypingTarget(target: EventTarget | null) {
@@ -779,7 +863,7 @@ export default function App() {
     <main className="app">
       <header className="app__header">
         <h1>Actuator2 Runtime Bootstrap</h1>
-        <p>I-002: Selection + translate/rotate/scale gizmos with local/world + pivot modes</p>
+        <p>N-001: Recorder stub API + deterministic playback clock service</p>
         <div className="app__actions">
           <button type="button" onClick={enterVR} disabled={!canUseWebXR}>
             Enter VR
@@ -792,6 +876,7 @@ export default function App() {
           ) : (
             <span>Desktop controls: Alt+LMB orbit, Alt+MMB pan, Alt+RMB zoom, Alt+wheel zoom</span>
           )}
+          <span>Playback: {playbackState} @ {playbackTimeSec.toFixed(2)}s</span>
         </div>
       </header>
       <section className="app__viewport">
@@ -808,6 +893,15 @@ export default function App() {
             </button>
             <button type="button" onClick={redo} disabled={redoStackRef.current.length === 0}>
               Redo
+            </button>
+            <button type="button" onClick={recordSynthetic}>
+              Record Synthetic
+            </button>
+            <button type="button" onClick={playSynthetic} disabled={syntheticClip === null}>
+              Play
+            </button>
+            <button type="button" onClick={stopSynthetic} disabled={syntheticClip === null}>
+              Stop
             </button>
           </div>
 
@@ -870,6 +964,7 @@ export default function App() {
         <div className="app__canvas-wrap">
           <Canvas camera={{ position: [2.5, 2.5, 3], fov: 50 }} shadows>
             <XR store={xrStore}>
+              <PlaybackDriver onStep={onPlaybackStep} />
               <DesktopInertialCameraControls blocked={isTransformDragging} invertOrbitX={invertOrbitX} />
               <SceneContent
                 actuators={actuators}

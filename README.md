@@ -16,3 +16,4 @@ Browser-based WebXR migration of the legacy Unity Actuator tool.
 - Runtime bootstrap complete (`R-001`)
 - XR entry + desktop fallback controls complete (`I-001`)
 - Runtime actuator prototype complete (`R-002`)
+- Animation recorder/playback stub complete (`N-001`)
