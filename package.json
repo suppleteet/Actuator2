@@ -1,0 +1,28 @@
+{
+  "name": "actuator2",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@react-three/drei": "^10.7.7",
+    "@react-three/fiber": "^9.3.0",
+    "@react-three/rapier": "^2.1.0",
+    "@react-three/xr": "^6.6.29",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "three": "^0.179.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.1",
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^5.0.0",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.5"
+  }
+}

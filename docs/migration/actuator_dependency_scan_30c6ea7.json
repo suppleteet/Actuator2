@@ -1,0 +1,155 @@
+{
+  "sourceRoot": "c:/Projects/Actuator",
+  "root": "Assets/Actuator",
+  "analyzedAtUtc": "2026-02-26T15:06:00.442Z",
+  "externalGuidReferencedAssets": [
+    {
+      "asset": "Assets/Standard Assets/Utility/DragRigidbody.cs",
+      "referencedBy": [
+        "Assets/Actuator/Resources/XRRig.prefab"
+      ]
+    },
+    {
+      "asset": "Assets/Supercyan Character Pack Animal People Sample/Materials/High Quality/animal_people_wolf_supercyan_material_body.mat",
+      "referencedBy": [
+        "Assets/Actuator/Examples/Scenes/CartoonCatGuy.unity",
+        "Assets/Actuator/Exports/CartoonCatGuy01.prefab"
+      ]
+    },
+    {
+      "asset": "Assets/Supercyan Character Pack Animal People Sample/Materials/High Quality/animal_people_wolf_supercyan_material_head.mat",
+      "referencedBy": [
+        "Assets/Actuator/Examples/Scenes/CartoonCatGuy.unity",
+        "Assets/Actuator/Exports/CartoonCatGuy01.prefab"
+      ]
+    },
+    {
+      "asset": "Assets/Supercyan Character Pack Animal People Sample/Models/animal_people_wolf_1.fbx",
+      "referencedBy": [
+        "Assets/Actuator/Examples/Scenes/CartoonCatGuy.unity"
+      ]
+    },
+    {
+      "asset": "Assets/Tests/Mike/Prefabs/dickhead_combined.prefab",
+      "referencedBy": [
+        "Assets/Actuator/Examples/Scenes/Dickhead.unity"
+      ]
+    },
+    {
+      "asset": "Assets/ThirdParty/DeltaMush/DeltaMushSkinnedMesh.cs",
+      "referencedBy": [
+        "Assets/Actuator/Examples/Scenes/Bruce_with_pasted.unity",
+        "Assets/Actuator/Examples/Scenes/CartoonCatGuy.unity",
+        "Assets/Actuator/Examples/Scenes/Dickhead.unity",
+        "Assets/Actuator/Exports/CartoonCatGuy01.prefab",
+        "Assets/Actuator/Exports/TestExport01.prefab",
+        "Assets/Actuator/Exports/TestExport01_just_mesh.prefab",
+        "Assets/Actuator/Resources/Meshes/Bruce_Mesh.prefab",
+        "Assets/Actuator/Resources/Meshes/Chad_Mesh.prefab",
+        "Assets/Actuator/Resources/Meshes/EndBoss_Mesh.prefab",
+        "Assets/Actuator/Resources/Meshes/GodCat.prefab",
+        "Assets/Actuator/Resources/Meshes/GodCat_Mesh.prefab"
+      ]
+    },
+    {
+      "asset": "Assets/ThirdParty/DeltaMush/DuctTapeToStandard/DeltaMushStandard.shader",
+      "referencedBy": [
+        "Assets/Actuator/Examples/Scenes/Bruce_with_pasted.unity",
+        "Assets/Actuator/Examples/Scenes/CartoonCatGuy.unity",
+        "Assets/Actuator/Examples/Scenes/Dickhead.unity",
+        "Assets/Actuator/Exports/CartoonCatGuy01.prefab",
+        "Assets/Actuator/Exports/TestExport01.prefab",
+        "Assets/Actuator/Exports/TestExport01_just_mesh.prefab",
+        "Assets/Actuator/Resources/Meshes/Bruce_Mesh.prefab",
+        "Assets/Actuator/Resources/Meshes/Chad_Mesh.prefab",
+        "Assets/Actuator/Resources/Meshes/EndBoss_Mesh.prefab",
+        "Assets/Actuator/Resources/Meshes/GodCat.prefab",
+        "Assets/Actuator/Resources/Meshes/GodCat_Mesh.prefab"
+      ]
+    },
+    {
+      "asset": "Assets/ThirdParty/DeltaMush/Resources/DeltaMush.compute",
+      "referencedBy": [
+        "Assets/Actuator/Examples/Scenes/Bruce_with_pasted.unity",
+        "Assets/Actuator/Examples/Scenes/CartoonCatGuy.unity",
+        "Assets/Actuator/Exports/CartoonCatGuy01.prefab",
+        "Assets/Actuator/Exports/TestExport01.prefab",
+        "Assets/Actuator/Exports/TestExport01_just_mesh.prefab"
+      ]
+    }
+  ],
+  "externalGuidReferencedAssetsByTopFolder": [
+    {
+      "folder": "Assets/ThirdParty",
+      "count": 3
+    },
+    {
+      "folder": "Assets/Supercyan Character Pack Animal People Sample",
+      "count": 3
+    },
+    {
+      "folder": "Assets/Tests",
+      "count": 1
+    },
+    {
+      "folder": "Assets/Standard Assets",
+      "count": 1
+    }
+  ],
+  "externalCodeNamespaces": [
+    "CjLib",
+    "SimpleFileBrowser",
+    "Sirenix.OdinInspector"
+  ],
+  "resourcesLoadPaths": [
+    {
+      "loadPath": "Actuator",
+      "callers": [
+        "Assets/Actuator/Scripts/Objects/ActuatorRigEditor.cs"
+      ],
+      "matches": []
+    },
+    {
+      "loadPath": "ActuatorApplication",
+      "callers": [
+        "Assets/Actuator/Scripts/Startup.cs"
+      ],
+      "matches": []
+    },
+    {
+      "loadPath": "Background",
+      "callers": [
+        "Assets/Actuator/Scripts/Startup.cs"
+      ],
+      "matches": []
+    },
+    {
+      "loadPath": "SceneLights",
+      "callers": [
+        "Assets/Actuator/Scripts/Startup.cs"
+      ],
+      "matches": []
+    },
+    {
+      "loadPath": "Timeline",
+      "callers": [
+        "Assets/Actuator/Scripts/Startup.cs"
+      ],
+      "matches": []
+    },
+    {
+      "loadPath": "Tools/",
+      "callers": [
+        "Assets/Actuator/Scripts/Tools/ToolSwitcher.cs"
+      ],
+      "matches": []
+    },
+    {
+      "loadPath": "XRRig",
+      "callers": [
+        "Assets/Actuator/Scripts/Startup.cs"
+      ],
+      "matches": []
+    }
+  ]
+}
