@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { Physics, RigidBody } from "@react-three/rapier";
+import { TransformControls } from "@react-three/drei";
 import { XR, createXRStore, useXR } from "@react-three/xr";
-import { Euler, Vector3 } from "three";
+import { Matrix4, Object3D, Quaternion, Vector3 } from "three";
 
 const xrStore = createXRStore({
   offerSession: false,
@@ -12,6 +13,8 @@ const xrStore = createXRStore({
 
 type DragMode = "orbit" | "pan" | "zoom" | null;
 type ActuatorShape = "capsule" | "sphere" | "box";
+type GizmoMode = "select" | "translate" | "rotate" | "scale";
+type PivotMode = "object" | "world";
 
 type Vec3 = { x: number; y: number; z: number };
 type Quat = { x: number; y: number; z: number; w: number };
@@ -28,10 +31,21 @@ type ActuatorEntity = {
   };
   size: Vec3;
 };
+
 type EditorState = {
   actuators: ActuatorEntity[];
   selectedActuatorId: string | null;
 };
+
+const MIN_SCALE = 0.02;
+
+function normalizePositiveScale(scale: Vec3): Vec3 {
+  return {
+    x: Math.max(Math.abs(scale.x), MIN_SCALE),
+    y: Math.max(Math.abs(scale.y), MIN_SCALE),
+    z: Math.max(Math.abs(scale.z), MIN_SCALE),
+  };
+}
 
 const ROOT_ACTUATOR: ActuatorEntity = {
   id: "act_root",
@@ -46,7 +60,12 @@ const ROOT_ACTUATOR: ActuatorEntity = {
   size: { x: 0.35, y: 0.8, z: 0.35 },
 };
 
-function DesktopInertialCameraControls() {
+type DesktopInertialCameraControlsProps = {
+  blocked: boolean;
+  invertOrbitX: boolean;
+};
+
+function DesktopInertialCameraControls({ blocked, invertOrbitX }: DesktopInertialCameraControlsProps) {
   const { camera, gl } = useThree();
   const mode = useXR((state) => state.mode);
   const isInXR = mode !== null;
@@ -76,7 +95,7 @@ function DesktopInertialCameraControls() {
     }
 
     function onPointerDown(event: PointerEvent) {
-      if (isInXR) return;
+      if (isInXR || blocked) return;
       if (!event.altKey) return;
 
       if (event.button === 0) dragModeRef.current = "orbit";
@@ -90,7 +109,7 @@ function DesktopInertialCameraControls() {
     }
 
     function onPointerMove(event: PointerEvent) {
-      if (isInXR || dragModeRef.current === null) return;
+      if (isInXR || blocked || dragModeRef.current === null) return;
       if (!event.altKey) return;
 
       const dx = event.clientX - lastPointerRef.current.x;
@@ -99,7 +118,8 @@ function DesktopInertialCameraControls() {
       lastPointerRef.current.y = event.clientY;
 
       if (dragModeRef.current === "orbit") {
-        velocityRef.current.theta -= dx * 0.022;
+        const orbitXSign = invertOrbitX ? -1 : 1;
+        velocityRef.current.theta -= dx * 0.022 * orbitXSign;
         velocityRef.current.phi -= dy * 0.022;
       } else if (dragModeRef.current === "pan") {
         const panImpulse = radiusRef.current * 0.007;
@@ -120,7 +140,7 @@ function DesktopInertialCameraControls() {
     }
 
     function onWheel(event: WheelEvent) {
-      if (isInXR) return;
+      if (isInXR || blocked) return;
       if (!event.altKey) return;
       event.preventDefault();
       const modeScale = event.deltaMode === 1 ? 14 : event.deltaMode === 2 ? 120 : 1;
@@ -143,10 +163,10 @@ function DesktopInertialCameraControls() {
       dom.removeEventListener("pointercancel", onPointerUp);
       dom.removeEventListener("wheel", onWheel);
     };
-  }, [gl, isInXR]);
+  }, [blocked, gl, invertOrbitX, isInXR]);
 
   useFrame((_, delta) => {
-    if (isInXR) return;
+    if (isInXR || blocked) return;
 
     if (!initializedRef.current) {
       const offset = camera.position.clone().sub(targetRef.current);
@@ -202,10 +222,61 @@ function DesktopInertialCameraControls() {
 type SceneContentProps = {
   actuators: ActuatorEntity[];
   selectedActuatorId: string | null;
+  selectedObject: Object3D | null;
+  gizmoMode: GizmoMode;
+  gizmoSpace: "world" | "local";
+  pivotMode: PivotMode;
+  isTransformDragging: boolean;
   onSelectActuator: (id: string) => void;
+  onClearSelection: () => void;
+  onActuatorRef: (id: string, object: Object3D | null) => void;
+  onTransformStart: () => void;
+  onTransformChange: (id: string, position: Vec3, rotation: Quat, scale: Vec3) => void;
+  onTransformEnd: () => void;
 };
 
-function SceneContent({ actuators, selectedActuatorId, onSelectActuator }: SceneContentProps) {
+function SceneContent({
+  actuators,
+  selectedActuatorId,
+  selectedObject,
+  gizmoMode,
+  gizmoSpace,
+  pivotMode,
+  isTransformDragging,
+  onSelectActuator,
+  onClearSelection,
+  onActuatorRef,
+  onTransformStart,
+  onTransformChange,
+  onTransformEnd,
+}: SceneContentProps) {
+  const xrMode = useXR((state) => state.mode);
+  const isInXR = xrMode !== null;
+  const pivotObjectRef = useRef<Object3D>(new Object3D());
+  const dragStartSelectedMatrixRef = useRef(new Matrix4());
+  const dragStartPivotMatrixRef = useRef(new Matrix4());
+  const dragActuatorIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const pivotObject = pivotObjectRef.current;
+    if (isTransformDragging) return;
+
+    if (pivotMode === "world") {
+      pivotObject.position.set(0, 0, 0);
+      pivotObject.quaternion.set(0, 0, 0, 1);
+      pivotObject.scale.set(1, 1, 1);
+      pivotObject.updateMatrixWorld(true);
+      return;
+    }
+
+    if (selectedObject !== null) {
+      pivotObject.position.copy(selectedObject.position);
+      pivotObject.quaternion.copy(selectedObject.quaternion);
+      pivotObject.scale.copy(selectedObject.scale);
+      pivotObject.updateMatrixWorld(true);
+    }
+  }, [isTransformDragging, pivotMode, selectedObject]);
+
   function getGeometry(shape: ActuatorShape, size: Vec3) {
     if (shape === "sphere") return <sphereGeometry args={[Math.max(size.x, size.y, size.z) * 0.5, 18, 14]} />;
     if (shape === "capsule") return <capsuleGeometry args={[Math.max(size.x, size.z) * 0.5, size.y, 8, 14]} />;
@@ -227,12 +298,17 @@ function SceneContent({ actuators, selectedActuatorId, onSelectActuator }: Scene
           return (
             <mesh
               key={actuator.id}
+              ref={(object) => onActuatorRef(actuator.id, object)}
               position={[actuator.transform.position.x, actuator.transform.position.y, actuator.transform.position.z]}
-              rotation={new Euler(
-                actuator.transform.rotation.x,
-                actuator.transform.rotation.y,
-                actuator.transform.rotation.z,
-              )}
+              quaternion={
+                new Quaternion(
+                  actuator.transform.rotation.x,
+                  actuator.transform.rotation.y,
+                  actuator.transform.rotation.z,
+                  actuator.transform.rotation.w,
+                )
+              }
+              scale={[actuator.transform.scale.x, actuator.transform.scale.y, actuator.transform.scale.z]}
               onClick={(event) => {
                 event.stopPropagation();
                 onSelectActuator(actuator.id);
@@ -245,8 +321,84 @@ function SceneContent({ actuators, selectedActuatorId, onSelectActuator }: Scene
           );
         })}
 
+        {selectedActuatorId !== null && selectedObject !== null && !isInXR && gizmoMode !== "select" ? (
+          <TransformControls
+            mode={gizmoMode}
+            space={gizmoSpace}
+            size={0.75}
+            object={pivotMode === "object" ? selectedObject : pivotObjectRef.current}
+            onMouseDown={() => {
+              dragActuatorIdRef.current = selectedActuatorId;
+              selectedObject.updateMatrixWorld(true);
+              dragStartSelectedMatrixRef.current.copy(selectedObject.matrixWorld);
+
+              const pivotTarget = pivotMode === "object" ? selectedObject : pivotObjectRef.current;
+              pivotTarget.updateMatrixWorld(true);
+              dragStartPivotMatrixRef.current.copy(pivotTarget.matrixWorld);
+              onTransformStart();
+            }}
+            onMouseUp={() => {
+              dragActuatorIdRef.current = null;
+              onTransformEnd();
+            }}
+            onObjectChange={() => {
+              const actuatorId = dragActuatorIdRef.current;
+              if (actuatorId === null) return;
+
+              if (pivotMode === "object") {
+                onTransformChange(
+                  actuatorId,
+                  {
+                    x: selectedObject.position.x,
+                    y: selectedObject.position.y,
+                    z: selectedObject.position.z,
+                  },
+                  {
+                    x: selectedObject.quaternion.x,
+                    y: selectedObject.quaternion.y,
+                    z: selectedObject.quaternion.z,
+                    w: selectedObject.quaternion.w,
+                  },
+                  {
+                    x: selectedObject.scale.x,
+                    y: selectedObject.scale.y,
+                    z: selectedObject.scale.z,
+                  },
+                );
+                return;
+              }
+
+              const pivotObject = pivotObjectRef.current;
+              pivotObject.updateMatrixWorld(true);
+
+              const startPivotInverse = dragStartPivotMatrixRef.current.clone().invert();
+              const deltaMatrix = pivotObject.matrixWorld.clone().multiply(startPivotInverse);
+              const nextSelectedMatrix = deltaMatrix.multiply(dragStartSelectedMatrixRef.current.clone());
+
+              const nextPosition = new Vector3();
+              const nextQuaternion = new Quaternion();
+              const nextScale = new Vector3();
+              nextSelectedMatrix.decompose(nextPosition, nextQuaternion, nextScale);
+
+              onTransformChange(
+                actuatorId,
+                { x: nextPosition.x, y: nextPosition.y, z: nextPosition.z },
+                { x: nextQuaternion.x, y: nextQuaternion.y, z: nextQuaternion.z, w: nextQuaternion.w },
+                { x: nextScale.x, y: nextScale.y, z: nextScale.z },
+              );
+            }}
+          />
+        ) : null}
+
         <RigidBody type="fixed" colliders="cuboid">
-          <mesh position={[0, -0.1, 0]} receiveShadow>
+          <mesh
+            position={[0, -0.1, 0]}
+            receiveShadow
+            onClick={(event) => {
+              event.stopPropagation();
+              onClearSelection();
+            }}
+          >
             <boxGeometry args={[8, 0.2, 8]} />
             <meshStandardMaterial color="#a8b8c8" />
           </mesh>
@@ -260,14 +412,27 @@ export default function App() {
   const canUseWebXR = typeof navigator !== "undefined" && "xr" in navigator;
   const createdAtRef = useRef(new Date().toISOString());
   const nextActuatorIndexRef = useRef(1);
+  const actuatorObjectRefs = useRef<Record<string, Object3D | null>>({});
   const undoStackRef = useRef<EditorState[]>([]);
   const redoStackRef = useRef<EditorState[]>([]);
   const [editorState, setEditorState] = useState<EditorState>({
     actuators: [ROOT_ACTUATOR],
     selectedActuatorId: ROOT_ACTUATOR.id,
   });
+  const [isTransformDragging, setIsTransformDragging] = useState(false);
+  const [invertOrbitX, setInvertOrbitX] = useState(false);
+  const [gizmoMode, setGizmoMode] = useState<GizmoMode>("translate");
+  const [gizmoSpace, setGizmoSpace] = useState<"world" | "local">("world");
+  const [pivotMode, setPivotMode] = useState<PivotMode>("object");
+  const transformStartSnapshotRef = useRef<EditorState | null>(null);
+
   const actuators = editorState.actuators;
   const selectedActuatorId = editorState.selectedActuatorId;
+  const selectedObject = selectedActuatorId !== null ? (actuatorObjectRefs.current[selectedActuatorId] ?? null) : null;
+
+  function setActuatorObjectRef(id: string, object: Object3D | null) {
+    actuatorObjectRefs.current[id] = object;
+  }
 
   function cloneEditorState(state: EditorState): EditorState {
     return {
@@ -360,6 +525,16 @@ export default function App() {
     });
   }
 
+  function clearSelection() {
+    commitEditorChange((previous) => {
+      if (previous.selectedActuatorId === null) return previous;
+      return {
+        actuators: previous.actuators,
+        selectedActuatorId: null,
+      };
+    });
+  }
+
   function undo() {
     setEditorState((previous) => {
       const snapshot = undoStackRef.current.pop();
@@ -375,6 +550,47 @@ export default function App() {
       if (snapshot === undefined) return previous;
       undoStackRef.current.push(cloneEditorState(previous));
       return snapshot;
+    });
+  }
+
+  function applyTransformChange(id: string, position: Vec3, rotation: Quat, scale: Vec3) {
+    const normalizedScale = normalizePositiveScale(scale);
+    setEditorState((previous) => ({
+      ...previous,
+      actuators: previous.actuators.map((actuator) =>
+        actuator.id === id
+          ? {
+              ...actuator,
+              transform: {
+                ...actuator.transform,
+                position: { ...position },
+                rotation: { ...rotation },
+                scale: normalizedScale,
+              },
+            }
+          : actuator,
+      ),
+    }));
+  }
+
+  function beginTransformChange() {
+    if (transformStartSnapshotRef.current !== null) return;
+    transformStartSnapshotRef.current = cloneEditorState(editorState);
+    setIsTransformDragging(true);
+  }
+
+  function endTransformChange() {
+    setIsTransformDragging(false);
+    const startSnapshot = transformStartSnapshotRef.current;
+    transformStartSnapshotRef.current = null;
+    if (startSnapshot === null) return;
+
+    setEditorState((current) => {
+      const changed = JSON.stringify(startSnapshot.actuators) !== JSON.stringify(current.actuators);
+      if (!changed) return current;
+      undoStackRef.current.push(startSnapshot);
+      redoStackRef.current = [];
+      return current;
     });
   }
 
@@ -434,20 +650,30 @@ export default function App() {
     function onKeyDown(event: KeyboardEvent) {
       if (isTypingTarget(event.target)) return;
 
-      const isPrimaryModifier = event.ctrlKey || event.metaKey;
-      if (!isPrimaryModifier) return;
-
       const key = event.key.toLowerCase();
-      if (key === "z" && event.shiftKey) {
-        event.preventDefault();
-        redo();
-      } else if (key === "z") {
-        event.preventDefault();
-        undo();
-      } else if (key === "y") {
-        event.preventDefault();
-        redo();
+      const isPrimaryModifier = event.ctrlKey || event.metaKey;
+      if (isPrimaryModifier) {
+        if (key === "z" && event.shiftKey) {
+          event.preventDefault();
+          redo();
+          return;
+        }
+        if (key === "z") {
+          event.preventDefault();
+          undo();
+          return;
+        }
+        if (key === "y") {
+          event.preventDefault();
+          redo();
+          return;
+        }
       }
+
+      if (key === "q") setGizmoMode("select");
+      if (key === "w") setGizmoMode("translate");
+      if (key === "e") setGizmoMode("rotate");
+      if (key === "r") setGizmoMode("scale");
     }
 
     window.addEventListener("keydown", onKeyDown);
@@ -466,15 +692,18 @@ export default function App() {
     <main className="app">
       <header className="app__header">
         <h1>Actuator2 Runtime Bootstrap</h1>
-        <p>R-002: In-memory actuator create/select/delete with stable IDs and schema serialization</p>
+        <p>I-002: Selection + translate/rotate/scale gizmos with local/world + pivot modes</p>
         <div className="app__actions">
           <button type="button" onClick={enterVR} disabled={!canUseWebXR}>
             Enter VR
           </button>
+          <button type="button" onClick={() => setInvertOrbitX((previous) => !previous)}>
+            Invert X Drag: {invertOrbitX ? "On" : "Off"}
+          </button>
           {!canUseWebXR ? (
             <span>WebXR unavailable in this browser</span>
           ) : (
-            <span>Desktop controls (Maya-style): Alt+LMB orbit, Alt+MMB pan, Alt+RMB zoom, Alt+wheel zoom</span>
+            <span>Desktop controls: Alt+LMB orbit, Alt+MMB pan, Alt+RMB zoom, Alt+wheel zoom</span>
           )}
         </div>
       </header>
@@ -494,6 +723,39 @@ export default function App() {
               Redo
             </button>
           </div>
+
+          <div className="app__panel-tools">
+            <strong>Tools</strong>
+            <div className="app__tool-row">
+              <button type="button" className={gizmoMode === "select" ? "is-selected" : ""} onClick={() => setGizmoMode("select")}>
+                Select (Q)
+              </button>
+              <button type="button" className={gizmoMode === "translate" ? "is-selected" : ""} onClick={() => setGizmoMode("translate")}>
+                Move (W)
+              </button>
+              <button type="button" className={gizmoMode === "rotate" ? "is-selected" : ""} onClick={() => setGizmoMode("rotate")}>
+                Rotate (E)
+              </button>
+              <button type="button" className={gizmoMode === "scale" ? "is-selected" : ""} onClick={() => setGizmoMode("scale")}>
+                Scale (R)
+              </button>
+            </div>
+            <div className="app__tool-row">
+              <label htmlFor="space-select">Orientation</label>
+              <select id="space-select" value={gizmoSpace} onChange={(event) => setGizmoSpace(event.target.value as "world" | "local") }>
+                <option value="world">World</option>
+                <option value="local">Local</option>
+              </select>
+            </div>
+            <div className="app__tool-row">
+              <label htmlFor="pivot-select">Pivot</label>
+              <select id="pivot-select" value={pivotMode} onChange={(event) => setPivotMode(event.target.value as PivotMode)}>
+                <option value="object">Object Center</option>
+                <option value="world">World Origin</option>
+              </select>
+            </div>
+          </div>
+
           <div className="app__panel-status">
             <strong>Selected:</strong> {selectedActuatorId ?? "none"}
           </div>
@@ -521,11 +783,21 @@ export default function App() {
         <div className="app__canvas-wrap">
           <Canvas camera={{ position: [2.5, 2.5, 3], fov: 50 }} shadows>
             <XR store={xrStore}>
-              <DesktopInertialCameraControls />
+              <DesktopInertialCameraControls blocked={isTransformDragging} invertOrbitX={invertOrbitX} />
               <SceneContent
                 actuators={actuators}
                 selectedActuatorId={selectedActuatorId}
+                selectedObject={selectedObject}
+                gizmoMode={gizmoMode}
+                gizmoSpace={gizmoSpace}
+                pivotMode={pivotMode}
+                isTransformDragging={isTransformDragging}
                 onSelectActuator={selectActuator}
+                onClearSelection={clearSelection}
+                onActuatorRef={setActuatorObjectRef}
+                onTransformStart={beginTransformChange}
+                onTransformChange={applyTransformChange}
+                onTransformEnd={endTransformChange}
               />
             </XR>
           </Canvas>
