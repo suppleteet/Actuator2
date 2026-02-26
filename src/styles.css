@@ -149,4 +149,13 @@ body,
 
 .app__canvas-wrap {
   min-width: 0;
+  position: relative;
+}
+
+.app__marquee {
+  position: absolute;
+  border: 1px solid #2f7fd1;
+  background: rgba(47, 127, 209, 0.14);
+  pointer-events: none;
+  z-index: 10;
 }

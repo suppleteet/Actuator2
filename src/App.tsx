@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { Canvas, useFrame, useLoader, useThree } from "@react-three/fiber";
 import { Physics, RigidBody } from "@react-three/rapier";
 import { TransformControls } from "@react-three/drei";
 import { XR, createXRStore, useXR } from "@react-three/xr";
-import { Matrix4, Object3D, Quaternion, Vector3 } from "three";
+import { BufferGeometry, DoubleSide, Matrix4, Mesh, Object3D, Quaternion, SRGBColorSpace, SkinnedMesh, TextureLoader, Vector3 } from "three";
+import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
 import { PlaybackClock, createSyntheticRecording, evaluateClipAtTime, type SyntheticClip } from "./animation/recorder";
+import { buildFocusRequestFromActuators, type FocusRequest } from "./interaction/focusFraming";
 
 const xrStore = createXRStore({
   offerSession: false,
@@ -36,6 +38,7 @@ type ActuatorEntity = {
 type EditorState = {
   actuators: ActuatorEntity[];
   selectedActuatorId: string | null;
+  selectedActuatorIds: string[];
 };
 
 const MIN_SCALE = 0.02;
@@ -72,9 +75,11 @@ const ROOT_ACTUATOR: ActuatorEntity = {
 type DesktopInertialCameraControlsProps = {
   blocked: boolean;
   invertOrbitX: boolean;
+  focusRequest: FocusRequest | null;
+  focusNonce: number;
 };
 
-function DesktopInertialCameraControls({ blocked, invertOrbitX }: DesktopInertialCameraControlsProps) {
+function DesktopInertialCameraControls({ blocked, invertOrbitX, focusRequest, focusNonce }: DesktopInertialCameraControlsProps) {
   const { camera, gl } = useThree();
   const mode = useXR((state) => state.mode);
   const isInXR = mode !== null;
@@ -95,6 +100,22 @@ function DesktopInertialCameraControls({ blocked, invertOrbitX }: DesktopInertia
     panY: 0,
     zoom: 0,
   });
+  const desiredTargetRef = useRef<Vector3 | null>(null);
+  const desiredRadiusRef = useRef<number | null>(null);
+  const focusingRef = useRef(false);
+
+  useEffect(() => {
+    if (focusRequest === null) return;
+
+    const fovDeg = (camera as any).fov ?? 50;
+    const fovRad = (fovDeg * Math.PI) / 180;
+    const safeSin = Math.max(Math.sin(fovRad * 0.5), 0.2);
+    const fitDistance = Math.max((focusRequest.fitRadius * 1.35) / safeSin, 0.8);
+
+    desiredTargetRef.current = new Vector3(focusRequest.center.x, focusRequest.center.y, focusRequest.center.z);
+    desiredRadiusRef.current = fitDistance;
+    focusingRef.current = true;
+  }, [camera, focusNonce, focusRequest]);
 
   useEffect(() => {
     const dom = gl.domElement;
@@ -199,6 +220,18 @@ function DesktopInertialCameraControls({ blocked, invertOrbitX }: DesktopInertia
     radiusRef.current += velocity.zoom * delta * followGain;
     radiusRef.current = Math.min(Math.max(radiusRef.current, 0.5), 80);
 
+    if (focusingRef.current && desiredTargetRef.current !== null && desiredRadiusRef.current !== null) {
+      const focusLerp = 1 - Math.exp(-13 * delta);
+      targetRef.current.lerp(desiredTargetRef.current, focusLerp);
+      radiusRef.current = radiusRef.current + (desiredRadiusRef.current - radiusRef.current) * focusLerp;
+
+      const targetDistance = targetRef.current.distanceTo(desiredTargetRef.current);
+      const radiusDistance = Math.abs(radiusRef.current - desiredRadiusRef.current);
+      if (targetDistance < 0.01 && radiusDistance < 0.01) {
+        focusingRef.current = false;
+      }
+    }
+
     const forward = new Vector3();
     camera.getWorldDirection(forward);
     const right = new Vector3().crossVectors(forward, camera.up).normalize();
@@ -223,6 +256,15 @@ function DesktopInertialCameraControls({ blocked, invertOrbitX }: DesktopInertia
     velocity.panX *= panDamping;
     velocity.panY *= panDamping;
     velocity.zoom *= zoomDamping;
+
+    if (focusingRef.current) {
+      const focusVelocityDamping = Math.exp(-24 * delta);
+      velocity.theta *= focusVelocityDamping;
+      velocity.phi *= focusVelocityDamping;
+      velocity.panX *= focusVelocityDamping;
+      velocity.panY *= focusVelocityDamping;
+      velocity.zoom *= focusVelocityDamping;
+    }
   });
 
   return null;
@@ -231,6 +273,7 @@ function DesktopInertialCameraControls({ blocked, invertOrbitX }: DesktopInertia
 type SceneContentProps = {
   actuators: ActuatorEntity[];
   selectedActuatorId: string | null;
+  selectedActuatorIds: string[];
   selectedObject: Object3D | null;
   gizmoMode: GizmoMode;
   gizmoSpace: "world" | "local";
@@ -244,9 +287,54 @@ type SceneContentProps = {
   onTransformEnd: () => void;
 };
 
+function ChadReferenceMesh() {
+  const chadSource = useLoader(FBXLoader, "/assets/chad/Chad.fbx");
+  const colorMap = useLoader(TextureLoader, "/assets/chad/Textures/chad_Col.png");
+  const normalMap = useLoader(TextureLoader, "/assets/chad/Textures/chad_Norm.png");
+  const roughnessMap = useLoader(TextureLoader, "/assets/chad/Textures/chad_Pbr.png");
+
+  const chadMeshGeometry = useMemo(() => {
+    let geometry: BufferGeometry | null = null;
+    chadSource.traverse((object) => {
+      if (geometry !== null) return;
+      if ((object as SkinnedMesh).isSkinnedMesh) {
+        geometry = (object as SkinnedMesh).geometry.clone();
+        return;
+      }
+      if ((object as Mesh).isMesh) {
+        geometry = (object as Mesh).geometry.clone();
+      }
+    });
+    return geometry;
+  }, [chadSource]);
+
+  useEffect(() => {
+    colorMap.colorSpace = SRGBColorSpace;
+    colorMap.needsUpdate = true;
+  }, [colorMap]);
+
+  if (chadMeshGeometry === null) return null;
+
+  const ignoreRaycast = () => {};
+
+  return (
+    <mesh
+      geometry={chadMeshGeometry}
+      scale={[0.01, 0.01, 0.01]}
+      position={[0, 0.02, 0]}
+      castShadow
+      receiveShadow
+      raycast={ignoreRaycast}
+    >
+      <meshStandardMaterial map={colorMap} normalMap={normalMap} roughnessMap={roughnessMap} roughness={1} metalness={0} />
+    </mesh>
+  );
+}
+
 function SceneContent({
   actuators,
   selectedActuatorId,
+  selectedActuatorIds,
   selectedObject,
   gizmoMode,
   gizmoSpace,
@@ -261,7 +349,9 @@ function SceneContent({
 }: SceneContentProps) {
   const xrMode = useXR((state) => state.mode);
   const isInXR = xrMode !== null;
+  const selectedIdSet = useMemo(() => new Set(selectedActuatorIds), [selectedActuatorIds]);
   const pivotObjectRef = useRef<Object3D>(new Object3D());
+  const transformControlsRef = useRef<any>(null);
   const dragStartSelectedMatrixRef = useRef(new Matrix4());
   const dragStartPivotMatrixRef = useRef(new Matrix4());
   const dragActuatorIdRef = useRef<string | null>(null);
@@ -286,6 +376,30 @@ function SceneContent({
     }
   }, [isTransformDragging, pivotMode, selectedObject]);
 
+  useEffect(() => {
+    const controls = transformControlsRef.current;
+    if (controls === null || controls === undefined) return;
+
+    controls.traverse((object: Object3D) => {
+      const mesh = object as Mesh;
+      if (!mesh.isMesh) return;
+
+      const material = mesh.material;
+      if (Array.isArray(material)) {
+        for (const entry of material) {
+          entry.side = DoubleSide;
+          entry.needsUpdate = true;
+        }
+        return;
+      }
+
+      if (material !== undefined && material !== null) {
+        material.side = DoubleSide;
+        material.needsUpdate = true;
+      }
+    });
+  }, [gizmoMode, gizmoSpace, pivotMode, selectedActuatorId]);
+
   function getGeometry(shape: ActuatorShape, size: Vec3) {
     if (shape === "sphere") return <sphereGeometry args={[Math.max(size.x, size.y, size.z) * 0.5, 18, 14]} />;
     if (shape === "capsule") return <capsuleGeometry args={[Math.max(size.x, size.z) * 0.5, size.y, 8, 14]} />;
@@ -297,10 +411,11 @@ function SceneContent({
       <color attach="background" args={["#d9ecff"]} />
       <ambientLight intensity={0.6} />
       <directionalLight position={[4, 6, 3]} intensity={1.1} />
+      <ChadReferenceMesh />
 
       <Physics gravity={[0, -9.81, 0]}>
         {actuators.map((actuator) => {
-          const isSelected = selectedActuatorId === actuator.id;
+          const isSelected = selectedIdSet.has(actuator.id);
           const isRoot = actuator.id === "act_root";
           const color = isSelected ? "#ff6a3d" : isRoot ? "#28a26a" : "#2f7fd1";
 
@@ -332,6 +447,7 @@ function SceneContent({
 
         {selectedActuatorId !== null && selectedObject !== null && !isInXR && gizmoMode !== "select" ? (
           <TransformControls
+            ref={transformControlsRef}
             mode={gizmoMode}
             space={gizmoSpace}
             size={0.75}
@@ -433,17 +549,29 @@ export default function App() {
   const createdAtRef = useRef(new Date().toISOString());
   const nextActuatorIndexRef = useRef(1);
   const actuatorObjectRefs = useRef<Record<string, Object3D | null>>({});
+  const canvasWrapRef = useRef<HTMLDivElement | null>(null);
+  const cameraRef = useRef<any>(null);
+  const marqueeDragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    moved: boolean;
+  } | null>(null);
   const undoStackRef = useRef<EditorState[]>([]);
   const redoStackRef = useRef<EditorState[]>([]);
   const [editorState, setEditorState] = useState<EditorState>({
     actuators: [ROOT_ACTUATOR],
     selectedActuatorId: ROOT_ACTUATOR.id,
+    selectedActuatorIds: [ROOT_ACTUATOR.id],
   });
   const [isTransformDragging, setIsTransformDragging] = useState(false);
   const [invertOrbitX, setInvertOrbitX] = useState(false);
   const [gizmoMode, setGizmoMode] = useState<GizmoMode>("translate");
   const [gizmoSpace, setGizmoSpace] = useState<"world" | "local">("world");
   const [pivotMode, setPivotMode] = useState<PivotMode>("object");
+  const [focusRequest, setFocusRequest] = useState<FocusRequest | null>(null);
+  const [focusNonce, setFocusNonce] = useState(0);
+  const [marqueeRect, setMarqueeRect] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
   const [syntheticClip, setSyntheticClip] = useState<SyntheticClip | null>(null);
   const [playbackState, setPlaybackState] = useState<"stopped" | "playing">("stopped");
   const [playbackTimeSec, setPlaybackTimeSec] = useState(0);
@@ -452,6 +580,7 @@ export default function App() {
 
   const actuators = editorState.actuators;
   const selectedActuatorId = editorState.selectedActuatorId;
+  const selectedActuatorIds = editorState.selectedActuatorIds;
   const selectedObject = selectedActuatorId !== null ? (actuatorObjectRefs.current[selectedActuatorId] ?? null) : null;
 
   function setActuatorObjectRef(id: string, object: Object3D | null) {
@@ -461,6 +590,7 @@ export default function App() {
   function cloneEditorState(state: EditorState): EditorState {
     return {
       selectedActuatorId: state.selectedActuatorId,
+      selectedActuatorIds: [...state.selectedActuatorIds],
       actuators: state.actuators.map((actuator) => ({
         ...actuator,
         transform: {
@@ -481,6 +611,27 @@ export default function App() {
       undoStackRef.current.push(cloneEditorState(previous));
       redoStackRef.current = [];
       return next;
+    });
+  }
+
+  function setSelection(nextIds: string[], preferredId?: string | null) {
+    const sortedUnique = [...new Set(nextIds)].sort((a, b) => a.localeCompare(b));
+    const primary =
+      preferredId !== undefined && preferredId !== null && sortedUnique.includes(preferredId)
+        ? preferredId
+        : (sortedUnique[0] ?? null);
+
+    commitEditorChange((previous) => {
+      const samePrimary = previous.selectedActuatorId === primary;
+      const sameIds =
+        previous.selectedActuatorIds.length === sortedUnique.length &&
+        previous.selectedActuatorIds.every((id, index) => id === sortedUnique[index]);
+      if (samePrimary && sameIds) return previous;
+      return {
+        actuators: previous.actuators,
+        selectedActuatorId: primary,
+        selectedActuatorIds: sortedUnique,
+      };
     });
   }
 
@@ -540,14 +691,16 @@ export default function App() {
         return [...previous.actuators, actuator];
       })(),
       selectedActuatorId: id,
+      selectedActuatorIds: [id],
     }));
   }
 
   function deleteSelectedActuator() {
-    if (selectedActuatorId === null || selectedActuatorId === ROOT_ACTUATOR.id) return;
-
     commitEditorChange((previous) => {
-      const removeIds = new Set<string>([selectedActuatorId]);
+      const explicitSelectionIds = previous.selectedActuatorIds.filter((id) => id !== ROOT_ACTUATOR.id);
+      if (explicitSelectionIds.length === 0) return previous;
+
+      const removeIds = new Set<string>(explicitSelectionIds);
       let changed = true;
 
       while (changed) {
@@ -563,28 +716,17 @@ export default function App() {
       return {
         actuators: previous.actuators.filter((actuator) => !removeIds.has(actuator.id)),
         selectedActuatorId: ROOT_ACTUATOR.id,
+        selectedActuatorIds: [ROOT_ACTUATOR.id],
       };
     });
   }
 
   function selectActuator(id: string) {
-    commitEditorChange((previous) => {
-      if (previous.selectedActuatorId === id) return previous;
-      return {
-        actuators: previous.actuators,
-        selectedActuatorId: id,
-      };
-    });
+    setSelection([id], id);
   }
 
   function clearSelection() {
-    commitEditorChange((previous) => {
-      if (previous.selectedActuatorId === null) return previous;
-      return {
-        actuators: previous.actuators,
-        selectedActuatorId: null,
-      };
-    });
+    setSelection([], null);
   }
 
   function undo() {
@@ -778,8 +920,8 @@ export default function App() {
             id: "char_001",
             name: "PrototypeCharacter",
             mesh: {
-              meshId: "mesh_placeholder",
-              uri: "assets/placeholder.glb",
+              meshId: "mesh_chad_fbx",
+              uri: "assets/chad/Chad.fbx",
             },
             rig: {
               rootActuatorId: ROOT_ACTUATOR.id,
@@ -845,11 +987,18 @@ export default function App() {
       if (key === "w") setGizmoMode("translate");
       if (key === "e") setGizmoMode("rotate");
       if (key === "r") setGizmoMode("scale");
+      if (key === "f") {
+        const idsToFrame = selectedActuatorIds.length > 0 ? selectedActuatorIds : actuators.map((actuator) => actuator.id);
+        const request = buildFocusRequestFromActuators(actuators, idsToFrame);
+        if (request === null) return;
+        setFocusRequest(request);
+        setFocusNonce((value) => value + 1);
+      }
     }
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [actuators, selectedActuatorIds]);
 
   async function enterVR() {
     try {
@@ -859,11 +1008,126 @@ export default function App() {
     }
   }
 
+  function onCanvasPointerMissed() {
+    if (marqueeDragRef.current !== null) return;
+    clearSelection();
+  }
+
+  function clientToCanvasLocal(clientX: number, clientY: number): { x: number; y: number; width: number; height: number } | null {
+    const wrap = canvasWrapRef.current;
+    if (wrap === null) return null;
+    const rect = wrap.getBoundingClientRect();
+    return {
+      x: clientX - rect.left,
+      y: clientY - rect.top,
+      width: rect.width,
+      height: rect.height,
+    };
+  }
+
+  function runMarqueeSelection(rect: { x: number; y: number; width: number; height: number }) {
+    const cameraObject = cameraRef.current;
+    if (cameraObject === null) return;
+    const wrap = canvasWrapRef.current;
+    if (wrap === null) return;
+
+    const minX = Math.min(rect.x, rect.x + rect.width);
+    const minY = Math.min(rect.y, rect.y + rect.height);
+    const maxX = Math.max(rect.x, rect.x + rect.width);
+    const maxY = Math.max(rect.y, rect.y + rect.height);
+
+    const hits: string[] = [];
+    for (const actuator of actuators) {
+      const projected = new Vector3(
+        actuator.transform.position.x,
+        actuator.transform.position.y,
+        actuator.transform.position.z,
+      ).project(cameraObject);
+
+      if (projected.z < -1 || projected.z > 1) continue;
+
+      const px = (projected.x * 0.5 + 0.5) * wrap.clientWidth;
+      const py = (-projected.y * 0.5 + 0.5) * wrap.clientHeight;
+      if (px >= minX && px <= maxX && py >= minY && py <= maxY) {
+        hits.push(actuator.id);
+      }
+    }
+
+    if (hits.length === 0) {
+      clearSelection();
+      return;
+    }
+
+    const primary = selectedActuatorId !== null && hits.includes(selectedActuatorId) ? selectedActuatorId : hits[0];
+    setSelection(hits, primary);
+  }
+
+  function onCanvasWrapPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return;
+    if (event.altKey) return;
+    if (gizmoMode !== "select") return;
+    if (isTransformDragging) return;
+
+    const local = clientToCanvasLocal(event.clientX, event.clientY);
+    if (local === null) return;
+
+    marqueeDragRef.current = {
+      pointerId: event.pointerId,
+      startX: local.x,
+      startY: local.y,
+      moved: false,
+    };
+
+    setMarqueeRect({ x: local.x, y: local.y, width: 0, height: 0 });
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function onCanvasWrapPointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = marqueeDragRef.current;
+    if (drag === null || drag.pointerId !== event.pointerId) return;
+
+    const local = clientToCanvasLocal(event.clientX, event.clientY);
+    if (local === null) return;
+
+    const width = local.x - drag.startX;
+    const height = local.y - drag.startY;
+    if (!drag.moved && Math.hypot(width, height) > 4) {
+      drag.moved = true;
+    }
+    setMarqueeRect({ x: drag.startX, y: drag.startY, width, height });
+  }
+
+  function onCanvasWrapPointerUp(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = marqueeDragRef.current;
+    if (drag === null || drag.pointerId !== event.pointerId) return;
+
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    const local = clientToCanvasLocal(event.clientX, event.clientY);
+    const completedRect =
+      local === null
+        ? null
+        : {
+            x: drag.startX,
+            y: drag.startY,
+            width: local.x - drag.startX,
+            height: local.y - drag.startY,
+          };
+    const wasMoved = drag.moved;
+    marqueeDragRef.current = null;
+    setMarqueeRect(null);
+
+    if (!wasMoved || completedRect === null) return;
+    runMarqueeSelection(completedRect);
+  }
+
   return (
     <main className="app">
       <header className="app__header">
         <h1>Actuator2 Runtime Bootstrap</h1>
-        <p>N-001: Recorder stub API + deterministic playback clock service</p>
+        <p>Sprint 01 focus: Chad mesh integration for rigging workflows</p>
         <div className="app__actions">
           <button type="button" onClick={enterVR} disabled={!canUseWebXR}>
             Enter VR
@@ -885,7 +1149,11 @@ export default function App() {
             <button type="button" onClick={createActuator}>
               Create Actuator
             </button>
-            <button type="button" onClick={deleteSelectedActuator} disabled={selectedActuatorId === ROOT_ACTUATOR.id}>
+            <button
+              type="button"
+              onClick={deleteSelectedActuator}
+              disabled={selectedActuatorIds.length === 0 || selectedActuatorIds.every((id) => id === ROOT_ACTUATOR.id)}
+            >
               Delete Selected
             </button>
             <button type="button" onClick={undo} disabled={undoStackRef.current.length === 0}>
@@ -938,7 +1206,7 @@ export default function App() {
           </div>
 
           <div className="app__panel-status">
-            <strong>Selected:</strong> {selectedActuatorId ?? "none"}
+            <strong>Selected:</strong> {selectedActuatorIds.length === 0 ? "none" : `${selectedActuatorIds.length} (active: ${selectedActuatorId})`}
           </div>
           <ul className="app__actuator-list">
             {actuators
@@ -948,7 +1216,7 @@ export default function App() {
                 <li key={actuator.id}>
                   <button
                     type="button"
-                    className={selectedActuatorId === actuator.id ? "is-selected" : ""}
+                    className={selectedActuatorIds.includes(actuator.id) ? "is-selected" : ""}
                     onClick={() => selectActuator(actuator.id)}
                   >
                     {actuator.id}
@@ -961,14 +1229,34 @@ export default function App() {
           </label>
           <textarea id="scene-json" className="app__serialized" value={serializedScene} readOnly />
         </aside>
-        <div className="app__canvas-wrap">
-          <Canvas camera={{ position: [2.5, 2.5, 3], fov: 50 }} shadows>
+        <div
+          ref={canvasWrapRef}
+          className="app__canvas-wrap"
+          onPointerDown={onCanvasWrapPointerDown}
+          onPointerMove={onCanvasWrapPointerMove}
+          onPointerUp={onCanvasWrapPointerUp}
+          onPointerCancel={onCanvasWrapPointerUp}
+        >
+          <Canvas
+            camera={{ position: [2.5, 2.5, 3], fov: 50 }}
+            shadows
+            onCreated={({ camera }) => {
+              cameraRef.current = camera;
+            }}
+            onPointerMissed={onCanvasPointerMissed}
+          >
             <XR store={xrStore}>
               <PlaybackDriver onStep={onPlaybackStep} />
-              <DesktopInertialCameraControls blocked={isTransformDragging} invertOrbitX={invertOrbitX} />
+              <DesktopInertialCameraControls
+                blocked={isTransformDragging}
+                invertOrbitX={invertOrbitX}
+                focusRequest={focusRequest}
+                focusNonce={focusNonce}
+              />
               <SceneContent
                 actuators={actuators}
                 selectedActuatorId={selectedActuatorId}
+                selectedActuatorIds={selectedActuatorIds}
                 selectedObject={selectedObject}
                 gizmoMode={gizmoMode}
                 gizmoSpace={gizmoSpace}
@@ -983,6 +1271,17 @@ export default function App() {
               />
             </XR>
           </Canvas>
+          {marqueeRect !== null ? (
+            <div
+              className="app__marquee"
+              style={{
+                left: Math.min(marqueeRect.x, marqueeRect.x + marqueeRect.width),
+                top: Math.min(marqueeRect.y, marqueeRect.y + marqueeRect.height),
+                width: Math.abs(marqueeRect.width),
+                height: Math.abs(marqueeRect.height),
+              }}
+            />
+          ) : null}
         </div>
       </section>
     </main>

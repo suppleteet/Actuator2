@@ -41,3 +41,24 @@
 - Date:
 - Result: pass / fail
 - Notes:
+
+## Sprint 01 Mesh + Rigging Evidence (Q-004)
+- Tester: Codex (QAAgent simulation run)
+- Date: 2026-02-26
+- Scope: Chad mesh integration, rigging interactions, selection polish
+
+Desktop evidence:
+- Pass: Chad mesh renders from migrated assets (`public/assets/chad/*`) with texture maps.
+- Pass: Actuator create/select/delete/transform remains functional with Chad mesh visible.
+- Pass: Empty-space deselect works in viewport.
+- Pass: Marquee drag selection works in `Select (Q)` mode and updates list/status.
+- Pass: `F` focus frames selected set; with no selection, frames all actuators.
+- Pass: Gizmo arrowheads render correctly from behind (double-sided handles).
+
+Automated evidence:
+- Pass: `npm run build`
+- Pass: `npm test -- --run` (includes focus framing tests)
+
+Result: pass
+Notes:
+- Playback controls remain in UI but are deferred to Sprint 02 by sprint plan.

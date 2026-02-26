@@ -1,6 +1,6 @@
 # Scene Schema v0
 
-Status: finalized for Sprint 00 baseline (`A-001`).
+Status: finalized for Sprint 01 persistence baseline (`A-003`).
 
 ## Goals
 - Provide a deterministic, serializable scene document.
@@ -20,6 +20,35 @@ type SceneDocument = {
   metadata?: Record<string, string>;
 };
 ```
+
+## Required Fields (Save/Load Contract)
+
+Required root keys:
+- `version`
+- `sceneId`
+- `createdAtUtc`
+- `updatedAtUtc`
+- `characters`
+- `playback`
+
+Required character keys:
+- `id`
+- `name`
+- `mesh`
+- `rig`
+- `skinBinding`
+- `channels`
+
+Required actuator keys:
+- `id`
+- `parentId`
+- `type`
+- `shape`
+- `transform`
+- `size`
+- `joint`
+- `physics`
+- `influence`
 
 ## Character Document
 
@@ -43,6 +72,25 @@ type MeshRef = {
   nodePath?: string;      // optional source node path in imported asset
 };
 ```
+
+## Sprint 01 Mesh Import Constraints (`A-005`)
+
+These constraints define the current migration boundary for mesh integration work:
+
+- Supported source baseline for Sprint 01:
+  - Unity baseline `30c6ea7` Chad asset set migrated to web assets path (`assets/chad/*`).
+  - Runtime import path currently targets `assets/chad/Chad.fbx`.
+- Runtime behavior boundary:
+  - Mesh-only rendering path is in scope.
+  - Embedded skeleton, animation clips, and playback coupling are out of scope for Sprint 01 runtime integration.
+- Material handling baseline:
+  - Runtime consumes texture maps from migrated Chad asset folder when available.
+  - Unity `.mat` files are treated as source references; runtime shading uses explicit web material setup.
+  - Missing maps must fall back to deterministic default material values (no random or device-specific variation).
+- Mesh identity and determinism:
+  - `mesh.meshId` must remain stable for the same imported source asset.
+  - `mesh.uri` must be a deterministic relative runtime path.
+  - `mesh.nodePath` is optional and may be omitted for single-mesh import usage.
 
 ## Rig
 
@@ -149,10 +197,46 @@ type PlaybackDocument = {
   - `characters` sorted by `id`
   - each `actuators` list sorted by `id`
 
+## Load Defaults (Explicit Materialization)
+
+Loader must materialize explicit values so runtime behavior is deterministic:
+
+- Missing `metadata` -> `{}`.
+- Missing `mesh.nodePath` -> omitted (do not synthesize a placeholder path).
+- Missing `channels.custom` -> `{}`.
+- Missing `playback.activeClipId` -> `null`.
+
+No other required field can be omitted; documents missing required fields are invalid and must be rejected before runtime mutation.
+
+## Round-Trip Behavior
+
+`save(load(doc))` and `load(save(state))` must be deterministic:
+- Preserve immutable identifiers (`sceneId`, character IDs, actuator IDs).
+- Preserve actuator parent graph topology and transforms.
+- Preserve explicit value types (numbers remain numbers, booleans remain booleans).
+- Preserve sorted output order for `characters` and `actuators`.
+- `updatedAtUtc` may change on save; all other persisted fields must remain equivalent unless edited by user action.
+
 ## Determinism Notes
 - Save then immediate load must yield equivalent document data (modulo `updatedAtUtc`).
 - Playback/runtime systems must consume only serialized values, not editor transient state.
 - Defaults must be explicit at serialization time (no hidden engine defaults).
+
+## Migration Note Format
+
+When schema or load behavior changes, record a migration note entry in task/PR docs using this format:
+
+```md
+Migration Note:
+- schema_version_from:
+- schema_version_to:
+- change_summary:
+- backward_compat_strategy:
+- deterministic_impact:
+- required_rewrite: yes/no
+```
+
+Use `required_rewrite: yes` only if a saved document must be rewritten to remain valid.
 
 ## Sample JSON Payload
 
