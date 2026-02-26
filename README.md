@@ -15,3 +15,4 @@ Browser-based WebXR migration of the legacy Unity Actuator tool.
 - Agent-team workflow scaffolded
 - Runtime bootstrap complete (`R-001`)
 - XR entry + desktop fallback controls complete (`I-001`)
+- Runtime actuator prototype complete (`R-002`)

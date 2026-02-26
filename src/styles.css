@@ -68,4 +68,85 @@ body,
 
 .app__viewport {
   min-height: 0;
+  display: grid;
+  grid-template-columns: 360px 1fr;
+}
+
+.app__panel {
+  border-right: 1px solid #c9d7e5;
+  background: #ffffff;
+  padding: 10px;
+  display: grid;
+  grid-template-rows: auto auto auto auto 1fr;
+  gap: 10px;
+  min-height: 0;
+}
+
+.app__panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.app__panel-actions button,
+.app__actuator-list button {
+  padding: 6px 10px;
+  border: 1px solid #345b7e;
+  background: #ffffff;
+  color: #1b3d5e;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.app__panel-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.app__panel-status {
+  font-size: 12px;
+  color: #2d4e6c;
+}
+
+.app__actuator-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+  max-height: 180px;
+  overflow: auto;
+}
+
+.app__actuator-list button {
+  width: 100%;
+  text-align: left;
+}
+
+.app__actuator-list button.is-selected {
+  background: #d4ebff;
+  border-color: #2f7fd1;
+}
+
+.app__serialized-label {
+  font-size: 12px;
+  color: #2d4e6c;
+}
+
+.app__serialized {
+  width: 100%;
+  min-height: 0;
+  height: 100%;
+  resize: none;
+  border: 1px solid #c9d7e5;
+  border-radius: 8px;
+  padding: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  color: #183553;
+  background: #f8fcff;
+}
+
+.app__canvas-wrap {
+  min-width: 0;
 }

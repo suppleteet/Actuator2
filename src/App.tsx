@@ -1,8 +1,8 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { Physics, RigidBody } from "@react-three/rapier";
 import { XR, createXRStore, useXR } from "@react-three/xr";
-import { Vector3 } from "three";
+import { Euler, Vector3 } from "three";
 
 const xrStore = createXRStore({
   offerSession: false,
@@ -11,6 +11,40 @@ const xrStore = createXRStore({
 });
 
 type DragMode = "orbit" | "pan" | "zoom" | null;
+type ActuatorShape = "capsule" | "sphere" | "box";
+
+type Vec3 = { x: number; y: number; z: number };
+type Quat = { x: number; y: number; z: number; w: number };
+
+type ActuatorEntity = {
+  id: string;
+  parentId: string | null;
+  type: "root" | "custom";
+  shape: ActuatorShape;
+  transform: {
+    position: Vec3;
+    rotation: Quat;
+    scale: Vec3;
+  };
+  size: Vec3;
+};
+type EditorState = {
+  actuators: ActuatorEntity[];
+  selectedActuatorId: string | null;
+};
+
+const ROOT_ACTUATOR: ActuatorEntity = {
+  id: "act_root",
+  parentId: null,
+  type: "root",
+  shape: "capsule",
+  transform: {
+    position: { x: 0, y: 1, z: 0 },
+    rotation: { x: 0, y: 0, z: 0, w: 1 },
+    scale: { x: 1, y: 1, z: 1 },
+  },
+  size: { x: 0.35, y: 0.8, z: 0.35 },
+};
 
 function DesktopInertialCameraControls() {
   const { camera, gl } = useThree();
@@ -165,7 +199,19 @@ function DesktopInertialCameraControls() {
   return null;
 }
 
-function SceneContent() {
+type SceneContentProps = {
+  actuators: ActuatorEntity[];
+  selectedActuatorId: string | null;
+  onSelectActuator: (id: string) => void;
+};
+
+function SceneContent({ actuators, selectedActuatorId, onSelectActuator }: SceneContentProps) {
+  function getGeometry(shape: ActuatorShape, size: Vec3) {
+    if (shape === "sphere") return <sphereGeometry args={[Math.max(size.x, size.y, size.z) * 0.5, 18, 14]} />;
+    if (shape === "capsule") return <capsuleGeometry args={[Math.max(size.x, size.z) * 0.5, size.y, 8, 14]} />;
+    return <boxGeometry args={[size.x, size.y, size.z]} />;
+  }
+
   return (
     <>
       <color attach="background" args={["#d9ecff"]} />
@@ -173,12 +219,31 @@ function SceneContent() {
       <directionalLight position={[4, 6, 3]} intensity={1.1} />
 
       <Physics gravity={[0, -9.81, 0]}>
-        <RigidBody colliders="cuboid">
-          <mesh position={[0, 1.2, 0]} castShadow>
-            <boxGeometry args={[0.6, 0.6, 0.6]} />
-            <meshStandardMaterial color="#ff6a3d" />
-          </mesh>
-        </RigidBody>
+        {actuators.map((actuator) => {
+          const isSelected = selectedActuatorId === actuator.id;
+          const isRoot = actuator.id === "act_root";
+          const color = isSelected ? "#ff6a3d" : isRoot ? "#28a26a" : "#2f7fd1";
+
+          return (
+            <mesh
+              key={actuator.id}
+              position={[actuator.transform.position.x, actuator.transform.position.y, actuator.transform.position.z]}
+              rotation={new Euler(
+                actuator.transform.rotation.x,
+                actuator.transform.rotation.y,
+                actuator.transform.rotation.z,
+              )}
+              onClick={(event) => {
+                event.stopPropagation();
+                onSelectActuator(actuator.id);
+              }}
+              castShadow
+            >
+              {getGeometry(actuator.shape, actuator.size)}
+              <meshStandardMaterial color={color} roughness={0.35} metalness={0.05} />
+            </mesh>
+          );
+        })}
 
         <RigidBody type="fixed" colliders="cuboid">
           <mesh position={[0, -0.1, 0]} receiveShadow>
@@ -193,6 +258,201 @@ function SceneContent() {
 
 export default function App() {
   const canUseWebXR = typeof navigator !== "undefined" && "xr" in navigator;
+  const createdAtRef = useRef(new Date().toISOString());
+  const nextActuatorIndexRef = useRef(1);
+  const undoStackRef = useRef<EditorState[]>([]);
+  const redoStackRef = useRef<EditorState[]>([]);
+  const [editorState, setEditorState] = useState<EditorState>({
+    actuators: [ROOT_ACTUATOR],
+    selectedActuatorId: ROOT_ACTUATOR.id,
+  });
+  const actuators = editorState.actuators;
+  const selectedActuatorId = editorState.selectedActuatorId;
+
+  function cloneEditorState(state: EditorState): EditorState {
+    return {
+      selectedActuatorId: state.selectedActuatorId,
+      actuators: state.actuators.map((actuator) => ({
+        ...actuator,
+        transform: {
+          ...actuator.transform,
+          position: { ...actuator.transform.position },
+          rotation: { ...actuator.transform.rotation },
+          scale: { ...actuator.transform.scale },
+        },
+        size: { ...actuator.size },
+      })),
+    };
+  }
+
+  function commitEditorChange(updater: (previous: EditorState) => EditorState) {
+    setEditorState((previous) => {
+      const next = updater(previous);
+      if (next === previous) return previous;
+      undoStackRef.current.push(cloneEditorState(previous));
+      redoStackRef.current = [];
+      return next;
+    });
+  }
+
+  function createActuator() {
+    const index = nextActuatorIndexRef.current;
+    nextActuatorIndexRef.current += 1;
+
+    const id = `act_${index.toString().padStart(4, "0")}`;
+    const row = Math.floor((index - 1) / 6);
+    const column = (index - 1) % 6;
+
+    const actuator: ActuatorEntity = {
+      id,
+      parentId: ROOT_ACTUATOR.id,
+      type: "custom",
+      shape: "box",
+      transform: {
+        position: {
+          x: -1.5 + column * 0.6,
+          y: 0.6 + row * 0.32,
+          z: -0.35 - row * 0.2,
+        },
+        rotation: { x: 0, y: 0, z: 0, w: 1 },
+        scale: { x: 1, y: 1, z: 1 },
+      },
+      size: { x: 0.4, y: 0.4, z: 0.4 },
+    };
+
+    commitEditorChange((previous) => ({
+      actuators: [...previous.actuators, actuator],
+      selectedActuatorId: id,
+    }));
+  }
+
+  function deleteSelectedActuator() {
+    if (selectedActuatorId === null || selectedActuatorId === ROOT_ACTUATOR.id) return;
+
+    commitEditorChange((previous) => {
+      const removeIds = new Set<string>([selectedActuatorId]);
+      let changed = true;
+
+      while (changed) {
+        changed = false;
+        for (const actuator of previous.actuators) {
+          if (actuator.parentId !== null && removeIds.has(actuator.parentId) && !removeIds.has(actuator.id)) {
+            removeIds.add(actuator.id);
+            changed = true;
+          }
+        }
+      }
+
+      return {
+        actuators: previous.actuators.filter((actuator) => !removeIds.has(actuator.id)),
+        selectedActuatorId: ROOT_ACTUATOR.id,
+      };
+    });
+  }
+
+  function selectActuator(id: string) {
+    commitEditorChange((previous) => {
+      if (previous.selectedActuatorId === id) return previous;
+      return {
+        actuators: previous.actuators,
+        selectedActuatorId: id,
+      };
+    });
+  }
+
+  function undo() {
+    setEditorState((previous) => {
+      const snapshot = undoStackRef.current.pop();
+      if (snapshot === undefined) return previous;
+      redoStackRef.current.push(cloneEditorState(previous));
+      return snapshot;
+    });
+  }
+
+  function redo() {
+    setEditorState((previous) => {
+      const snapshot = redoStackRef.current.pop();
+      if (snapshot === undefined) return previous;
+      undoStackRef.current.push(cloneEditorState(previous));
+      return snapshot;
+    });
+  }
+
+  const serializedScene = useMemo(() => {
+    const sortedActuators = [...actuators].sort((a, b) => a.id.localeCompare(b.id));
+    return JSON.stringify(
+      {
+        version: "0.1.0",
+        sceneId: "scene_main",
+        createdAtUtc: createdAtRef.current,
+        updatedAtUtc: new Date().toISOString(),
+        characters: [
+          {
+            id: "char_001",
+            name: "PrototypeCharacter",
+            mesh: {
+              meshId: "mesh_placeholder",
+              uri: "assets/placeholder.glb",
+            },
+            rig: {
+              rootActuatorId: ROOT_ACTUATOR.id,
+              actuators: sortedActuators,
+            },
+            skinBinding: {
+              version: "0.1",
+              solver: "closestVolume",
+              meshHash: "pending",
+              bindingHash: "pending",
+              generatedAtUtc: new Date().toISOString(),
+              influenceCount: sortedActuators.length,
+            },
+            channels: {
+              look: { yaw: 0, pitch: 0 },
+              blink: { left: 0, right: 0 },
+              custom: {},
+            },
+          },
+        ],
+        playback: {
+          fps: 60,
+          durationSec: 10,
+          activeClipId: null,
+        },
+      },
+      null,
+      2,
+    );
+  }, [actuators]);
+
+  useEffect(() => {
+    function isTypingTarget(target: EventTarget | null) {
+      if (!(target instanceof HTMLElement)) return false;
+      const tag = target.tagName;
+      return tag === "INPUT" || tag === "TEXTAREA" || target.isContentEditable;
+    }
+
+    function onKeyDown(event: KeyboardEvent) {
+      if (isTypingTarget(event.target)) return;
+
+      const isPrimaryModifier = event.ctrlKey || event.metaKey;
+      if (!isPrimaryModifier) return;
+
+      const key = event.key.toLowerCase();
+      if (key === "z" && event.shiftKey) {
+        event.preventDefault();
+        redo();
+      } else if (key === "z") {
+        event.preventDefault();
+        undo();
+      } else if (key === "y") {
+        event.preventDefault();
+        redo();
+      }
+    }
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   async function enterVR() {
     try {
@@ -206,7 +466,7 @@ export default function App() {
     <main className="app">
       <header className="app__header">
         <h1>Actuator2 Runtime Bootstrap</h1>
-        <p>I-001: WebXR session entry + desktop fallback camera controls</p>
+        <p>R-002: In-memory actuator create/select/delete with stable IDs and schema serialization</p>
         <div className="app__actions">
           <button type="button" onClick={enterVR} disabled={!canUseWebXR}>
             Enter VR
@@ -219,12 +479,57 @@ export default function App() {
         </div>
       </header>
       <section className="app__viewport">
-        <Canvas camera={{ position: [2.5, 2.5, 3], fov: 50 }}>
-          <XR store={xrStore}>
-            <DesktopInertialCameraControls />
-            <SceneContent />
-          </XR>
-        </Canvas>
+        <aside className="app__panel">
+          <div className="app__panel-actions">
+            <button type="button" onClick={createActuator}>
+              Create Actuator
+            </button>
+            <button type="button" onClick={deleteSelectedActuator} disabled={selectedActuatorId === ROOT_ACTUATOR.id}>
+              Delete Selected
+            </button>
+            <button type="button" onClick={undo} disabled={undoStackRef.current.length === 0}>
+              Undo
+            </button>
+            <button type="button" onClick={redo} disabled={redoStackRef.current.length === 0}>
+              Redo
+            </button>
+          </div>
+          <div className="app__panel-status">
+            <strong>Selected:</strong> {selectedActuatorId ?? "none"}
+          </div>
+          <ul className="app__actuator-list">
+            {actuators
+              .slice()
+              .sort((a, b) => a.id.localeCompare(b.id))
+              .map((actuator) => (
+                <li key={actuator.id}>
+                  <button
+                    type="button"
+                    className={selectedActuatorId === actuator.id ? "is-selected" : ""}
+                    onClick={() => selectActuator(actuator.id)}
+                  >
+                    {actuator.id}
+                  </button>
+                </li>
+              ))}
+          </ul>
+          <label className="app__serialized-label" htmlFor="scene-json">
+            Serialized SceneDocument
+          </label>
+          <textarea id="scene-json" className="app__serialized" value={serializedScene} readOnly />
+        </aside>
+        <div className="app__canvas-wrap">
+          <Canvas camera={{ position: [2.5, 2.5, 3], fov: 50 }} shadows>
+            <XR store={xrStore}>
+              <DesktopInertialCameraControls />
+              <SceneContent
+                actuators={actuators}
+                selectedActuatorId={selectedActuatorId}
+                onSelectActuator={selectActuator}
+              />
+            </XR>
+          </Canvas>
+        </div>
       </section>
     </main>
   );
