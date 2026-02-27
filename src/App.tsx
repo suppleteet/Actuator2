@@ -1,12 +1,14 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { Canvas, useFrame, useLoader, useThree } from "@react-three/fiber";
 import { Physics, RigidBody } from "@react-three/rapier";
 import { TransformControls } from "@react-three/drei";
 import { XR, createXRStore, useXR } from "@react-three/xr";
-import { BufferGeometry, DoubleSide, Matrix4, Mesh, Object3D, Quaternion, SRGBColorSpace, SkinnedMesh, TextureLoader, Vector3 } from "three";
+import { Box3, BufferGeometry, Color, DoubleSide, Matrix4, Mesh, Object3D, Quaternion, Raycaster, SRGBColorSpace, SkinnedMesh, TextureLoader, Vector2, Vector3 } from "three";
 import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
 import { PlaybackClock, createSyntheticRecording, evaluateClipAtTime, type SyntheticClip } from "./animation/recorder";
 import { buildFocusRequestFromActuators, type FocusRequest } from "./interaction/focusFraming";
+import { bindVerticesToClosestCapsule, type Capsule, type Vec3 as SkinVec3 } from "./skinning/closestCapsuleBinding";
+import { applyDeltaMush, buildVertexNeighbors } from "./skinning/deltaMush";
 
 const xrStore = createXRStore({
   offerSession: false,
@@ -18,12 +20,14 @@ type DragMode = "orbit" | "pan" | "zoom" | null;
 type ActuatorShape = "capsule" | "sphere" | "box";
 type GizmoMode = "select" | "translate" | "rotate" | "scale";
 type PivotMode = "object" | "world";
+type AppMode = "Rig" | "Pose";
 
 type Vec3 = { x: number; y: number; z: number };
 type Quat = { x: number; y: number; z: number; w: number };
 
 type ActuatorEntity = {
   id: string;
+  rigId: string;
   parentId: string | null;
   type: "root" | "custom";
   shape: ActuatorShape;
@@ -37,6 +41,7 @@ type ActuatorEntity = {
 
 type EditorState = {
   actuators: ActuatorEntity[];
+  selectedRigId: string;
   selectedActuatorId: string | null;
   selectedActuatorIds: string[];
 };
@@ -59,27 +64,114 @@ function composeMatrix(position: Vec3, rotation: Quat, scale: Vec3): Matrix4 {
   );
 }
 
-const ROOT_ACTUATOR: ActuatorEntity = {
-  id: "act_root",
-  parentId: null,
-  type: "root",
-  shape: "capsule",
-  transform: {
-    position: { x: 0, y: 1, z: 0 },
-    rotation: { x: 0, y: 0, z: 0, w: 1 },
-    scale: { x: 1, y: 1, z: 1 },
-  },
-  size: { x: 0.35, y: 0.8, z: 0.35 },
-};
+function rootIdForRig(rigId: string): string {
+  return `${rigId}_act_root`;
+}
+
+function createRootActuator(rigId: string, xOffset = 0): ActuatorEntity {
+  return {
+    id: rootIdForRig(rigId),
+    rigId,
+    parentId: null,
+    type: "root",
+    shape: "capsule",
+    transform: {
+      position: { x: xOffset, y: 1, z: 0 },
+      rotation: { x: 0, y: 0, z: 0, w: 1 },
+      scale: { x: 1, y: 1, z: 1 },
+    },
+    size: { x: 0.35, y: 0.8, z: 0.35 },
+  };
+}
+
+type SmoothDampVec3Velocity = { x: number; y: number; z: number };
+type SmoothDampQuatVelocity = { x: number; y: number; z: number; w: number };
+
+function smoothDampScalar(
+  current: number,
+  target: number,
+  currentVelocity: number,
+  smoothTime: number,
+  deltaTime: number,
+  maxSpeed = Number.POSITIVE_INFINITY,
+): { value: number; velocity: number } {
+  const clampedSmoothTime = Math.max(0.0001, smoothTime);
+  const omega = 2 / clampedSmoothTime;
+  const x = omega * deltaTime;
+  const exp = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x);
+
+  let change = current - target;
+  const originalTo = target;
+  const maxChange = maxSpeed * clampedSmoothTime;
+  change = Math.max(-maxChange, Math.min(maxChange, change));
+  const adjustedTarget = current - change;
+
+  const temp = (currentVelocity + omega * change) * deltaTime;
+  let nextVelocity = (currentVelocity - omega * temp) * exp;
+  let output = adjustedTarget + (change + temp) * exp;
+
+  if ((originalTo - current > 0) === (output > originalTo)) {
+    output = originalTo;
+    nextVelocity = deltaTime > 0 ? (output - originalTo) / deltaTime : 0;
+  }
+
+  return { value: output, velocity: nextVelocity };
+}
+
+function smoothDampVec3(
+  current: Vector3,
+  target: Vector3,
+  currentVelocity: SmoothDampVec3Velocity,
+  smoothTime: number,
+  deltaTime: number,
+  maxSpeed = Number.POSITIVE_INFINITY,
+): Vector3 {
+  const x = smoothDampScalar(current.x, target.x, currentVelocity.x, smoothTime, deltaTime, maxSpeed);
+  const y = smoothDampScalar(current.y, target.y, currentVelocity.y, smoothTime, deltaTime, maxSpeed);
+  const z = smoothDampScalar(current.z, target.z, currentVelocity.z, smoothTime, deltaTime, maxSpeed);
+  currentVelocity.x = x.velocity;
+  currentVelocity.y = y.velocity;
+  currentVelocity.z = z.velocity;
+  return new Vector3(x.value, y.value, z.value);
+}
+
+function smoothDampQuat(
+  current: Quaternion,
+  target: Quaternion,
+  currentVelocity: SmoothDampQuatVelocity,
+  smoothTime: number,
+  deltaTime: number,
+  maxSpeed = Number.POSITIVE_INFINITY,
+): Quaternion {
+  let targetX = target.x;
+  let targetY = target.y;
+  let targetZ = target.z;
+  let targetW = target.w;
+  if (current.dot(target) < 0) {
+    targetX = -targetX;
+    targetY = -targetY;
+    targetZ = -targetZ;
+    targetW = -targetW;
+  }
+
+  const x = smoothDampScalar(current.x, targetX, currentVelocity.x, smoothTime, deltaTime, maxSpeed);
+  const y = smoothDampScalar(current.y, targetY, currentVelocity.y, smoothTime, deltaTime, maxSpeed);
+  const z = smoothDampScalar(current.z, targetZ, currentVelocity.z, smoothTime, deltaTime, maxSpeed);
+  const w = smoothDampScalar(current.w, targetW, currentVelocity.w, smoothTime, deltaTime, maxSpeed);
+  currentVelocity.x = x.velocity;
+  currentVelocity.y = y.velocity;
+  currentVelocity.z = z.velocity;
+  currentVelocity.w = w.velocity;
+  return new Quaternion(x.value, y.value, z.value, w.value).normalize();
+}
 
 type DesktopInertialCameraControlsProps = {
   blocked: boolean;
-  invertOrbitX: boolean;
   focusRequest: FocusRequest | null;
   focusNonce: number;
 };
 
-function DesktopInertialCameraControls({ blocked, invertOrbitX, focusRequest, focusNonce }: DesktopInertialCameraControlsProps) {
+function DesktopInertialCameraControls({ blocked, focusRequest, focusNonce }: DesktopInertialCameraControlsProps) {
   const { camera, gl } = useThree();
   const mode = useXR((state) => state.mode);
   const isInXR = mode !== null;
@@ -92,6 +184,7 @@ function DesktopInertialCameraControls({ blocked, invertOrbitX, focusRequest, fo
 
   const dragModeRef = useRef<DragMode>(null);
   const controlFollowRampRef = useRef(0);
+  const controlFollowVelocityRef = useRef(0);
   const lastPointerRef = useRef({ x: 0, y: 0 });
   const velocityRef = useRef({
     theta: 0,
@@ -102,6 +195,8 @@ function DesktopInertialCameraControls({ blocked, invertOrbitX, focusRequest, fo
   });
   const desiredTargetRef = useRef<Vector3 | null>(null);
   const desiredRadiusRef = useRef<number | null>(null);
+  const desiredTargetVelocityRef = useRef<SmoothDampVec3Velocity>({ x: 0, y: 0, z: 0 });
+  const desiredRadiusVelocityRef = useRef(0);
   const focusingRef = useRef(false);
 
   useEffect(() => {
@@ -114,6 +209,8 @@ function DesktopInertialCameraControls({ blocked, invertOrbitX, focusRequest, fo
 
     desiredTargetRef.current = new Vector3(focusRequest.center.x, focusRequest.center.y, focusRequest.center.z);
     desiredRadiusRef.current = fitDistance;
+    desiredTargetVelocityRef.current = { x: 0, y: 0, z: 0 };
+    desiredRadiusVelocityRef.current = 0;
     focusingRef.current = true;
   }, [camera, focusNonce, focusRequest]);
 
@@ -126,9 +223,7 @@ function DesktopInertialCameraControls({ blocked, invertOrbitX, focusRequest, fo
 
     function onPointerDown(event: PointerEvent) {
       if (isInXR || blocked) return;
-      if (!event.altKey) return;
-
-      if (event.button === 0) dragModeRef.current = "orbit";
+      if (event.button === 0 && event.altKey) dragModeRef.current = "orbit";
       if (event.button === 1) dragModeRef.current = "pan";
       if (event.button === 2) dragModeRef.current = "zoom";
       if (dragModeRef.current === null) return;
@@ -140,7 +235,7 @@ function DesktopInertialCameraControls({ blocked, invertOrbitX, focusRequest, fo
 
     function onPointerMove(event: PointerEvent) {
       if (isInXR || blocked || dragModeRef.current === null) return;
-      if (!event.altKey) return;
+      if (dragModeRef.current === "orbit" && !event.altKey) return;
 
       const dx = event.clientX - lastPointerRef.current.x;
       const dy = event.clientY - lastPointerRef.current.y;
@@ -148,8 +243,7 @@ function DesktopInertialCameraControls({ blocked, invertOrbitX, focusRequest, fo
       lastPointerRef.current.y = event.clientY;
 
       if (dragModeRef.current === "orbit") {
-        const orbitXSign = invertOrbitX ? -1 : 1;
-        velocityRef.current.theta -= dx * 0.022 * orbitXSign;
+        velocityRef.current.theta -= dx * 0.022;
         velocityRef.current.phi -= dy * 0.022;
       } else if (dragModeRef.current === "pan") {
         const panImpulse = radiusRef.current * 0.007;
@@ -171,7 +265,6 @@ function DesktopInertialCameraControls({ blocked, invertOrbitX, focusRequest, fo
 
     function onWheel(event: WheelEvent) {
       if (isInXR || blocked) return;
-      if (!event.altKey) return;
       event.preventDefault();
       const modeScale = event.deltaMode === 1 ? 14 : event.deltaMode === 2 ? 120 : 1;
       const zoomImpulse = Math.max(radiusRef.current * 0.005, 0.016);
@@ -193,7 +286,7 @@ function DesktopInertialCameraControls({ blocked, invertOrbitX, focusRequest, fo
       dom.removeEventListener("pointercancel", onPointerUp);
       dom.removeEventListener("wheel", onWheel);
     };
-  }, [blocked, gl, invertOrbitX, isInXR]);
+  }, [blocked, gl, isInXR]);
 
   useFrame((_, delta) => {
     if (isInXR || blocked) return;
@@ -209,8 +302,15 @@ function DesktopInertialCameraControls({ blocked, invertOrbitX, focusRequest, fo
     const velocity = velocityRef.current;
     const dragging = dragModeRef.current !== null;
     const followTarget = dragging ? 1 : 0;
-    const followLerp = 1 - Math.exp(-(dragging ? 35 : 20) * delta);
-    controlFollowRampRef.current += (followTarget - controlFollowRampRef.current) * followLerp;
+    const follow = smoothDampScalar(
+      controlFollowRampRef.current,
+      followTarget,
+      controlFollowVelocityRef.current,
+      dragging ? 0.05 : 0.08,
+      delta,
+    );
+    controlFollowRampRef.current = follow.value;
+    controlFollowVelocityRef.current = follow.velocity;
     const followGain = 1 + controlFollowRampRef.current * 1.35;
 
     thetaRef.current += velocity.theta * delta * followGain;
@@ -221,13 +321,32 @@ function DesktopInertialCameraControls({ blocked, invertOrbitX, focusRequest, fo
     radiusRef.current = Math.min(Math.max(radiusRef.current, 0.5), 80);
 
     if (focusingRef.current && desiredTargetRef.current !== null && desiredRadiusRef.current !== null) {
-      const focusLerp = 1 - Math.exp(-13 * delta);
-      targetRef.current.lerp(desiredTargetRef.current, focusLerp);
-      radiusRef.current = radiusRef.current + (desiredRadiusRef.current - radiusRef.current) * focusLerp;
+      const smoothedTarget = smoothDampVec3(
+        targetRef.current,
+        desiredTargetRef.current,
+        desiredTargetVelocityRef.current,
+        0.15,
+        delta,
+      );
+      targetRef.current.copy(smoothedTarget);
+      const smoothedRadius = smoothDampScalar(
+        radiusRef.current,
+        desiredRadiusRef.current,
+        desiredRadiusVelocityRef.current,
+        0.15,
+        delta,
+      );
+      radiusRef.current = smoothedRadius.value;
+      desiredRadiusVelocityRef.current = smoothedRadius.velocity;
 
       const targetDistance = targetRef.current.distanceTo(desiredTargetRef.current);
       const radiusDistance = Math.abs(radiusRef.current - desiredRadiusRef.current);
-      if (targetDistance < 0.01 && radiusDistance < 0.01) {
+      const targetVelocityMag = Math.hypot(
+        desiredTargetVelocityRef.current.x,
+        desiredTargetVelocityRef.current.y,
+        desiredTargetVelocityRef.current.z,
+      );
+      if (targetDistance < 0.01 && radiusDistance < 0.01 && targetVelocityMag < 0.02 && Math.abs(desiredRadiusVelocityRef.current) < 0.02) {
         focusingRef.current = false;
       }
     }
@@ -272,56 +391,496 @@ function DesktopInertialCameraControls({ blocked, invertOrbitX, focusRequest, fo
 
 type SceneContentProps = {
   actuators: ActuatorEntity[];
+  appMode: AppMode;
   selectedActuatorId: string | null;
   selectedActuatorIds: string[];
-  selectedObject: Object3D | null;
+  physicsEnabled: boolean;
+  skinningEnabled: boolean;
+  skinningRevision: number;
+  deltaMushEnabled: boolean;
+  deltaMushSettings: DeltaMushSettings;
+  onSkinningStats: (stats: SkinningStats) => void;
+  onSkinningComputationStatus: (status: SkinningComputationStatus) => void;
   gizmoMode: GizmoMode;
   gizmoSpace: "world" | "local";
   pivotMode: PivotMode;
   isTransformDragging: boolean;
-  onSelectActuator: (id: string) => void;
+  onSelectActuator: (id: string, options?: { additive?: boolean; toggle?: boolean }) => void;
   onClearSelection: () => void;
   onActuatorRef: (id: string, object: Object3D | null) => void;
   onTransformStart: () => void;
-  onTransformChange: (id: string, position: Vec3, rotation: Quat, scale: Vec3) => void;
+  onTransformChange: (id: string, worldDelta: Matrix4, localDelta: Matrix4, worldOffset: Vec3) => void;
   onTransformEnd: () => void;
 };
 
-function ChadReferenceMesh() {
+type SkinningStats = {
+  vertexCount: number;
+  capsuleCount: number;
+  averageWeight: number;
+};
+
+type DeltaMushSettings = {
+  iterations: number;
+  strength: number;
+};
+
+type SkinningComputationStatus = {
+  busy: boolean;
+  revision: number;
+  completed: boolean;
+  bindingHash: string | null;
+  meshHash: string | null;
+};
+
+type ActuatorTransformSnapshot = {
+  position: Vec3;
+  rotation: Quat;
+  scale: Vec3;
+};
+
+type ChadReferenceMeshProps = {
+  actuators: ActuatorEntity[];
+  appMode: AppMode;
+  skinningEnabled: boolean;
+  skinningRevision: number;
+  deltaMushEnabled: boolean;
+  deltaMushSettings: DeltaMushSettings;
+  onSkinningStats: (stats: SkinningStats) => void;
+  onSkinningComputationStatus: (status: SkinningComputationStatus) => void;
+};
+
+function ChadReferenceMesh({
+  actuators,
+  appMode,
+  skinningEnabled,
+  skinningRevision,
+  deltaMushEnabled,
+  deltaMushSettings,
+  onSkinningStats,
+  onSkinningComputationStatus,
+}: ChadReferenceMeshProps) {
   const chadSource = useLoader(FBXLoader, "/assets/chad/Chad.fbx");
   const colorMap = useLoader(TextureLoader, "/assets/chad/Textures/chad_Col.png");
   const normalMap = useLoader(TextureLoader, "/assets/chad/Textures/chad_Norm.png");
   const roughnessMap = useLoader(TextureLoader, "/assets/chad/Textures/chad_Pbr.png");
+  const meshScale = 0.01;
+  const meshYOffset = 0.02;
 
-  const chadMeshGeometry = useMemo(() => {
-    let geometry: BufferGeometry | null = null;
+  type RuntimeVertexBinding = {
+    capsuleId: string;
+    rootCapsuleId: string | null;
+    bindWorld: SkinVec3;
+    localOffset: SkinVec3;
+    rootLocalOffset: SkinVec3;
+    weight: number;
+  };
+
+  const baseGeometry: BufferGeometry | null = useMemo(() => {
+    let foundGeometry: BufferGeometry | null = null;
     chadSource.traverse((object) => {
-      if (geometry !== null) return;
+      if (foundGeometry !== null) return;
       if ((object as SkinnedMesh).isSkinnedMesh) {
-        geometry = (object as SkinnedMesh).geometry.clone();
+        foundGeometry = (object as SkinnedMesh).geometry.clone();
         return;
       }
       if ((object as Mesh).isMesh) {
-        geometry = (object as Mesh).geometry.clone();
+        foundGeometry = (object as Mesh).geometry.clone();
       }
     });
-    return geometry;
+    const resolved = foundGeometry as BufferGeometry | null;
+    if (resolved === null) return null;
+    if (resolved.getAttribute("normal") === undefined) {
+      resolved.computeVertexNormals();
+    }
+    return resolved;
   }, [chadSource]);
+
+  const displayGeometry: BufferGeometry | null = useMemo(() => baseGeometry?.clone() ?? null, [baseGeometry]);
+
+  const baseVerticesLocal = useMemo<SkinVec3[]>(() => {
+    if (baseGeometry === null) return [];
+    const position = baseGeometry.getAttribute("position");
+    if (position === undefined) return [];
+    const vertices: SkinVec3[] = [];
+    for (let i = 0; i < position.count; i += 1) {
+      vertices.push({ x: position.getX(i), y: position.getY(i), z: position.getZ(i) });
+    }
+    return vertices;
+  }, [baseGeometry]);
+
+  const triangles = useMemo<Array<[number, number, number]>>(() => {
+    if (baseGeometry === null) return [];
+    const indices = baseGeometry.getIndex()?.array;
+    const built: Array<[number, number, number]> = [];
+    if (indices !== undefined) {
+      for (let i = 0; i + 2 < indices.length; i += 3) {
+        built.push([Number(indices[i]), Number(indices[i + 1]), Number(indices[i + 2])]);
+      }
+      return built;
+    }
+
+    for (let i = 0; i + 2 < baseVerticesLocal.length; i += 3) {
+      built.push([i, i + 1, i + 2]);
+    }
+    return built;
+  }, [baseGeometry, baseVerticesLocal.length]);
+
+  const weldData = useMemo(() => {
+    const vertexToWelded = new Array<number>(baseVerticesLocal.length);
+    const weldedToVertices: number[][] = [];
+    const weldedVertices: SkinVec3[] = [];
+    const keyToWelded = new Map<string, number>();
+    const precision = 10000;
+
+    for (let i = 0; i < baseVerticesLocal.length; i += 1) {
+      const vertex = baseVerticesLocal[i];
+      const key = `${Math.round(vertex.x * precision)}|${Math.round(vertex.y * precision)}|${Math.round(vertex.z * precision)}`;
+      let weldedIndex = keyToWelded.get(key);
+      if (weldedIndex === undefined) {
+        weldedIndex = weldedVertices.length;
+        keyToWelded.set(key, weldedIndex);
+        weldedVertices.push(vertex);
+        weldedToVertices.push([]);
+      }
+      vertexToWelded[i] = weldedIndex;
+      weldedToVertices[weldedIndex].push(i);
+    }
+
+    const weldedTriangles: Array<[number, number, number]> = [];
+    for (const [a, b, c] of triangles) {
+      const wa = vertexToWelded[a];
+      const wb = vertexToWelded[b];
+      const wc = vertexToWelded[c];
+      if (wa === wb || wb === wc || wa === wc) continue;
+      weldedTriangles.push([wa, wb, wc]);
+    }
+
+    return {
+      vertexToWelded,
+      weldedToVertices,
+      weldedVertices,
+      weldedTriangles,
+    };
+  }, [baseVerticesLocal, triangles]);
+
+  const weldedNeighbors = useMemo(
+    () => buildVertexNeighbors(weldData.weldedVertices.length, weldData.weldedTriangles),
+    [weldData],
+  );
+
+  const baseVerticesWorld = useMemo(
+    () =>
+      baseVerticesLocal.map((vertex) => ({
+        x: vertex.x * meshScale,
+        y: vertex.y * meshScale + meshYOffset,
+        z: vertex.z * meshScale,
+      })),
+    [baseVerticesLocal],
+  );
+
+  const meshHash = useMemo(
+    () => (baseGeometry === null ? null : `mesh:${baseVerticesLocal.length}:${triangles.length}`),
+    [baseGeometry, baseVerticesLocal.length, triangles.length],
+  );
+
+  const [runtimeBindings, setRuntimeBindings] = useState<RuntimeVertexBinding[] | null>(null);
+  const [bindingsRevision, setBindingsRevision] = useState(0);
+  const skinningJobTokenRef = useRef(0);
 
   useEffect(() => {
     colorMap.colorSpace = SRGBColorSpace;
     colorMap.needsUpdate = true;
   }, [colorMap]);
 
-  if (chadMeshGeometry === null) return null;
+  useEffect(() => {
+    if (baseVerticesWorld.length === 0 || meshHash === null) {
+      setRuntimeBindings(null);
+      setBindingsRevision(skinningRevision);
+      onSkinningStats({ vertexCount: 0, capsuleCount: 0, averageWeight: 0 });
+      onSkinningComputationStatus({
+        busy: false,
+        revision: skinningRevision,
+        completed: true,
+        bindingHash: null,
+        meshHash: null,
+      });
+      return;
+    }
+
+    const revision = skinningRevision;
+    const currentToken = skinningJobTokenRef.current + 1;
+    skinningJobTokenRef.current = currentToken;
+    onSkinningComputationStatus({
+      busy: true,
+      revision,
+      completed: false,
+      bindingHash: null,
+      meshHash,
+    });
+
+    const run = async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      if (skinningJobTokenRef.current !== currentToken) return;
+
+      const capsules: Capsule[] = actuators
+        .filter((actuator) => actuator.shape === "capsule")
+        .map((actuator) => {
+          const rotation = new Quaternion(
+            actuator.transform.rotation.x,
+            actuator.transform.rotation.y,
+            actuator.transform.rotation.z,
+            actuator.transform.rotation.w,
+          );
+          const halfHeight = Math.max((actuator.size.y * actuator.transform.scale.y) / 2, 0.01);
+          const up = new Vector3(0, 1, 0).applyQuaternion(rotation);
+          const center = new Vector3(
+            actuator.transform.position.x,
+            actuator.transform.position.y,
+            actuator.transform.position.z,
+          );
+          const start = center.clone().addScaledVector(up, -halfHeight);
+          const end = center.clone().addScaledVector(up, halfHeight);
+          return {
+            id: actuator.id,
+            start: { x: start.x, y: start.y, z: start.z },
+            end: { x: end.x, y: end.y, z: end.z },
+            radius: Math.max((Math.max(actuator.size.x, actuator.size.z) * actuator.transform.scale.x) / 2, 0.02),
+          };
+        });
+      const rootCapsuleIds = actuators
+        .filter((actuator) => actuator.parentId === null && actuator.shape === "capsule")
+        .map((actuator) => actuator.id);
+
+      if (capsules.length === 0) {
+        setRuntimeBindings([]);
+        setBindingsRevision(revision);
+        onSkinningStats({ vertexCount: baseVerticesWorld.length, capsuleCount: 0, averageWeight: 0 });
+        onSkinningComputationStatus({
+          busy: false,
+          revision,
+          completed: true,
+          bindingHash: `bind:${revision}:empty`,
+          meshHash,
+        });
+        return;
+      }
+
+      const nearest = bindVerticesToClosestCapsule(baseVerticesWorld, capsules, {
+        rootCapsuleIds,
+        falloffMultiplier: 2,
+      });
+      if (skinningJobTokenRef.current !== currentToken) return;
+
+      const actuatorById = new Map(
+        actuators.map((actuator) => [
+          actuator.id,
+          {
+            rigId: actuator.rigId,
+            position: new Vector3(
+              actuator.transform.position.x,
+              actuator.transform.position.y,
+              actuator.transform.position.z,
+            ),
+            rotation: new Quaternion(
+              actuator.transform.rotation.x,
+              actuator.transform.rotation.y,
+              actuator.transform.rotation.z,
+              actuator.transform.rotation.w,
+            ),
+          },
+        ]),
+      );
+      const rootIdByRig = new Map<string, string>();
+      for (const actuator of actuators) {
+        if (actuator.parentId !== null || actuator.shape !== "capsule") continue;
+        rootIdByRig.set(actuator.rigId, actuator.id);
+      }
+      const fallbackRootCapsuleId = rootCapsuleIds[0] ?? null;
+
+      const nextBindings: RuntimeVertexBinding[] = nearest.map((binding, index) => {
+        const bindWorld = baseVerticesWorld[index];
+        const influenceActuator = actuatorById.get(binding.capsuleId);
+        const rigScopedRootId =
+          influenceActuator === undefined
+            ? null
+            : (rootIdByRig.get(influenceActuator.rigId) ?? fallbackRootCapsuleId);
+        const rootCapsuleId = rigScopedRootId ?? fallbackRootCapsuleId;
+        const rootActuator = rootCapsuleId === null ? undefined : actuatorById.get(rootCapsuleId);
+        const rootLocalOffset =
+          rootActuator === undefined
+            ? { x: 0, y: 0, z: 0 }
+            : (() => {
+                const offset = new Vector3(bindWorld.x, bindWorld.y, bindWorld.z)
+                  .sub(rootActuator.position)
+                  .applyQuaternion(rootActuator.rotation.clone().invert());
+                return { x: offset.x, y: offset.y, z: offset.z };
+              })();
+
+        if (influenceActuator === undefined) {
+          return {
+            capsuleId: binding.capsuleId,
+            rootCapsuleId,
+            bindWorld,
+            localOffset: { x: 0, y: 0, z: 0 },
+            rootLocalOffset,
+            weight: 0,
+          };
+        }
+
+        const localOffset = new Vector3(bindWorld.x, bindWorld.y, bindWorld.z)
+          .sub(influenceActuator.position)
+          .applyQuaternion(influenceActuator.rotation.clone().invert());
+        return {
+          capsuleId: binding.capsuleId,
+          rootCapsuleId,
+          bindWorld,
+          localOffset: { x: localOffset.x, y: localOffset.y, z: localOffset.z },
+          rootLocalOffset,
+          weight: binding.weight,
+        };
+      });
+
+      const averageWeight = nextBindings.reduce((sum, binding) => sum + binding.weight, 0) / Math.max(nextBindings.length, 1);
+      const bindingHash = `bind:${revision}:${nextBindings.length}:${capsules.length}:${averageWeight.toFixed(6)}`;
+      setRuntimeBindings(nextBindings);
+      setBindingsRevision(revision);
+      onSkinningStats({
+        vertexCount: baseVerticesWorld.length,
+        capsuleCount: capsules.length,
+        averageWeight,
+      });
+      onSkinningComputationStatus({
+        busy: false,
+        revision,
+        completed: true,
+        bindingHash,
+        meshHash,
+      });
+    };
+
+    void run();
+  }, [baseVerticesWorld, meshHash, onSkinningComputationStatus, onSkinningStats, skinningRevision]);
+
+  useEffect(() => {
+    if (displayGeometry === null) return;
+    const position = displayGeometry.getAttribute("position");
+    if (position === undefined) return;
+
+    const actuatorById = new Map(
+      actuators.map((actuator) => [
+        actuator.id,
+        {
+          position: new Vector3(
+            actuator.transform.position.x,
+            actuator.transform.position.y,
+            actuator.transform.position.z,
+          ),
+          rotation: new Quaternion(
+            actuator.transform.rotation.x,
+            actuator.transform.rotation.y,
+            actuator.transform.rotation.z,
+            actuator.transform.rotation.w,
+          ),
+        },
+      ]),
+    );
+
+    const shouldDeformInPose =
+      appMode === "Pose" &&
+      skinningEnabled &&
+      runtimeBindings !== null &&
+      runtimeBindings.length === baseVerticesLocal.length &&
+      bindingsRevision >= skinningRevision;
+
+    const deformed = baseVerticesLocal.map((bindLocal, index) => {
+      if (!shouldDeformInPose) return bindLocal;
+      const binding = runtimeBindings[index];
+      if (binding === undefined) return bindLocal;
+
+      const actuator = actuatorById.get(binding.capsuleId);
+      const rootActuator = binding.rootCapsuleId === null ? undefined : actuatorById.get(binding.rootCapsuleId);
+
+      const bindWorld = new Vector3(binding.bindWorld.x, binding.bindWorld.y, binding.bindWorld.z);
+      const transformedWorld =
+        actuator === undefined
+          ? bindWorld.clone()
+          : new Vector3(binding.localOffset.x, binding.localOffset.y, binding.localOffset.z)
+              .applyQuaternion(actuator.rotation)
+              .add(actuator.position);
+      const rootWorld =
+        rootActuator === undefined
+          ? bindWorld.clone()
+          : new Vector3(binding.rootLocalOffset.x, binding.rootLocalOffset.y, binding.rootLocalOffset.z)
+              .applyQuaternion(rootActuator.rotation)
+              .add(rootActuator.position);
+      const weight = Math.max(0, Math.min(1, binding.weight));
+      const weightedWorld = new Vector3(
+        rootWorld.x + (transformedWorld.x - rootWorld.x) * weight,
+        rootWorld.y + (transformedWorld.y - rootWorld.y) * weight,
+        rootWorld.z + (transformedWorld.z - rootWorld.z) * weight,
+      );
+
+      return {
+        x: weightedWorld.x / meshScale,
+        y: (weightedWorld.y - meshYOffset) / meshScale,
+        z: weightedWorld.z / meshScale,
+      };
+    });
+
+    let finalVertices = deformed;
+    if (shouldDeformInPose && deltaMushEnabled) {
+      const deltaMushIterations = Math.max(0, Math.floor(deltaMushSettings.iterations));
+      const deltaMushStrength = Math.max(0, Math.min(1, deltaMushSettings.strength));
+      const weldedCurrent = weldData.weldedVertices.map((_, weldedIndex) => {
+        const members = weldData.weldedToVertices[weldedIndex] ?? [];
+        if (members.length === 0) return { x: 0, y: 0, z: 0 };
+        let sx = 0;
+        let sy = 0;
+        let sz = 0;
+        for (const vertexIndex of members) {
+          sx += deformed[vertexIndex].x;
+          sy += deformed[vertexIndex].y;
+          sz += deformed[vertexIndex].z;
+        }
+        const inv = 1 / members.length;
+        return { x: sx * inv, y: sy * inv, z: sz * inv };
+      });
+
+      const smoothedWelded = applyDeltaMush(weldedCurrent, weldedNeighbors, deltaMushIterations, deltaMushStrength);
+      finalVertices = deformed.map((_, vertexIndex) => {
+        const weldedIndex = weldData.vertexToWelded[vertexIndex];
+        return smoothedWelded[weldedIndex];
+      });
+    }
+
+    for (let i = 0; i < finalVertices.length; i += 1) {
+      position.setXYZ(i, finalVertices[i].x, finalVertices[i].y, finalVertices[i].z);
+    }
+    position.needsUpdate = true;
+  }, [
+    actuators,
+    appMode,
+    baseVerticesLocal,
+    bindingsRevision,
+    deltaMushEnabled,
+    deltaMushSettings,
+    displayGeometry,
+    runtimeBindings,
+    skinningEnabled,
+    skinningRevision,
+    weldData,
+    weldedNeighbors,
+  ]);
+
+  if (displayGeometry === null) return null;
 
   const ignoreRaycast = () => {};
 
   return (
     <mesh
-      geometry={chadMeshGeometry}
-      scale={[0.01, 0.01, 0.01]}
-      position={[0, 0.02, 0]}
+      geometry={displayGeometry}
+      scale={[meshScale, meshScale, meshScale]}
+      position={[0, meshYOffset, 0]}
       castShadow
       receiveShadow
       raycast={ignoreRaycast}
@@ -333,9 +892,16 @@ function ChadReferenceMesh() {
 
 function SceneContent({
   actuators,
+  appMode,
   selectedActuatorId,
   selectedActuatorIds,
-  selectedObject,
+  physicsEnabled,
+  skinningEnabled,
+  skinningRevision,
+  deltaMushEnabled,
+  deltaMushSettings,
+  onSkinningStats,
+  onSkinningComputationStatus,
   gizmoMode,
   gizmoSpace,
   pivotMode,
@@ -347,18 +913,26 @@ function SceneContent({
   onTransformChange,
   onTransformEnd,
 }: SceneContentProps) {
+  const { scene } = useThree();
   const xrMode = useXR((state) => state.mode);
   const isInXR = xrMode !== null;
   const selectedIdSet = useMemo(() => new Set(selectedActuatorIds), [selectedActuatorIds]);
   const pivotObjectRef = useRef<Object3D>(new Object3D());
   const transformControlsRef = useRef<any>(null);
-  const dragStartSelectedMatrixRef = useRef(new Matrix4());
   const dragStartPivotMatrixRef = useRef(new Matrix4());
+  const dragStartPivotPositionRef = useRef(new Vector3());
   const dragActuatorIdRef = useRef<string | null>(null);
+  const isDragActiveRef = useRef(false);
+  const hasAcceptedDragFrameRef = useRef(false);
+  const backgroundBlendRef = useRef(appMode === "Pose" ? 1 : 0);
+  const backgroundBlendVelocityRef = useRef(0);
+  const blendedBackgroundRef = useRef(new Color("#d9ecff"));
+  const lightBackground = useMemo(() => new Color("#d9ecff"), []);
+  const darkBackground = useMemo(() => new Color("#1d2230"), []);
 
-  useEffect(() => {
+  function syncPivotFromSelection() {
     const pivotObject = pivotObjectRef.current;
-    if (isTransformDragging) return;
+    if (isTransformDragging || isDragActiveRef.current) return;
 
     if (pivotMode === "world") {
       pivotObject.position.set(0, 0, 0);
@@ -368,13 +942,28 @@ function SceneContent({
       return;
     }
 
-    if (selectedObject !== null) {
-      pivotObject.position.copy(selectedObject.position);
-      pivotObject.quaternion.copy(selectedObject.quaternion);
-      pivotObject.scale.copy(selectedObject.scale);
+    if (selectedActuatorId !== null) {
+      const selectedActuator = actuators.find((actuator) => actuator.id === selectedActuatorId);
+      if (selectedActuator === undefined) return;
+      pivotObject.position.set(
+        selectedActuator.transform.position.x,
+        selectedActuator.transform.position.y,
+        selectedActuator.transform.position.z,
+      );
+      pivotObject.quaternion.set(
+        selectedActuator.transform.rotation.x,
+        selectedActuator.transform.rotation.y,
+        selectedActuator.transform.rotation.z,
+        selectedActuator.transform.rotation.w,
+      );
+      pivotObject.scale.set(1, 1, 1);
       pivotObject.updateMatrixWorld(true);
     }
-  }, [isTransformDragging, pivotMode, selectedObject]);
+  }
+
+  useEffect(() => {
+    syncPivotFromSelection();
+  }, [isTransformDragging, pivotMode, selectedActuatorId, actuators]);
 
   useEffect(() => {
     const controls = transformControlsRef.current;
@@ -400,6 +989,40 @@ function SceneContent({
     });
   }, [gizmoMode, gizmoSpace, pivotMode, selectedActuatorId]);
 
+  useFrame((_, delta) => {
+    const targetBlend = appMode === "Pose" ? 1 : 0;
+    const blended = smoothDampScalar(
+      backgroundBlendRef.current,
+      targetBlend,
+      backgroundBlendVelocityRef.current,
+      0.15,
+      delta,
+    );
+    backgroundBlendRef.current = blended.value;
+    backgroundBlendVelocityRef.current = blended.velocity;
+    const t = backgroundBlendRef.current;
+    blendedBackgroundRef.current.setRGB(
+      lightBackground.r + (darkBackground.r - lightBackground.r) * t,
+      lightBackground.g + (darkBackground.g - lightBackground.g) * t,
+      lightBackground.b + (darkBackground.b - lightBackground.b) * t,
+    );
+    scene.background = blendedBackgroundRef.current;
+
+    syncPivotFromSelection();
+    const controls = transformControlsRef.current;
+    if (controls === null || controls === undefined) return;
+    controls.traverse((object: Object3D) => {
+      const mesh = object as Mesh;
+      if (!mesh.isMesh) return;
+      const material = mesh.material;
+      if (Array.isArray(material)) {
+        for (const entry of material) entry.side = DoubleSide;
+      } else if (material !== undefined && material !== null) {
+        material.side = DoubleSide;
+      }
+    });
+  });
+
   function getGeometry(shape: ActuatorShape, size: Vec3) {
     if (shape === "sphere") return <sphereGeometry args={[Math.max(size.x, size.y, size.z) * 0.5, 18, 14]} />;
     if (shape === "capsule") return <capsuleGeometry args={[Math.max(size.x, size.z) * 0.5, size.y, 8, 14]} />;
@@ -408,15 +1031,24 @@ function SceneContent({
 
   return (
     <>
-      <color attach="background" args={["#d9ecff"]} />
       <ambientLight intensity={0.6} />
       <directionalLight position={[4, 6, 3]} intensity={1.1} />
-      <ChadReferenceMesh />
+      <primitive object={pivotObjectRef.current} visible={false} />
+      <ChadReferenceMesh
+        actuators={actuators}
+        appMode={appMode}
+        skinningEnabled={skinningEnabled}
+        skinningRevision={skinningRevision}
+        deltaMushEnabled={deltaMushEnabled}
+        deltaMushSettings={deltaMushSettings}
+        onSkinningStats={onSkinningStats}
+        onSkinningComputationStatus={onSkinningComputationStatus}
+      />
 
-      <Physics gravity={[0, -9.81, 0]}>
+      <Physics gravity={[0, -9.81, 0]} paused={!physicsEnabled}>
         {actuators.map((actuator) => {
           const isSelected = selectedIdSet.has(actuator.id);
-          const isRoot = actuator.id === "act_root";
+          const isRoot = actuator.parentId === null;
           const color = isSelected ? "#ff6a3d" : isRoot ? "#28a26a" : "#2f7fd1";
 
           return (
@@ -435,8 +1067,12 @@ function SceneContent({
               scale={[actuator.transform.scale.x, actuator.transform.scale.y, actuator.transform.scale.z]}
               onClick={(event) => {
                 event.stopPropagation();
-                onSelectActuator(actuator.id);
+                onSelectActuator(actuator.id, {
+                  additive: event.shiftKey,
+                  toggle: event.ctrlKey || event.metaKey,
+                });
               }}
+              onPointerDown={(event) => event.stopPropagation()}
               castShadow
             >
               {getGeometry(actuator.shape, actuator.size)}
@@ -445,72 +1081,59 @@ function SceneContent({
           );
         })}
 
-        {selectedActuatorId !== null && selectedObject !== null && !isInXR && gizmoMode !== "select" ? (
+        {selectedActuatorId !== null && !isInXR && gizmoMode !== "select" ? (
           <TransformControls
             ref={transformControlsRef}
             mode={gizmoMode}
             space={gizmoSpace}
             size={0.75}
-            object={pivotMode === "object" ? selectedObject : pivotObjectRef.current}
+            object={pivotObjectRef.current}
             onMouseDown={() => {
+              hasAcceptedDragFrameRef.current = false;
+              syncPivotFromSelection();
+              isDragActiveRef.current = true;
               dragActuatorIdRef.current = selectedActuatorId;
-              selectedObject.updateMatrixWorld(true);
-              dragStartSelectedMatrixRef.current.copy(selectedObject.matrixWorld);
-
-              const pivotTarget = pivotMode === "object" ? selectedObject : pivotObjectRef.current;
+              const pivotTarget = pivotObjectRef.current;
               pivotTarget.updateMatrixWorld(true);
               dragStartPivotMatrixRef.current.copy(pivotTarget.matrixWorld);
+              dragStartPivotPositionRef.current.setFromMatrixPosition(dragStartPivotMatrixRef.current);
               onTransformStart();
             }}
             onMouseUp={() => {
+              isDragActiveRef.current = false;
+              hasAcceptedDragFrameRef.current = false;
               dragActuatorIdRef.current = null;
               onTransformEnd();
             }}
             onObjectChange={() => {
+              if (!isDragActiveRef.current) return;
               const actuatorId = dragActuatorIdRef.current;
               if (actuatorId === null) return;
-
-              if (pivotMode === "object") {
-                onTransformChange(
-                  actuatorId,
-                  {
-                    x: selectedObject.position.x,
-                    y: selectedObject.position.y,
-                    z: selectedObject.position.z,
-                  },
-                  {
-                    x: selectedObject.quaternion.x,
-                    y: selectedObject.quaternion.y,
-                    z: selectedObject.quaternion.z,
-                    w: selectedObject.quaternion.w,
-                  },
-                  {
-                    x: selectedObject.scale.x,
-                    y: selectedObject.scale.y,
-                    z: selectedObject.scale.z,
-                  },
-                );
-                return;
-              }
 
               const pivotObject = pivotObjectRef.current;
               pivotObject.updateMatrixWorld(true);
 
               const startPivotInverse = dragStartPivotMatrixRef.current.clone().invert();
-              const deltaMatrix = pivotObject.matrixWorld.clone().multiply(startPivotInverse);
-              const nextSelectedMatrix = deltaMatrix.multiply(dragStartSelectedMatrixRef.current.clone());
+              const worldDelta = pivotObject.matrixWorld.clone().multiply(startPivotInverse);
+              const localDelta = startPivotInverse.clone().multiply(pivotObject.matrixWorld.clone());
+              const currentPivotPosition = new Vector3().setFromMatrixPosition(pivotObject.matrixWorld);
+              const worldOffset = currentPivotPosition.sub(dragStartPivotPositionRef.current);
 
-              const nextPosition = new Vector3();
-              const nextQuaternion = new Quaternion();
-              const nextScale = new Vector3();
-              nextSelectedMatrix.decompose(nextPosition, nextQuaternion, nextScale);
+              if (!hasAcceptedDragFrameRef.current) {
+                // Guard against TransformControls first-frame matrix jump.
+                if (worldOffset.length() > 1) {
+                  dragStartPivotMatrixRef.current.copy(pivotObject.matrixWorld);
+                  dragStartPivotPositionRef.current.setFromMatrixPosition(pivotObject.matrixWorld);
+                  return;
+                }
+                hasAcceptedDragFrameRef.current = true;
+              }
 
-              onTransformChange(
-                actuatorId,
-                { x: nextPosition.x, y: nextPosition.y, z: nextPosition.z },
-                { x: nextQuaternion.x, y: nextQuaternion.y, z: nextQuaternion.z, w: nextQuaternion.w },
-                { x: nextScale.x, y: nextScale.y, z: nextScale.z },
-              );
+              onTransformChange(actuatorId, worldDelta, localDelta, {
+                x: worldOffset.x,
+                y: worldOffset.y,
+                z: worldOffset.z,
+              });
             }}
           />
         ) : null}
@@ -548,27 +1171,46 @@ export default function App() {
   const canUseWebXR = typeof navigator !== "undefined" && "xr" in navigator;
   const createdAtRef = useRef(new Date().toISOString());
   const nextActuatorIndexRef = useRef(1);
+  const nextRigIndexRef = useRef(2);
   const actuatorObjectRefs = useRef<Record<string, Object3D | null>>({});
   const canvasWrapRef = useRef<HTMLDivElement | null>(null);
   const cameraRef = useRef<any>(null);
+  const raycasterRef = useRef(new Raycaster());
+  const pointerNdcRef = useRef(new Vector2());
   const marqueeDragRef = useRef<{
     pointerId: number;
     startX: number;
     startY: number;
     moved: boolean;
+    additive: boolean;
+    toggle: boolean;
   } | null>(null);
   const undoStackRef = useRef<EditorState[]>([]);
   const redoStackRef = useRef<EditorState[]>([]);
+  const initialRigId = "rig_001";
+  const initialRoot = createRootActuator(initialRigId);
   const [editorState, setEditorState] = useState<EditorState>({
-    actuators: [ROOT_ACTUATOR],
-    selectedActuatorId: ROOT_ACTUATOR.id,
-    selectedActuatorIds: [ROOT_ACTUATOR.id],
+    actuators: [initialRoot],
+    selectedRigId: initialRigId,
+    selectedActuatorId: initialRoot.id,
+    selectedActuatorIds: [initialRoot.id],
   });
   const [isTransformDragging, setIsTransformDragging] = useState(false);
-  const [invertOrbitX, setInvertOrbitX] = useState(false);
   const [gizmoMode, setGizmoMode] = useState<GizmoMode>("translate");
   const [gizmoSpace, setGizmoSpace] = useState<"world" | "local">("world");
   const [pivotMode, setPivotMode] = useState<PivotMode>("object");
+  const [appMode, setAppMode] = useState<AppMode>("Rig");
+  const [newActuatorShape, setNewActuatorShape] = useState<ActuatorShape>("capsule");
+  const [deltaMushEnabled, setDeltaMushEnabled] = useState(true);
+  const [deltaMushSettings, setDeltaMushSettings] = useState<DeltaMushSettings>({
+    iterations: 2,
+    strength: 0.25,
+  });
+  const [skinningStats, setSkinningStats] = useState<SkinningStats>({
+    vertexCount: 0,
+    capsuleCount: 0,
+    averageWeight: 0,
+  });
   const [focusRequest, setFocusRequest] = useState<FocusRequest | null>(null);
   const [focusNonce, setFocusNonce] = useState(0);
   const [marqueeRect, setMarqueeRect] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
@@ -577,18 +1219,250 @@ export default function App() {
   const [playbackTimeSec, setPlaybackTimeSec] = useState(0);
   const playbackClockRef = useRef<PlaybackClock | null>(null);
   const transformStartSnapshotRef = useRef<EditorState | null>(null);
+  const editorStateRef = useRef<EditorState>(editorState);
+  const [skinningRevision, setSkinningRevision] = useState(1);
+  const [skinningBusy, setSkinningBusy] = useState(false);
+  const [completedSkinningRevision, setCompletedSkinningRevision] = useState(0);
+  const [skinBindingHash, setSkinBindingHash] = useState("pending");
+  const [skinMeshHash, setSkinMeshHash] = useState("pending");
+  const [skinningEnabled, setSkinningEnabled] = useState(false);
+  const [pendingPoseRevision, setPendingPoseRevision] = useState<number | null>(null);
+  const bindPoseTransformsRef = useRef<Record<string, ActuatorTransformSnapshot> | null>(null);
+  const bindBlendStateRef = useRef<{
+    target: Record<string, ActuatorTransformSnapshot>;
+    lastTimestampMs: number | null;
+    velocityById: Record<
+      string,
+      {
+        position: SmoothDampVec3Velocity;
+        scale: SmoothDampVec3Velocity;
+        rotation: SmoothDampQuatVelocity;
+      }
+    >;
+  } | null>(null);
+  const [bindBlendNonce, setBindBlendNonce] = useState(0);
 
   const actuators = editorState.actuators;
+  const selectedRigId = editorState.selectedRigId;
   const selectedActuatorId = editorState.selectedActuatorId;
   const selectedActuatorIds = editorState.selectedActuatorIds;
-  const selectedObject = selectedActuatorId !== null ? (actuatorObjectRefs.current[selectedActuatorId] ?? null) : null;
+  const rigIds = useMemo(() => [...new Set(actuators.map((actuator) => actuator.rigId))].sort(), [actuators]);
+  const onSkinningStats = useCallback((stats: SkinningStats) => {
+    setSkinningStats(stats);
+  }, []);
+  const onSkinningComputationStatus = useCallback((status: SkinningComputationStatus) => {
+    setSkinningBusy(status.busy);
+    if (!status.completed) return;
+    setCompletedSkinningRevision((previous) => Math.max(previous, status.revision));
+    if (status.bindingHash !== null) {
+      setSkinBindingHash(status.bindingHash);
+    }
+    if (status.meshHash !== null) {
+      setSkinMeshHash(status.meshHash);
+    }
+  }, []);
+  const physicsEnabled = false;
+
+  useEffect(() => {
+    editorStateRef.current = editorState;
+  }, [editorState]);
 
   function setActuatorObjectRef(id: string, object: Object3D | null) {
     actuatorObjectRefs.current[id] = object;
   }
 
+  function snapshotActuatorTransforms(sourceActuators: ActuatorEntity[] = actuators): Record<string, ActuatorTransformSnapshot> {
+    const snapshots: Record<string, ActuatorTransformSnapshot> = {};
+    for (const actuator of sourceActuators) {
+      snapshots[actuator.id] = {
+        position: { ...actuator.transform.position },
+        rotation: { ...actuator.transform.rotation },
+        scale: { ...actuator.transform.scale },
+      };
+    }
+    return snapshots;
+  }
+
+  function requestAppMode(nextMode: AppMode) {
+    if (nextMode === "Pose") {
+      if (appMode === "Pose" && pendingPoseRevision === null) return;
+      const requiredRevision = skinningRevision + 1;
+      setPendingPoseRevision(requiredRevision);
+      setSkinningEnabled(true);
+      setSkinningRevision(requiredRevision);
+      return;
+    }
+
+    if (appMode === "Rig" && pendingPoseRevision === null) return;
+    setPendingPoseRevision(null);
+    setSkinningEnabled(false);
+    setAppMode("Rig");
+
+    const bindPose = bindPoseTransformsRef.current;
+    if (bindPose === null) return;
+    const velocityById: Record<
+      string,
+      {
+        position: SmoothDampVec3Velocity;
+        scale: SmoothDampVec3Velocity;
+        rotation: SmoothDampQuatVelocity;
+      }
+    > = {};
+    for (const actuatorId of Object.keys(bindPose)) {
+      velocityById[actuatorId] = {
+        position: { x: 0, y: 0, z: 0 },
+        scale: { x: 0, y: 0, z: 0 },
+        rotation: { x: 0, y: 0, z: 0, w: 0 },
+      };
+    }
+    bindBlendStateRef.current = {
+      target: bindPose,
+      lastTimestampMs: null,
+      velocityById,
+    };
+    setBindBlendNonce((value) => value + 1);
+  }
+
+  useEffect(() => {
+    if (appMode !== "Rig") return;
+    if (pendingPoseRevision !== null) return;
+    if (bindBlendStateRef.current !== null) return;
+    const timer = setTimeout(() => {
+      setSkinningRevision((value) => value + 1);
+    }, 60);
+    return () => clearTimeout(timer);
+  }, [actuators, appMode, pendingPoseRevision]);
+
+  useEffect(() => {
+    if (pendingPoseRevision === null) return;
+    if (skinningBusy) return;
+    if (completedSkinningRevision < pendingPoseRevision) return;
+    bindPoseTransformsRef.current = snapshotActuatorTransforms();
+    setSkinningEnabled(true);
+    setAppMode("Pose");
+    setPendingPoseRevision(null);
+  }, [actuators, completedSkinningRevision, pendingPoseRevision, skinningBusy]);
+
+  useEffect(() => {
+    const blend = bindBlendStateRef.current;
+    if (blend === null) return;
+
+    let frameId = 0;
+    const update = (timestamp: number) => {
+      const activeBlend = bindBlendStateRef.current;
+      if (activeBlend === null) return;
+      const previousTimestamp = activeBlend.lastTimestampMs ?? timestamp;
+      const deltaSec = Math.max(1 / 240, Math.min((timestamp - previousTimestamp) / 1000, 1 / 15));
+      activeBlend.lastTimestampMs = timestamp;
+
+      const source = editorStateRef.current;
+      let allSettled = true;
+      const nextActuators = source.actuators.map((actuator) => {
+        const target = activeBlend.target[actuator.id];
+        if (target === undefined) return actuator;
+
+        const velocity = activeBlend.velocityById[actuator.id] ?? {
+          position: { x: 0, y: 0, z: 0 },
+          scale: { x: 0, y: 0, z: 0 },
+          rotation: { x: 0, y: 0, z: 0, w: 0 },
+        };
+        activeBlend.velocityById[actuator.id] = velocity;
+
+        const smoothedPosition = smoothDampVec3(
+          new Vector3(
+            actuator.transform.position.x,
+            actuator.transform.position.y,
+            actuator.transform.position.z,
+          ),
+          new Vector3(target.position.x, target.position.y, target.position.z),
+          velocity.position,
+          0.08,
+          deltaSec,
+        );
+        const smoothedScale = smoothDampVec3(
+          new Vector3(
+            actuator.transform.scale.x,
+            actuator.transform.scale.y,
+            actuator.transform.scale.z,
+          ),
+          new Vector3(target.scale.x, target.scale.y, target.scale.z),
+          velocity.scale,
+          0.08,
+          deltaSec,
+        );
+        const smoothedRotation = smoothDampQuat(
+          new Quaternion(
+            actuator.transform.rotation.x,
+            actuator.transform.rotation.y,
+            actuator.transform.rotation.z,
+            actuator.transform.rotation.w,
+          ),
+          new Quaternion(target.rotation.x, target.rotation.y, target.rotation.z, target.rotation.w),
+          velocity.rotation,
+          0.08,
+          deltaSec,
+        );
+
+        const positionError = smoothedPosition.distanceTo(
+          new Vector3(target.position.x, target.position.y, target.position.z),
+        );
+        const scaleError = smoothedScale.distanceTo(new Vector3(target.scale.x, target.scale.y, target.scale.z));
+        const rotationError = smoothedRotation.angleTo(
+          new Quaternion(target.rotation.x, target.rotation.y, target.rotation.z, target.rotation.w),
+        );
+        const velocityMagnitude =
+          Math.hypot(velocity.position.x, velocity.position.y, velocity.position.z) +
+          Math.hypot(velocity.scale.x, velocity.scale.y, velocity.scale.z) +
+          Math.hypot(velocity.rotation.x, velocity.rotation.y, velocity.rotation.z, velocity.rotation.w);
+        if (positionError > 0.0008 || scaleError > 0.0008 || rotationError > 0.0015 || velocityMagnitude > 0.02) {
+          allSettled = false;
+        }
+
+        return {
+          ...actuator,
+          transform: {
+            ...actuator.transform,
+            position: {
+              x: smoothedPosition.x,
+              y: smoothedPosition.y,
+              z: smoothedPosition.z,
+            },
+            rotation: {
+              x: smoothedRotation.x,
+              y: smoothedRotation.y,
+              z: smoothedRotation.z,
+              w: smoothedRotation.w,
+            },
+            scale: normalizePositiveScale({
+              x: smoothedScale.x,
+              y: smoothedScale.y,
+              z: smoothedScale.z,
+            }),
+          },
+        };
+      });
+
+      const nextState: EditorState = {
+        ...source,
+        actuators: nextActuators,
+      };
+      editorStateRef.current = nextState;
+      setEditorState(nextState);
+
+      if (allSettled) {
+        bindBlendStateRef.current = null;
+      } else {
+        frameId = requestAnimationFrame(update);
+      }
+    };
+
+    frameId = requestAnimationFrame(update);
+    return () => cancelAnimationFrame(frameId);
+  }, [bindBlendNonce]);
+
   function cloneEditorState(state: EditorState): EditorState {
     return {
+      selectedRigId: state.selectedRigId,
       selectedActuatorId: state.selectedActuatorId,
       selectedActuatorIds: [...state.selectedActuatorIds],
       actuators: state.actuators.map((actuator) => ({
@@ -620,17 +1494,47 @@ export default function App() {
       preferredId !== undefined && preferredId !== null && sortedUnique.includes(preferredId)
         ? preferredId
         : (sortedUnique[0] ?? null);
+    const selectedPrimary = primary === null ? null : actuators.find((actuator) => actuator.id === primary);
+    const primaryRigId = selectedPrimary?.rigId ?? selectedRigId;
+    const rigConstrained =
+      appMode === "Rig"
+        ? sortedUnique.filter((id) => {
+            const actuator = actuators.find((item) => item.id === id);
+            return actuator?.rigId === primaryRigId;
+          })
+        : sortedUnique;
+    const nextPrimary =
+      preferredId !== undefined && preferredId !== null && rigConstrained.includes(preferredId)
+        ? preferredId
+        : (rigConstrained[0] ?? null);
+    const nextRigId = primaryRigId;
 
     commitEditorChange((previous) => {
-      const samePrimary = previous.selectedActuatorId === primary;
+      const samePrimary = previous.selectedActuatorId === nextPrimary;
+      const sameRig = previous.selectedRigId === nextRigId;
       const sameIds =
-        previous.selectedActuatorIds.length === sortedUnique.length &&
-        previous.selectedActuatorIds.every((id, index) => id === sortedUnique[index]);
-      if (samePrimary && sameIds) return previous;
+        previous.selectedActuatorIds.length === rigConstrained.length &&
+        previous.selectedActuatorIds.every((id, index) => id === rigConstrained[index]);
+      if (samePrimary && sameIds && sameRig) return previous;
       return {
         actuators: previous.actuators,
-        selectedActuatorId: primary,
-        selectedActuatorIds: sortedUnique,
+        selectedRigId: nextRigId,
+        selectedActuatorId: nextPrimary,
+        selectedActuatorIds: rigConstrained,
+      };
+    });
+  }
+
+  function setActiveRig(rigId: string) {
+    commitEditorChange((previous) => {
+      const rigActuators = previous.actuators.filter((actuator) => actuator.rigId === rigId);
+      const preferred = rigActuators.find((actuator) => actuator.id === previous.selectedActuatorId) ?? rigActuators[0] ?? null;
+      const nextSelection = preferred === null ? [] : [preferred.id];
+      return {
+        actuators: previous.actuators,
+        selectedRigId: rigId,
+        selectedActuatorId: preferred?.id ?? null,
+        selectedActuatorIds: nextSelection,
       };
     });
   }
@@ -643,10 +1547,12 @@ export default function App() {
 
     commitEditorChange((previous) => ({
       actuators: (() => {
+        const activeRigId = previous.selectedRigId;
+        const rigActuators = previous.actuators.filter((actuator) => actuator.rigId === activeRigId);
+        const fallbackRoot = rigActuators.find((actuator) => actuator.parentId === null) ?? createRootActuator(activeRigId);
         const parent =
-          previous.actuators.find((actuator) => actuator.id === previous.selectedActuatorId) ??
-          previous.actuators.find((actuator) => actuator.id === ROOT_ACTUATOR.id) ??
-          ROOT_ACTUATOR;
+          previous.actuators.find((actuator) => actuator.id === previous.selectedActuatorId && actuator.rigId === activeRigId) ??
+          fallbackRoot;
 
         const parentRotation = new Quaternion(
           parent.transform.rotation.x,
@@ -660,17 +1566,23 @@ export default function App() {
           parent.transform.position.z,
         );
 
-        const childSize = { x: 0.4, y: 0.4, z: 0.4 };
+        const childSize =
+          newActuatorShape === "capsule"
+            ? { x: 0.35, y: 0.7, z: 0.35 }
+            : newActuatorShape === "sphere"
+              ? { x: 0.45, y: 0.45, z: 0.45 }
+              : { x: 0.4, y: 0.4, z: 0.4 };
         const parentHalfHeight = (parent.size.y * parent.transform.scale.y) / 2;
         const childHalfHeight = childSize.y / 2;
         const endOffset = new Vector3(0, parentHalfHeight + childHalfHeight + 0.08, 0).applyQuaternion(parentRotation);
         const spawnPosition = parentPosition.add(endOffset);
 
         const actuator: ActuatorEntity = {
-          id,
+          id: `${activeRigId}_${id}`,
+          rigId: activeRigId,
           parentId: parent.id,
           type: "custom",
-          shape: "box",
+          shape: newActuatorShape,
           transform: {
             position: {
               x: spawnPosition.x,
@@ -690,14 +1602,32 @@ export default function App() {
 
         return [...previous.actuators, actuator];
       })(),
-      selectedActuatorId: id,
-      selectedActuatorIds: [id],
+      selectedRigId: previous.selectedRigId,
+      selectedActuatorId: `${previous.selectedRigId}_${id}`,
+      selectedActuatorIds: [`${previous.selectedRigId}_${id}`],
+    }));
+  }
+
+  function createRig() {
+    const rigIndex = nextRigIndexRef.current;
+    nextRigIndexRef.current += 1;
+    const rigId = `rig_${rigIndex.toString().padStart(3, "0")}`;
+    const root = createRootActuator(rigId, (rigIndex - 1) * 1.5);
+
+    commitEditorChange((previous) => ({
+      actuators: [...previous.actuators, root],
+      selectedRigId: rigId,
+      selectedActuatorId: root.id,
+      selectedActuatorIds: [root.id],
     }));
   }
 
   function deleteSelectedActuator() {
     commitEditorChange((previous) => {
-      const explicitSelectionIds = previous.selectedActuatorIds.filter((id) => id !== ROOT_ACTUATOR.id);
+      const explicitSelectionIds = previous.selectedActuatorIds.filter((id) => {
+        const actuator = previous.actuators.find((item) => item.id === id);
+        return actuator !== undefined && actuator.parentId !== null;
+      });
       if (explicitSelectionIds.length === 0) return previous;
 
       const removeIds = new Set<string>(explicitSelectionIds);
@@ -713,15 +1643,41 @@ export default function App() {
         }
       }
 
+      const remainingForRig = previous.actuators.filter(
+        (actuator) => actuator.rigId === previous.selectedRigId && !removeIds.has(actuator.id),
+      );
+      const nextRoot = remainingForRig.find((actuator) => actuator.parentId === null) ?? null;
+
       return {
         actuators: previous.actuators.filter((actuator) => !removeIds.has(actuator.id)),
-        selectedActuatorId: ROOT_ACTUATOR.id,
-        selectedActuatorIds: [ROOT_ACTUATOR.id],
+        selectedRigId: previous.selectedRigId,
+        selectedActuatorId: nextRoot?.id ?? null,
+        selectedActuatorIds: nextRoot === null ? [] : [nextRoot.id],
       };
     });
   }
 
-  function selectActuator(id: string) {
+  function selectActuator(id: string, options?: { additive?: boolean; toggle?: boolean }) {
+    const additive = options?.additive === true;
+    const toggle = options?.toggle === true;
+    const alreadySelected = selectedActuatorIds.includes(id);
+
+    if (toggle) {
+      if (alreadySelected) {
+        const remaining = selectedActuatorIds.filter((selectedId) => selectedId !== id);
+        setSelection(remaining, remaining[0] ?? null);
+        return;
+      }
+      setSelection([...selectedActuatorIds, id], id);
+      return;
+    }
+
+    if (additive) {
+      if (alreadySelected) return;
+      setSelection([...selectedActuatorIds, id], id);
+      return;
+    }
+
     setSelection([id], id);
   }
 
@@ -747,80 +1703,159 @@ export default function App() {
     });
   }
 
-  function applyTransformChange(id: string, position: Vec3, rotation: Quat, scale: Vec3) {
-    const normalizedScale = normalizePositiveScale(scale);
+  function applyTransformChange(id: string, worldDelta: Matrix4, localDelta: Matrix4, worldOffset: Vec3) {
+    const baseState = transformStartSnapshotRef.current ?? editorState;
+    const moved = baseState.actuators.find((actuator) => actuator.id === id);
+    if (moved === undefined) return;
+
+    const byId = new Map(baseState.actuators.map((actuator) => [actuator.id, actuator]));
+    const childrenByParent = new Map<string, string[]>();
+    for (const actuator of baseState.actuators) {
+      if (actuator.parentId === null) continue;
+      const siblings = childrenByParent.get(actuator.parentId) ?? [];
+      siblings.push(actuator.id);
+      childrenByParent.set(actuator.parentId, siblings);
+    }
+    for (const [parentId, children] of childrenByParent.entries()) {
+      children.sort((a, b) => a.localeCompare(b));
+      childrenByParent.set(parentId, children);
+    }
+
+    const worldMatrixById = new Map<string, Matrix4>();
+    for (const actuator of baseState.actuators) {
+      worldMatrixById.set(
+        actuator.id,
+        composeMatrix(actuator.transform.position, actuator.transform.rotation, actuator.transform.scale),
+      );
+    }
+
+    function depthOf(actuatorId: string): number {
+      let depth = 0;
+      let current = byId.get(actuatorId);
+      while (current !== undefined && current.parentId !== null) {
+        depth += 1;
+        current = byId.get(current.parentId);
+      }
+      return depth;
+    }
+
+    function applyDeltaToDescendants(parentId: string, delta: Matrix4) {
+      const children = childrenByParent.get(parentId) ?? [];
+      for (const childId of children) {
+        const original = worldMatrixById.get(childId);
+        if (original !== undefined) {
+          worldMatrixById.set(childId, delta.clone().multiply(original));
+        }
+        applyDeltaToDescendants(childId, delta);
+      }
+    }
+
+    const selectedOrdered = [...new Set(baseState.selectedActuatorIds)]
+      .filter((selectedId) => byId.has(selectedId))
+      .sort((a, b) => {
+        const da = depthOf(a);
+        const db = depthOf(b);
+        if (da !== db) return da - db;
+        return a.localeCompare(b);
+      });
+
+    const deltaPosition = new Vector3();
+    const deltaRotation = new Quaternion();
+    const deltaScale = new Vector3();
+    localDelta.decompose(deltaPosition, deltaRotation, deltaScale);
+
+    void worldDelta;
+    const worldTranslateDelta = new Vector3(worldOffset.x, worldOffset.y, worldOffset.z);
+
+    for (const selectedId of selectedOrdered) {
+      const original = worldMatrixById.get(selectedId);
+      if (original === undefined) continue;
+
+      const originalPosition = new Vector3();
+      const originalRotation = new Quaternion();
+      const originalScale = new Vector3();
+      original.decompose(originalPosition, originalRotation, originalScale);
+
+      const nextPosition = originalPosition.clone();
+      const nextRotation = originalRotation.clone();
+      const nextScale = originalScale.clone();
+
+      if (gizmoMode === "translate") {
+        nextPosition.add(worldTranslateDelta);
+      } else if (gizmoMode === "rotate") {
+        nextRotation.multiply(deltaRotation);
+      } else if (gizmoMode === "scale") {
+        nextScale.set(
+          nextScale.x * deltaScale.x,
+          nextScale.y * deltaScale.y,
+          nextScale.z * deltaScale.z,
+        );
+      }
+
+      const targetMatrix = new Matrix4().compose(nextPosition, nextRotation, nextScale);
+      worldMatrixById.set(selectedId, targetMatrix);
+      const subtreeDelta = targetMatrix.clone().multiply(original.clone().invert());
+      applyDeltaToDescendants(selectedId, subtreeDelta);
+    }
+
+    const nextActuators = baseState.actuators.map((actuator) => {
+      const nextMatrix = worldMatrixById.get(actuator.id);
+      if (nextMatrix === undefined) return actuator;
+
+      const nextPosition = new Vector3();
+      const nextRotation = new Quaternion();
+      const nextScale = new Vector3();
+      nextMatrix.decompose(nextPosition, nextRotation, nextScale);
+
+      return {
+        ...actuator,
+        transform: {
+          ...actuator.transform,
+          position: { x: nextPosition.x, y: nextPosition.y, z: nextPosition.z },
+          rotation: { x: nextRotation.x, y: nextRotation.y, z: nextRotation.z, w: nextRotation.w },
+          scale: normalizePositiveScale({
+            x: nextScale.x,
+            y: nextScale.y,
+            z: nextScale.z,
+          }),
+        },
+      };
+    });
+
+    // Apply scene-object transforms in the same event tick as gizmo movement.
+    for (const actuator of nextActuators) {
+      const object = actuatorObjectRefs.current[actuator.id];
+      if (object === null || object === undefined) continue;
+      object.position.set(
+        actuator.transform.position.x,
+        actuator.transform.position.y,
+        actuator.transform.position.z,
+      );
+      object.quaternion.set(
+        actuator.transform.rotation.x,
+        actuator.transform.rotation.y,
+        actuator.transform.rotation.z,
+        actuator.transform.rotation.w,
+      );
+      object.scale.set(
+        actuator.transform.scale.x,
+        actuator.transform.scale.y,
+        actuator.transform.scale.z,
+      );
+      object.updateMatrixWorld(true);
+    }
+
     setEditorState((previous) => ({
       ...previous,
-      actuators: (() => {
-        const moved = previous.actuators.find((actuator) => actuator.id === id);
-        if (moved === undefined) return previous.actuators;
-
-        const movedOldMatrix = composeMatrix(moved.transform.position, moved.transform.rotation, moved.transform.scale);
-        const movedNewMatrix = composeMatrix(position, rotation, normalizedScale);
-        const deltaMatrix = movedNewMatrix.clone().multiply(movedOldMatrix.clone().invert());
-
-        function isDescendant(candidateId: string): boolean {
-          let current = previous.actuators.find((actuator) => actuator.id === candidateId);
-          while (current !== undefined && current.parentId !== null) {
-            if (current.parentId === id) return true;
-            current = previous.actuators.find((actuator) => actuator.id === current?.parentId);
-          }
-          return false;
-        }
-
-        return previous.actuators.map((actuator) => {
-          if (actuator.id === id) {
-            return {
-              ...actuator,
-              transform: {
-                ...actuator.transform,
-                position: { ...position },
-                rotation: { ...rotation },
-                scale: normalizedScale,
-              },
-            };
-          }
-
-          if (!isDescendant(actuator.id)) return actuator;
-
-          const childMatrix = composeMatrix(actuator.transform.position, actuator.transform.rotation, actuator.transform.scale);
-          const childNextMatrix = deltaMatrix.clone().multiply(childMatrix);
-
-          const childPosition = new Vector3();
-          const childRotation = new Quaternion();
-          const childScale = new Vector3();
-          childNextMatrix.decompose(childPosition, childRotation, childScale);
-
-          return {
-            ...actuator,
-            transform: {
-              ...actuator.transform,
-              position: {
-                x: childPosition.x,
-                y: childPosition.y,
-                z: childPosition.z,
-              },
-              rotation: {
-                x: childRotation.x,
-                y: childRotation.y,
-                z: childRotation.z,
-                w: childRotation.w,
-              },
-              scale: normalizePositiveScale({
-                x: childScale.x,
-                y: childScale.y,
-                z: childScale.z,
-              }),
-            },
-          };
-        });
-      })(),
+      actuators: nextActuators,
     }));
   }
 
   function beginTransformChange() {
     if (transformStartSnapshotRef.current !== null) return;
     transformStartSnapshotRef.current = cloneEditorState(editorState);
+    marqueeDragRef.current = null;
+    setMarqueeRect(null);
     setIsTransformDragging(true);
   }
 
@@ -909,39 +1944,43 @@ export default function App() {
 
   const serializedScene = useMemo(() => {
     const sortedActuators = [...actuators].sort((a, b) => a.id.localeCompare(b.id));
+    const characters = rigIds.map((rigId, index) => {
+      const rigActuators = sortedActuators.filter((actuator) => actuator.rigId === rigId);
+      const root = rigActuators.find((actuator) => actuator.parentId === null);
+      return {
+        id: `char_${(index + 1).toString().padStart(3, "0")}`,
+        name: `PrototypeCharacter_${rigId}`,
+        mesh: {
+          meshId: "mesh_chad_fbx",
+          uri: "assets/chad/Chad.fbx",
+        },
+        rig: {
+          rootActuatorId: root?.id ?? "",
+          actuators: rigActuators,
+        },
+        skinBinding: {
+          version: "0.1",
+          solver: "closestVolume",
+          meshHash: skinMeshHash,
+          bindingHash: skinBindingHash,
+          generatedAtUtc: new Date().toISOString(),
+          influenceCount: skinningStats.vertexCount,
+        },
+        channels: {
+          look: { yaw: 0, pitch: 0 },
+          blink: { left: 0, right: 0 },
+          custom: {},
+        },
+      };
+    });
+
     return JSON.stringify(
       {
         version: "0.1.0",
         sceneId: "scene_main",
         createdAtUtc: createdAtRef.current,
         updatedAtUtc: new Date().toISOString(),
-        characters: [
-          {
-            id: "char_001",
-            name: "PrototypeCharacter",
-            mesh: {
-              meshId: "mesh_chad_fbx",
-              uri: "assets/chad/Chad.fbx",
-            },
-            rig: {
-              rootActuatorId: ROOT_ACTUATOR.id,
-              actuators: sortedActuators,
-            },
-            skinBinding: {
-              version: "0.1",
-              solver: "closestVolume",
-              meshHash: "pending",
-              bindingHash: "pending",
-              generatedAtUtc: new Date().toISOString(),
-              influenceCount: sortedActuators.length,
-            },
-            channels: {
-              look: { yaw: 0, pitch: 0 },
-              blink: { left: 0, right: 0 },
-              custom: {},
-            },
-          },
-        ],
+        characters,
         playback: {
           fps: syntheticClip?.fps ?? 60,
           durationSec: syntheticClip?.durationSec ?? 10,
@@ -951,7 +1990,7 @@ export default function App() {
       null,
       2,
     );
-  }, [actuators, syntheticClip]);
+  }, [actuators, rigIds, syntheticClip, skinBindingHash, skinMeshHash, skinningStats.vertexCount]);
 
   useEffect(() => {
     function isTypingTarget(target: EventTarget | null) {
@@ -983,12 +2022,21 @@ export default function App() {
         }
       }
 
+      if (event.code === "Space") {
+        event.preventDefault();
+        requestAppMode(appMode === "Rig" ? "Pose" : "Rig");
+        return;
+      }
+
       if (key === "q") setGizmoMode("select");
       if (key === "w") setGizmoMode("translate");
       if (key === "e") setGizmoMode("rotate");
       if (key === "r") setGizmoMode("scale");
       if (key === "f") {
-        const idsToFrame = selectedActuatorIds.length > 0 ? selectedActuatorIds : actuators.map((actuator) => actuator.id);
+        const idsToFrame =
+          selectedActuatorIds.length > 0
+            ? selectedActuatorIds
+            : actuators.filter((actuator) => actuator.rigId === selectedRigId).map((actuator) => actuator.id);
         const request = buildFocusRequestFromActuators(actuators, idsToFrame);
         if (request === null) return;
         setFocusRequest(request);
@@ -998,7 +2046,7 @@ export default function App() {
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [actuators, selectedActuatorIds]);
+  }, [actuators, appMode, pendingPoseRevision, selectedActuatorIds, selectedRigId, skinningRevision]);
 
   async function enterVR() {
     try {
@@ -1010,6 +2058,7 @@ export default function App() {
 
   function onCanvasPointerMissed() {
     if (marqueeDragRef.current !== null) return;
+    if (isTransformDragging) return;
     clearSelection();
   }
 
@@ -1025,11 +2074,11 @@ export default function App() {
     };
   }
 
-  function runMarqueeSelection(rect: { x: number; y: number; width: number; height: number }) {
+  function collectMarqueeHits(rect: { x: number; y: number; width: number; height: number }): string[] {
     const cameraObject = cameraRef.current;
-    if (cameraObject === null) return;
+    if (cameraObject === null) return [];
     const wrap = canvasWrapRef.current;
-    if (wrap === null) return;
+    if (wrap === null) return [];
 
     const minX = Math.min(rect.x, rect.x + rect.width);
     const minY = Math.min(rect.y, rect.y + rect.height);
@@ -1037,36 +2086,83 @@ export default function App() {
     const maxY = Math.max(rect.y, rect.y + rect.height);
 
     const hits: string[] = [];
-    for (const actuator of actuators) {
-      const projected = new Vector3(
-        actuator.transform.position.x,
-        actuator.transform.position.y,
-        actuator.transform.position.z,
-      ).project(cameraObject);
+    const candidates =
+      appMode === "Rig" ? actuators.filter((actuator) => actuator.rigId === selectedRigId) : actuators;
 
-      if (projected.z < -1 || projected.z > 1) continue;
+    for (const actuator of candidates) {
+      const object = actuatorObjectRefs.current[actuator.id];
+      if (object === null || object === undefined) continue;
 
-      const px = (projected.x * 0.5 + 0.5) * wrap.clientWidth;
-      const py = (-projected.y * 0.5 + 0.5) * wrap.clientHeight;
-      if (px >= minX && px <= maxX && py >= minY && py <= maxY) {
+      const bounds = new Box3().setFromObject(object);
+      const boundsMin = bounds.min;
+      const boundsMax = bounds.max;
+
+      const corners = [
+        new Vector3(boundsMin.x, boundsMin.y, boundsMin.z),
+        new Vector3(boundsMin.x, boundsMin.y, boundsMax.z),
+        new Vector3(boundsMin.x, boundsMax.y, boundsMin.z),
+        new Vector3(boundsMin.x, boundsMax.y, boundsMax.z),
+        new Vector3(boundsMax.x, boundsMin.y, boundsMin.z),
+        new Vector3(boundsMax.x, boundsMin.y, boundsMax.z),
+        new Vector3(boundsMax.x, boundsMax.y, boundsMin.z),
+        new Vector3(boundsMax.x, boundsMax.y, boundsMax.z),
+      ];
+
+      let projectedMinX = Number.POSITIVE_INFINITY;
+      let projectedMinY = Number.POSITIVE_INFINITY;
+      let projectedMaxX = Number.NEGATIVE_INFINITY;
+      let projectedMaxY = Number.NEGATIVE_INFINITY;
+      let hasVisibleCorner = false;
+
+      for (const corner of corners) {
+        corner.project(cameraObject);
+        if (corner.z < -1 || corner.z > 1) continue;
+        hasVisibleCorner = true;
+        const px = (corner.x * 0.5 + 0.5) * wrap.clientWidth;
+        const py = (-corner.y * 0.5 + 0.5) * wrap.clientHeight;
+        projectedMinX = Math.min(projectedMinX, px);
+        projectedMinY = Math.min(projectedMinY, py);
+        projectedMaxX = Math.max(projectedMaxX, px);
+        projectedMaxY = Math.max(projectedMaxY, py);
+      }
+
+      if (!hasVisibleCorner) continue;
+      const intersects =
+        projectedMaxX >= minX &&
+        projectedMinX <= maxX &&
+        projectedMaxY >= minY &&
+        projectedMinY <= maxY;
+
+      if (intersects) {
         hits.push(actuator.id);
       }
     }
 
-    if (hits.length === 0) {
-      clearSelection();
-      return;
-    }
+    return hits;
+  }
 
-    const primary = selectedActuatorId !== null && hits.includes(selectedActuatorId) ? selectedActuatorId : hits[0];
-    setSelection(hits, primary);
+  function hasActuatorHit(clientX: number, clientY: number): boolean {
+    const wrap = canvasWrapRef.current;
+    const camera = cameraRef.current;
+    if (wrap === null || camera === null) return false;
+
+    const rect = wrap.getBoundingClientRect();
+    const x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    const y = -((clientY - rect.top) / rect.height) * 2 + 1;
+    pointerNdcRef.current.set(x, y);
+    raycasterRef.current.setFromCamera(pointerNdcRef.current, camera);
+
+    const objects = actuators
+      .map((actuator) => actuatorObjectRefs.current[actuator.id])
+      .filter((object): object is Object3D => object !== null && object !== undefined);
+    return raycasterRef.current.intersectObjects(objects, false).length > 0;
   }
 
   function onCanvasWrapPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
     if (event.button !== 0) return;
     if (event.altKey) return;
-    if (gizmoMode !== "select") return;
     if (isTransformDragging) return;
+    if (hasActuatorHit(event.clientX, event.clientY)) return;
 
     const local = clientToCanvasLocal(event.clientX, event.clientY);
     if (local === null) return;
@@ -1076,6 +2172,8 @@ export default function App() {
       startX: local.x,
       startY: local.y,
       moved: false,
+      additive: event.shiftKey,
+      toggle: event.ctrlKey || event.metaKey,
     };
 
     setMarqueeRect({ x: local.x, y: local.y, width: 0, height: 0 });
@@ -1119,8 +2217,36 @@ export default function App() {
     marqueeDragRef.current = null;
     setMarqueeRect(null);
 
-    if (!wasMoved || completedRect === null) return;
-    runMarqueeSelection(completedRect);
+    if (!wasMoved) {
+      const hitActuator = hasActuatorHit(event.clientX, event.clientY);
+      const hasModifier = event.shiftKey || event.ctrlKey || event.metaKey;
+      if (!hitActuator && !hasModifier && !isTransformDragging) {
+        clearSelection();
+      }
+      return;
+    }
+    if (completedRect === null) return;
+
+    const hits = collectMarqueeHits(completedRect);
+    if (drag.additive) {
+      setSelection([...selectedActuatorIds, ...hits], selectedActuatorId);
+      return;
+    }
+    if (drag.toggle) {
+      const next = new Set(selectedActuatorIds);
+      for (const id of hits) {
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+      }
+      setSelection([...next], selectedActuatorId);
+      return;
+    }
+    if (hits.length === 0) {
+      clearSelection();
+      return;
+    }
+    const primary = selectedActuatorId !== null && hits.includes(selectedActuatorId) ? selectedActuatorId : hits[0];
+    setSelection(hits, primary);
   }
 
   return (
@@ -1129,30 +2255,44 @@ export default function App() {
         <h1>Actuator2 Runtime Bootstrap</h1>
         <p>Sprint 01 focus: Chad mesh integration for rigging workflows</p>
         <div className="app__actions">
+          <button type="button" onClick={() => requestAppMode("Rig")} disabled={appMode === "Rig" && pendingPoseRevision === null}>
+            Rig Mode
+          </button>
+          <button type="button" onClick={() => requestAppMode("Pose")} disabled={appMode === "Pose" || pendingPoseRevision !== null}>
+            Pose Mode
+          </button>
           <button type="button" onClick={enterVR} disabled={!canUseWebXR}>
             Enter VR
-          </button>
-          <button type="button" onClick={() => setInvertOrbitX((previous) => !previous)}>
-            Invert X Drag: {invertOrbitX ? "On" : "Off"}
           </button>
           {!canUseWebXR ? (
             <span>WebXR unavailable in this browser</span>
           ) : (
-            <span>Desktop controls: Alt+LMB orbit, Alt+MMB pan, Alt+RMB zoom, Alt+wheel zoom</span>
+            <span>Desktop controls: Alt+LMB orbit, MMB pan, RMB zoom, wheel zoom</span>
           )}
+          <span>Mode: {appMode} (Space toggles Rig/Pose)</span>
+          <span>Skinning: {skinningBusy ? "Rebuilding..." : `Ready (rev ${completedSkinningRevision})`}</span>
           <span>Playback: {playbackState} @ {playbackTimeSec.toFixed(2)}s</span>
         </div>
       </header>
       <section className="app__viewport">
         <aside className="app__panel">
           <div className="app__panel-actions">
+            <button type="button" onClick={createRig}>
+              Create Rig
+            </button>
             <button type="button" onClick={createActuator}>
               Create Actuator
             </button>
             <button
               type="button"
               onClick={deleteSelectedActuator}
-              disabled={selectedActuatorIds.length === 0 || selectedActuatorIds.every((id) => id === ROOT_ACTUATOR.id)}
+              disabled={
+                selectedActuatorIds.length === 0 ||
+                selectedActuatorIds.every((id) => {
+                  const actuator = actuators.find((item) => item.id === id);
+                  return actuator?.parentId === null;
+                })
+              }
             >
               Delete Selected
             </button>
@@ -1203,10 +2343,85 @@ export default function App() {
                 <option value="world">World Origin</option>
               </select>
             </div>
+            <div className="app__tool-row">
+              <label htmlFor="rig-select">Active Rig</label>
+              <select id="rig-select" value={selectedRigId} onChange={(event) => setActiveRig(event.target.value)}>
+                {rigIds.map((rigId) => (
+                  <option key={rigId} value={rigId}>
+                    {rigId}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="app__tool-row">
+              <label htmlFor="new-actuator-shape">New Actuator</label>
+              <select
+                id="new-actuator-shape"
+                value={newActuatorShape}
+                onChange={(event) => setNewActuatorShape(event.target.value as ActuatorShape)}
+              >
+                <option value="capsule">Capsule (Default)</option>
+                <option value="sphere">Sphere</option>
+                <option value="box">Box</option>
+              </select>
+            </div>
+            <div className="app__tool-row">
+              <label htmlFor="delta-mush-toggle">Delta Mush</label>
+              <select
+                id="delta-mush-toggle"
+                value={deltaMushEnabled ? "on" : "off"}
+                onChange={(event) => setDeltaMushEnabled(event.target.value === "on")}
+              >
+                <option value="on">On</option>
+                <option value="off">Off</option>
+              </select>
+            </div>
+            <div className="app__tool-row">
+              <label htmlFor="delta-mush-iterations">Mush Iterations</label>
+              <input
+                id="delta-mush-iterations"
+                type="number"
+                min={0}
+                max={12}
+                step={1}
+                value={deltaMushSettings.iterations}
+                onChange={(event) => {
+                  const parsed = Number(event.target.value);
+                  const nextIterations = Number.isFinite(parsed) ? Math.max(0, Math.min(12, Math.round(parsed))) : 0;
+                  setDeltaMushSettings((previous) => ({
+                    ...previous,
+                    iterations: nextIterations,
+                  }));
+                }}
+              />
+            </div>
+            <div className="app__tool-row">
+              <label htmlFor="delta-mush-strength">Mush Strength</label>
+              <input
+                id="delta-mush-strength"
+                type="number"
+                min={0}
+                max={1}
+                step={0.05}
+                value={deltaMushSettings.strength}
+                onChange={(event) => {
+                  const parsed = Number(event.target.value);
+                  const nextStrength = Number.isFinite(parsed) ? Math.max(0, Math.min(1, parsed)) : 0;
+                  setDeltaMushSettings((previous) => ({
+                    ...previous,
+                    strength: nextStrength,
+                  }));
+                }}
+              />
+            </div>
           </div>
 
           <div className="app__panel-status">
-            <strong>Selected:</strong> {selectedActuatorIds.length === 0 ? "none" : `${selectedActuatorIds.length} (active: ${selectedActuatorId})`}
+            <strong>Rig:</strong> {selectedRigId} | <strong>Selected:</strong>{" "}
+            {selectedActuatorIds.length === 0 ? "none" : `${selectedActuatorIds.length} (active: ${selectedActuatorId})`}
+            <br />
+            <strong>Skin:</strong> {skinningStats.vertexCount} verts, {skinningStats.capsuleCount} capsules, avg w{" "}
+            {skinningStats.averageWeight.toFixed(3)}
           </div>
           <ul className="app__actuator-list">
             {actuators
@@ -1217,7 +2432,12 @@ export default function App() {
                   <button
                     type="button"
                     className={selectedActuatorIds.includes(actuator.id) ? "is-selected" : ""}
-                    onClick={() => selectActuator(actuator.id)}
+                    onClick={(event) =>
+                      selectActuator(actuator.id, {
+                        additive: event.shiftKey,
+                        toggle: event.ctrlKey || event.metaKey,
+                      })
+                    }
                   >
                     {actuator.id}
                   </button>
@@ -1249,15 +2469,21 @@ export default function App() {
               <PlaybackDriver onStep={onPlaybackStep} />
               <DesktopInertialCameraControls
                 blocked={isTransformDragging}
-                invertOrbitX={invertOrbitX}
                 focusRequest={focusRequest}
                 focusNonce={focusNonce}
               />
               <SceneContent
                 actuators={actuators}
+                appMode={appMode}
                 selectedActuatorId={selectedActuatorId}
                 selectedActuatorIds={selectedActuatorIds}
-                selectedObject={selectedObject}
+                physicsEnabled={physicsEnabled}
+                skinningEnabled={skinningEnabled}
+                skinningRevision={skinningRevision}
+                deltaMushEnabled={deltaMushEnabled}
+                deltaMushSettings={deltaMushSettings}
+                onSkinningStats={onSkinningStats}
+                onSkinningComputationStatus={onSkinningComputationStatus}
                 gizmoMode={gizmoMode}
                 gizmoSpace={gizmoSpace}
                 pivotMode={pivotMode}

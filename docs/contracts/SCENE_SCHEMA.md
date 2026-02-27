@@ -197,6 +197,15 @@ type PlaybackDocument = {
   - `characters` sorted by `id`
   - each `actuators` list sorted by `id`
 
+## Multi-Rig Scene Rules (`A-006`)
+
+- A scene may contain multiple independent character rigs via `characters[]`.
+- Actuator IDs must be globally unique across the full scene (not only within a single character).
+- Parent-child relationships are constrained to the same character rig.
+- Cross-rig parenting is invalid and must be rejected during validation/load.
+- Selection and tool operations may target actuators across rigs, but serialization must preserve per-character rig ownership.
+- Deterministic ordering still applies scene-wide (`characters` then each character's `actuators`).
+
 ## Load Defaults (Explicit Materialization)
 
 Loader must materialize explicit values so runtime behavior is deterministic:

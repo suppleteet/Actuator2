@@ -111,6 +111,11 @@ If disallowed tool is requested:
 - Selection updates are ordered and stable (IDs sorted before write).
 - No hidden per-frame mutation of mode/tool state outside event handlers.
 
+## Multi-Rig Selection Notes (`A-006`)
+- Selection payload IDs must be globally unique at scene scope (safe across multiple rigs/characters).
+- Multi-select may span more than one rig; ordering remains deterministic (`lexicographic id` sort before commit).
+- Active selection primary ID determines the active rig context for subsequent creation/tool default behavior unless explicitly overridden by UI.
+
 ## Event Payload Contracts
 
 ```ts

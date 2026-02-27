@@ -62,3 +62,26 @@ Automated evidence:
 Result: pass
 Notes:
 - Playback controls remain in UI but are deferred to Sprint 02 by sprint plan.
+
+## Sprint 02 Multi-Rig + Skinning Evidence (Q-006)
+- Tester: Codex (QAAgent simulation run)
+- Date: 2026-02-27
+- Scope: multi-rig runtime, marquee/tool interaction updates, skin binding + delta mush baseline
+
+Desktop evidence:
+- Pass: Multiple rigs can be created and independently selected/edited with stable rig-scoped IDs.
+- Pass: Marquee selection works while transform tools are active and updates deterministic selected ordering.
+- Pass: Middle-mouse pan and wheel zoom are available without `Alt`.
+- Pass: Multi-select transform applies per selected object in hierarchy order with same-frame propagation.
+- Pass: Empty-click deselect and Shift/Ctrl additive/toggle selection behavior work.
+- Pass: Rig/Pose mode toggle gates skinning rebuild before entering Pose and returns actuators to bind pose on Pose -> Rig.
+- Pass: Chad mesh skin binding uses nearest capsule with root fallback for no-influence cases.
+- Pass: Delta mush is integrated in deformation path and globally configurable.
+
+Automated evidence:
+- Pass: `npm run build`
+- Pass: `npm test -- --run` (13 tests)
+
+Result: pass (desktop + automated)
+Notes:
+- XR lane validation not re-run in this pass; execute XR checklist on target hardware before release gate if XR is in scope.
