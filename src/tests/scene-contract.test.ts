@@ -20,6 +20,10 @@ function makeScene(overrides?: Partial<SceneDocument>): SceneDocument {
               parentId: null,
               type: "root",
               shape: "capsule",
+              pivot: {
+                mode: "capStart",
+                offsetLocal: { x: 0, y: 0, z: 0 },
+              },
               transform: {
                 position: { x: 0, y: 1, z: 0 },
                 rotation: { x: 0, y: 0, z: 0, w: 1 },
@@ -35,6 +39,10 @@ function makeScene(overrides?: Partial<SceneDocument>): SceneDocument {
               parentId: "act_root",
               type: "custom",
               shape: "box",
+              pivot: {
+                mode: "center",
+                offsetLocal: { x: 0, y: 0, z: 0 },
+              },
               transform: {
                 position: { x: 0.2, y: 1.4, z: 0 },
                 rotation: { x: 0, y: 0, z: 0, w: 1 },

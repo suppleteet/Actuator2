@@ -1,14 +1,41 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
-import { Canvas, useFrame, useLoader, useThree } from "@react-three/fiber";
-import { Physics, RigidBody } from "@react-three/rapier";
-import { TransformControls } from "@react-three/drei";
-import { XR, createXRStore, useXR } from "@react-three/xr";
-import { Box3, BufferGeometry, Color, DoubleSide, Matrix4, Mesh, Object3D, Quaternion, Raycaster, SRGBColorSpace, SkinnedMesh, TextureLoader, Vector2, Vector3 } from "three";
-import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
+import { Canvas } from "@react-three/fiber";
+import { XR, createXRStore } from "@react-three/xr";
+import { Box3, Matrix4, Object3D, Quaternion, Raycaster, Vector2, Vector3 } from "three";
 import { PlaybackClock, createSyntheticRecording, evaluateClipAtTime, type SyntheticClip } from "./animation/recorder";
 import { buildFocusRequestFromActuators, type FocusRequest } from "./interaction/focusFraming";
-import { bindVerticesToClosestCapsule, type Capsule, type Vec3 as SkinVec3 } from "./skinning/closestCapsuleBinding";
-import { applyDeltaMush, buildVertexNeighbors } from "./skinning/deltaMush";
+import {
+  getActuatorPrimitiveCenter,
+  getCapsuleHalfAxis,
+  normalizePositiveScale,
+  normalizePrimitiveSize,
+  scalePrimitiveSizeFromGizmoDelta,
+} from "./runtime/physicsAuthoring";
+import {
+  defaultPresetForActuatorType,
+  getActuatorMassFromPreset,
+  getActuatorPresetSettings,
+} from "./runtime/physicsPresets";
+import { createRootActuator, composeMatrix } from "./app/actuatorModel";
+import { smoothDampQuat, smoothDampVec3, type SmoothDampQuatVelocity, type SmoothDampVec3Velocity } from "./app/smoothDamp";
+import {
+  type ActiveMeshSource,
+  type ActuatorEntity,
+  type ActuatorShape,
+  type ActuatorTransformSnapshot,
+  type AppMode,
+  type DeltaMushSettings,
+  type EditorState,
+  type GizmoMode,
+  type PhysicsTuning,
+  type PivotMode,
+  type SkinningComputationStatus,
+  type SkinningStats,
+  type Vec3,
+} from "./app/types";
+import { DesktopInertialCameraControls } from "./app/components/DesktopInertialCameraControls";
+import { PlaybackDriver } from "./app/components/PlaybackDriver";
+import { SceneContent } from "./app/components/SceneContent";
 
 const xrStore = createXRStore({
   offerSession: false,
@@ -16,1158 +43,40 @@ const xrStore = createXRStore({
   emulate: false,
 });
 
-type DragMode = "orbit" | "pan" | "zoom" | null;
-type ActuatorShape = "capsule" | "sphere" | "box";
-type GizmoMode = "select" | "translate" | "rotate" | "scale";
-type PivotMode = "object" | "world";
-type AppMode = "Rig" | "Pose";
-
-type Vec3 = { x: number; y: number; z: number };
-type Quat = { x: number; y: number; z: number; w: number };
-
-type ActuatorEntity = {
-  id: string;
-  rigId: string;
-  parentId: string | null;
-  type: "root" | "custom";
-  shape: ActuatorShape;
-  transform: {
-    position: Vec3;
-    rotation: Quat;
-    scale: Vec3;
-  };
-  size: Vec3;
+const DEFAULT_PHYSICS_TUNING: PhysicsTuning = {
+  solverIterations: 8,
+  internalPgsIterations: 2,
+  additionalSolverIterations: 4,
+  bodyLinearDamping: 1,
+  bodyAngularDamping: 1,
+  rotationStiffness: 1,
+  rotationVelocityBlend: 1,
+  maxAngularSpeed: 1,
+  pullStiffness: 240,
+  pullDamping: 36,
+  pullMaxForce: 4200,
 };
 
-type EditorState = {
-  actuators: ActuatorEntity[];
-  selectedRigId: string;
-  selectedActuatorId: string | null;
-  selectedActuatorIds: string[];
+const DEFAULT_DELTA_MUSH_SETTINGS: DeltaMushSettings = {
+  iterations: 8,
+  strength: 0.75,
 };
-
-const MIN_SCALE = 0.02;
-
-function normalizePositiveScale(scale: Vec3): Vec3 {
-  return {
-    x: Math.max(Math.abs(scale.x), MIN_SCALE),
-    y: Math.max(Math.abs(scale.y), MIN_SCALE),
-    z: Math.max(Math.abs(scale.z), MIN_SCALE),
-  };
-}
-
-function composeMatrix(position: Vec3, rotation: Quat, scale: Vec3): Matrix4 {
-  return new Matrix4().compose(
-    new Vector3(position.x, position.y, position.z),
-    new Quaternion(rotation.x, rotation.y, rotation.z, rotation.w),
-    new Vector3(scale.x, scale.y, scale.z),
-  );
-}
-
-function rootIdForRig(rigId: string): string {
-  return `${rigId}_act_root`;
-}
-
-function createRootActuator(rigId: string, xOffset = 0): ActuatorEntity {
-  return {
-    id: rootIdForRig(rigId),
-    rigId,
-    parentId: null,
-    type: "root",
-    shape: "capsule",
-    transform: {
-      position: { x: xOffset, y: 1, z: 0 },
-      rotation: { x: 0, y: 0, z: 0, w: 1 },
-      scale: { x: 1, y: 1, z: 1 },
-    },
-    size: { x: 0.35, y: 0.8, z: 0.35 },
-  };
-}
-
-type SmoothDampVec3Velocity = { x: number; y: number; z: number };
-type SmoothDampQuatVelocity = { x: number; y: number; z: number; w: number };
-
-function smoothDampScalar(
-  current: number,
-  target: number,
-  currentVelocity: number,
-  smoothTime: number,
-  deltaTime: number,
-  maxSpeed = Number.POSITIVE_INFINITY,
-): { value: number; velocity: number } {
-  const clampedSmoothTime = Math.max(0.0001, smoothTime);
-  const omega = 2 / clampedSmoothTime;
-  const x = omega * deltaTime;
-  const exp = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x);
-
-  let change = current - target;
-  const originalTo = target;
-  const maxChange = maxSpeed * clampedSmoothTime;
-  change = Math.max(-maxChange, Math.min(maxChange, change));
-  const adjustedTarget = current - change;
-
-  const temp = (currentVelocity + omega * change) * deltaTime;
-  let nextVelocity = (currentVelocity - omega * temp) * exp;
-  let output = adjustedTarget + (change + temp) * exp;
-
-  if ((originalTo - current > 0) === (output > originalTo)) {
-    output = originalTo;
-    nextVelocity = deltaTime > 0 ? (output - originalTo) / deltaTime : 0;
-  }
-
-  return { value: output, velocity: nextVelocity };
-}
-
-function smoothDampVec3(
-  current: Vector3,
-  target: Vector3,
-  currentVelocity: SmoothDampVec3Velocity,
-  smoothTime: number,
-  deltaTime: number,
-  maxSpeed = Number.POSITIVE_INFINITY,
-): Vector3 {
-  const x = smoothDampScalar(current.x, target.x, currentVelocity.x, smoothTime, deltaTime, maxSpeed);
-  const y = smoothDampScalar(current.y, target.y, currentVelocity.y, smoothTime, deltaTime, maxSpeed);
-  const z = smoothDampScalar(current.z, target.z, currentVelocity.z, smoothTime, deltaTime, maxSpeed);
-  currentVelocity.x = x.velocity;
-  currentVelocity.y = y.velocity;
-  currentVelocity.z = z.velocity;
-  return new Vector3(x.value, y.value, z.value);
-}
-
-function smoothDampQuat(
-  current: Quaternion,
-  target: Quaternion,
-  currentVelocity: SmoothDampQuatVelocity,
-  smoothTime: number,
-  deltaTime: number,
-  maxSpeed = Number.POSITIVE_INFINITY,
-): Quaternion {
-  let targetX = target.x;
-  let targetY = target.y;
-  let targetZ = target.z;
-  let targetW = target.w;
-  if (current.dot(target) < 0) {
-    targetX = -targetX;
-    targetY = -targetY;
-    targetZ = -targetZ;
-    targetW = -targetW;
-  }
-
-  const x = smoothDampScalar(current.x, targetX, currentVelocity.x, smoothTime, deltaTime, maxSpeed);
-  const y = smoothDampScalar(current.y, targetY, currentVelocity.y, smoothTime, deltaTime, maxSpeed);
-  const z = smoothDampScalar(current.z, targetZ, currentVelocity.z, smoothTime, deltaTime, maxSpeed);
-  const w = smoothDampScalar(current.w, targetW, currentVelocity.w, smoothTime, deltaTime, maxSpeed);
-  currentVelocity.x = x.velocity;
-  currentVelocity.y = y.velocity;
-  currentVelocity.z = z.velocity;
-  currentVelocity.w = w.velocity;
-  return new Quaternion(x.value, y.value, z.value, w.value).normalize();
-}
-
-type DesktopInertialCameraControlsProps = {
-  blocked: boolean;
-  focusRequest: FocusRequest | null;
-  focusNonce: number;
-};
-
-function DesktopInertialCameraControls({ blocked, focusRequest, focusNonce }: DesktopInertialCameraControlsProps) {
-  const { camera, gl } = useThree();
-  const mode = useXR((state) => state.mode);
-  const isInXR = mode !== null;
-
-  const targetRef = useRef(new Vector3(0, 1, 0));
-  const thetaRef = useRef(0);
-  const phiRef = useRef(0);
-  const radiusRef = useRef(4);
-  const initializedRef = useRef(false);
-
-  const dragModeRef = useRef<DragMode>(null);
-  const controlFollowRampRef = useRef(0);
-  const controlFollowVelocityRef = useRef(0);
-  const lastPointerRef = useRef({ x: 0, y: 0 });
-  const velocityRef = useRef({
-    theta: 0,
-    phi: 0,
-    panX: 0,
-    panY: 0,
-    zoom: 0,
-  });
-  const desiredTargetRef = useRef<Vector3 | null>(null);
-  const desiredRadiusRef = useRef<number | null>(null);
-  const desiredTargetVelocityRef = useRef<SmoothDampVec3Velocity>({ x: 0, y: 0, z: 0 });
-  const desiredRadiusVelocityRef = useRef(0);
-  const focusingRef = useRef(false);
-
-  useEffect(() => {
-    if (focusRequest === null) return;
-
-    const fovDeg = (camera as any).fov ?? 50;
-    const fovRad = (fovDeg * Math.PI) / 180;
-    const safeSin = Math.max(Math.sin(fovRad * 0.5), 0.2);
-    const fitDistance = Math.max((focusRequest.fitRadius * 1.35) / safeSin, 0.8);
-
-    desiredTargetRef.current = new Vector3(focusRequest.center.x, focusRequest.center.y, focusRequest.center.z);
-    desiredRadiusRef.current = fitDistance;
-    desiredTargetVelocityRef.current = { x: 0, y: 0, z: 0 };
-    desiredRadiusVelocityRef.current = 0;
-    focusingRef.current = true;
-  }, [camera, focusNonce, focusRequest]);
-
-  useEffect(() => {
-    const dom = gl.domElement;
-
-    function onContextMenu(event: MouseEvent) {
-      event.preventDefault();
-    }
-
-    function onPointerDown(event: PointerEvent) {
-      if (isInXR || blocked) return;
-      if (event.button === 0 && event.altKey) dragModeRef.current = "orbit";
-      if (event.button === 1) dragModeRef.current = "pan";
-      if (event.button === 2) dragModeRef.current = "zoom";
-      if (dragModeRef.current === null) return;
-
-      lastPointerRef.current.x = event.clientX;
-      lastPointerRef.current.y = event.clientY;
-      dom.setPointerCapture(event.pointerId);
-    }
-
-    function onPointerMove(event: PointerEvent) {
-      if (isInXR || blocked || dragModeRef.current === null) return;
-      if (dragModeRef.current === "orbit" && !event.altKey) return;
-
-      const dx = event.clientX - lastPointerRef.current.x;
-      const dy = event.clientY - lastPointerRef.current.y;
-      lastPointerRef.current.x = event.clientX;
-      lastPointerRef.current.y = event.clientY;
-
-      if (dragModeRef.current === "orbit") {
-        velocityRef.current.theta -= dx * 0.022;
-        velocityRef.current.phi -= dy * 0.022;
-      } else if (dragModeRef.current === "pan") {
-        const panImpulse = radiusRef.current * 0.007;
-        velocityRef.current.panX += -dx * panImpulse;
-        velocityRef.current.panY += dy * panImpulse;
-      } else if (dragModeRef.current === "zoom") {
-        const zoomImpulse = Math.max(radiusRef.current * 0.09, 0.35);
-        velocityRef.current.zoom += dy * zoomImpulse;
-      }
-    }
-
-    function onPointerUp(event: PointerEvent) {
-      if (dragModeRef.current === null) return;
-      dragModeRef.current = null;
-      if (dom.hasPointerCapture(event.pointerId)) {
-        dom.releasePointerCapture(event.pointerId);
-      }
-    }
-
-    function onWheel(event: WheelEvent) {
-      if (isInXR || blocked) return;
-      event.preventDefault();
-      const modeScale = event.deltaMode === 1 ? 14 : event.deltaMode === 2 ? 120 : 1;
-      const zoomImpulse = Math.max(radiusRef.current * 0.005, 0.016);
-      velocityRef.current.zoom += event.deltaY * modeScale * zoomImpulse;
-    }
-
-    dom.addEventListener("contextmenu", onContextMenu);
-    dom.addEventListener("pointerdown", onPointerDown);
-    dom.addEventListener("pointermove", onPointerMove);
-    dom.addEventListener("pointerup", onPointerUp);
-    dom.addEventListener("pointercancel", onPointerUp);
-    dom.addEventListener("wheel", onWheel, { passive: false });
-
-    return () => {
-      dom.removeEventListener("contextmenu", onContextMenu);
-      dom.removeEventListener("pointerdown", onPointerDown);
-      dom.removeEventListener("pointermove", onPointerMove);
-      dom.removeEventListener("pointerup", onPointerUp);
-      dom.removeEventListener("pointercancel", onPointerUp);
-      dom.removeEventListener("wheel", onWheel);
-    };
-  }, [blocked, gl, isInXR]);
-
-  useFrame((_, delta) => {
-    if (isInXR || blocked) return;
-
-    if (!initializedRef.current) {
-      const offset = camera.position.clone().sub(targetRef.current);
-      radiusRef.current = Math.max(offset.length(), 0.5);
-      thetaRef.current = Math.atan2(offset.x, offset.z);
-      phiRef.current = Math.acos(Math.min(Math.max(offset.y / radiusRef.current, -1), 1));
-      initializedRef.current = true;
-    }
-
-    const velocity = velocityRef.current;
-    const dragging = dragModeRef.current !== null;
-    const followTarget = dragging ? 1 : 0;
-    const follow = smoothDampScalar(
-      controlFollowRampRef.current,
-      followTarget,
-      controlFollowVelocityRef.current,
-      dragging ? 0.05 : 0.08,
-      delta,
-    );
-    controlFollowRampRef.current = follow.value;
-    controlFollowVelocityRef.current = follow.velocity;
-    const followGain = 1 + controlFollowRampRef.current * 1.35;
-
-    thetaRef.current += velocity.theta * delta * followGain;
-    phiRef.current += velocity.phi * delta * followGain;
-    phiRef.current = Math.min(Math.max(phiRef.current, 0.1), Math.PI - 0.1);
-
-    radiusRef.current += velocity.zoom * delta * followGain;
-    radiusRef.current = Math.min(Math.max(radiusRef.current, 0.5), 80);
-
-    if (focusingRef.current && desiredTargetRef.current !== null && desiredRadiusRef.current !== null) {
-      const smoothedTarget = smoothDampVec3(
-        targetRef.current,
-        desiredTargetRef.current,
-        desiredTargetVelocityRef.current,
-        0.15,
-        delta,
-      );
-      targetRef.current.copy(smoothedTarget);
-      const smoothedRadius = smoothDampScalar(
-        radiusRef.current,
-        desiredRadiusRef.current,
-        desiredRadiusVelocityRef.current,
-        0.15,
-        delta,
-      );
-      radiusRef.current = smoothedRadius.value;
-      desiredRadiusVelocityRef.current = smoothedRadius.velocity;
-
-      const targetDistance = targetRef.current.distanceTo(desiredTargetRef.current);
-      const radiusDistance = Math.abs(radiusRef.current - desiredRadiusRef.current);
-      const targetVelocityMag = Math.hypot(
-        desiredTargetVelocityRef.current.x,
-        desiredTargetVelocityRef.current.y,
-        desiredTargetVelocityRef.current.z,
-      );
-      if (targetDistance < 0.01 && radiusDistance < 0.01 && targetVelocityMag < 0.02 && Math.abs(desiredRadiusVelocityRef.current) < 0.02) {
-        focusingRef.current = false;
-      }
-    }
-
-    const forward = new Vector3();
-    camera.getWorldDirection(forward);
-    const right = new Vector3().crossVectors(forward, camera.up).normalize();
-    const up = new Vector3().copy(camera.up).normalize();
-    targetRef.current.addScaledVector(right, velocity.panX * delta * followGain);
-    targetRef.current.addScaledVector(up, velocity.panY * delta * followGain);
-
-    const sinPhi = Math.sin(phiRef.current);
-    const camOffset = new Vector3(
-      radiusRef.current * sinPhi * Math.sin(thetaRef.current),
-      radiusRef.current * Math.cos(phiRef.current),
-      radiusRef.current * sinPhi * Math.cos(thetaRef.current),
-    );
-    camera.position.copy(targetRef.current).add(camOffset);
-    camera.lookAt(targetRef.current);
-
-    const orbitDamping = Math.exp(-9 * delta);
-    const panDamping = Math.exp(-10 * delta);
-    const zoomDamping = Math.exp(-11 * delta);
-    velocity.theta *= orbitDamping;
-    velocity.phi *= orbitDamping;
-    velocity.panX *= panDamping;
-    velocity.panY *= panDamping;
-    velocity.zoom *= zoomDamping;
-
-    if (focusingRef.current) {
-      const focusVelocityDamping = Math.exp(-24 * delta);
-      velocity.theta *= focusVelocityDamping;
-      velocity.phi *= focusVelocityDamping;
-      velocity.panX *= focusVelocityDamping;
-      velocity.panY *= focusVelocityDamping;
-      velocity.zoom *= focusVelocityDamping;
-    }
-  });
-
-  return null;
-}
-
-type SceneContentProps = {
-  actuators: ActuatorEntity[];
-  appMode: AppMode;
-  selectedActuatorId: string | null;
-  selectedActuatorIds: string[];
-  physicsEnabled: boolean;
-  skinningEnabled: boolean;
-  skinningRevision: number;
-  deltaMushEnabled: boolean;
-  deltaMushSettings: DeltaMushSettings;
-  onSkinningStats: (stats: SkinningStats) => void;
-  onSkinningComputationStatus: (status: SkinningComputationStatus) => void;
-  gizmoMode: GizmoMode;
-  gizmoSpace: "world" | "local";
-  pivotMode: PivotMode;
-  isTransformDragging: boolean;
-  onSelectActuator: (id: string, options?: { additive?: boolean; toggle?: boolean }) => void;
-  onClearSelection: () => void;
-  onActuatorRef: (id: string, object: Object3D | null) => void;
-  onTransformStart: () => void;
-  onTransformChange: (id: string, worldDelta: Matrix4, localDelta: Matrix4, worldOffset: Vec3) => void;
-  onTransformEnd: () => void;
-};
-
-type SkinningStats = {
-  vertexCount: number;
-  capsuleCount: number;
-  averageWeight: number;
-};
-
-type DeltaMushSettings = {
-  iterations: number;
-  strength: number;
-};
-
-type SkinningComputationStatus = {
-  busy: boolean;
-  revision: number;
-  completed: boolean;
-  bindingHash: string | null;
-  meshHash: string | null;
-};
-
-type ActuatorTransformSnapshot = {
-  position: Vec3;
-  rotation: Quat;
-  scale: Vec3;
-};
-
-type ChadReferenceMeshProps = {
-  actuators: ActuatorEntity[];
-  appMode: AppMode;
-  skinningEnabled: boolean;
-  skinningRevision: number;
-  deltaMushEnabled: boolean;
-  deltaMushSettings: DeltaMushSettings;
-  onSkinningStats: (stats: SkinningStats) => void;
-  onSkinningComputationStatus: (status: SkinningComputationStatus) => void;
-};
-
-function ChadReferenceMesh({
-  actuators,
-  appMode,
-  skinningEnabled,
-  skinningRevision,
-  deltaMushEnabled,
-  deltaMushSettings,
-  onSkinningStats,
-  onSkinningComputationStatus,
-}: ChadReferenceMeshProps) {
-  const chadSource = useLoader(FBXLoader, "/assets/chad/Chad.fbx");
-  const colorMap = useLoader(TextureLoader, "/assets/chad/Textures/chad_Col.png");
-  const normalMap = useLoader(TextureLoader, "/assets/chad/Textures/chad_Norm.png");
-  const roughnessMap = useLoader(TextureLoader, "/assets/chad/Textures/chad_Pbr.png");
-  const meshScale = 0.01;
-  const meshYOffset = 0.02;
-
-  type RuntimeVertexBinding = {
-    capsuleId: string;
-    rootCapsuleId: string | null;
-    bindWorld: SkinVec3;
-    localOffset: SkinVec3;
-    rootLocalOffset: SkinVec3;
-    weight: number;
-  };
-
-  const baseGeometry: BufferGeometry | null = useMemo(() => {
-    let foundGeometry: BufferGeometry | null = null;
-    chadSource.traverse((object) => {
-      if (foundGeometry !== null) return;
-      if ((object as SkinnedMesh).isSkinnedMesh) {
-        foundGeometry = (object as SkinnedMesh).geometry.clone();
-        return;
-      }
-      if ((object as Mesh).isMesh) {
-        foundGeometry = (object as Mesh).geometry.clone();
-      }
-    });
-    const resolved = foundGeometry as BufferGeometry | null;
-    if (resolved === null) return null;
-    if (resolved.getAttribute("normal") === undefined) {
-      resolved.computeVertexNormals();
-    }
-    return resolved;
-  }, [chadSource]);
-
-  const displayGeometry: BufferGeometry | null = useMemo(() => baseGeometry?.clone() ?? null, [baseGeometry]);
-
-  const baseVerticesLocal = useMemo<SkinVec3[]>(() => {
-    if (baseGeometry === null) return [];
-    const position = baseGeometry.getAttribute("position");
-    if (position === undefined) return [];
-    const vertices: SkinVec3[] = [];
-    for (let i = 0; i < position.count; i += 1) {
-      vertices.push({ x: position.getX(i), y: position.getY(i), z: position.getZ(i) });
-    }
-    return vertices;
-  }, [baseGeometry]);
-
-  const triangles = useMemo<Array<[number, number, number]>>(() => {
-    if (baseGeometry === null) return [];
-    const indices = baseGeometry.getIndex()?.array;
-    const built: Array<[number, number, number]> = [];
-    if (indices !== undefined) {
-      for (let i = 0; i + 2 < indices.length; i += 3) {
-        built.push([Number(indices[i]), Number(indices[i + 1]), Number(indices[i + 2])]);
-      }
-      return built;
-    }
-
-    for (let i = 0; i + 2 < baseVerticesLocal.length; i += 3) {
-      built.push([i, i + 1, i + 2]);
-    }
-    return built;
-  }, [baseGeometry, baseVerticesLocal.length]);
-
-  const weldData = useMemo(() => {
-    const vertexToWelded = new Array<number>(baseVerticesLocal.length);
-    const weldedToVertices: number[][] = [];
-    const weldedVertices: SkinVec3[] = [];
-    const keyToWelded = new Map<string, number>();
-    const precision = 10000;
-
-    for (let i = 0; i < baseVerticesLocal.length; i += 1) {
-      const vertex = baseVerticesLocal[i];
-      const key = `${Math.round(vertex.x * precision)}|${Math.round(vertex.y * precision)}|${Math.round(vertex.z * precision)}`;
-      let weldedIndex = keyToWelded.get(key);
-      if (weldedIndex === undefined) {
-        weldedIndex = weldedVertices.length;
-        keyToWelded.set(key, weldedIndex);
-        weldedVertices.push(vertex);
-        weldedToVertices.push([]);
-      }
-      vertexToWelded[i] = weldedIndex;
-      weldedToVertices[weldedIndex].push(i);
-    }
-
-    const weldedTriangles: Array<[number, number, number]> = [];
-    for (const [a, b, c] of triangles) {
-      const wa = vertexToWelded[a];
-      const wb = vertexToWelded[b];
-      const wc = vertexToWelded[c];
-      if (wa === wb || wb === wc || wa === wc) continue;
-      weldedTriangles.push([wa, wb, wc]);
-    }
-
-    return {
-      vertexToWelded,
-      weldedToVertices,
-      weldedVertices,
-      weldedTriangles,
-    };
-  }, [baseVerticesLocal, triangles]);
-
-  const weldedNeighbors = useMemo(
-    () => buildVertexNeighbors(weldData.weldedVertices.length, weldData.weldedTriangles),
-    [weldData],
-  );
-
-  const baseVerticesWorld = useMemo(
-    () =>
-      baseVerticesLocal.map((vertex) => ({
-        x: vertex.x * meshScale,
-        y: vertex.y * meshScale + meshYOffset,
-        z: vertex.z * meshScale,
-      })),
-    [baseVerticesLocal],
-  );
-
-  const meshHash = useMemo(
-    () => (baseGeometry === null ? null : `mesh:${baseVerticesLocal.length}:${triangles.length}`),
-    [baseGeometry, baseVerticesLocal.length, triangles.length],
-  );
-
-  const [runtimeBindings, setRuntimeBindings] = useState<RuntimeVertexBinding[] | null>(null);
-  const [bindingsRevision, setBindingsRevision] = useState(0);
-  const skinningJobTokenRef = useRef(0);
-
-  useEffect(() => {
-    colorMap.colorSpace = SRGBColorSpace;
-    colorMap.needsUpdate = true;
-  }, [colorMap]);
-
-  useEffect(() => {
-    if (baseVerticesWorld.length === 0 || meshHash === null) {
-      setRuntimeBindings(null);
-      setBindingsRevision(skinningRevision);
-      onSkinningStats({ vertexCount: 0, capsuleCount: 0, averageWeight: 0 });
-      onSkinningComputationStatus({
-        busy: false,
-        revision: skinningRevision,
-        completed: true,
-        bindingHash: null,
-        meshHash: null,
-      });
-      return;
-    }
-
-    const revision = skinningRevision;
-    const currentToken = skinningJobTokenRef.current + 1;
-    skinningJobTokenRef.current = currentToken;
-    onSkinningComputationStatus({
-      busy: true,
-      revision,
-      completed: false,
-      bindingHash: null,
-      meshHash,
-    });
-
-    const run = async () => {
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      if (skinningJobTokenRef.current !== currentToken) return;
-
-      const capsules: Capsule[] = actuators
-        .filter((actuator) => actuator.shape === "capsule")
-        .map((actuator) => {
-          const rotation = new Quaternion(
-            actuator.transform.rotation.x,
-            actuator.transform.rotation.y,
-            actuator.transform.rotation.z,
-            actuator.transform.rotation.w,
-          );
-          const halfHeight = Math.max((actuator.size.y * actuator.transform.scale.y) / 2, 0.01);
-          const up = new Vector3(0, 1, 0).applyQuaternion(rotation);
-          const center = new Vector3(
-            actuator.transform.position.x,
-            actuator.transform.position.y,
-            actuator.transform.position.z,
-          );
-          const start = center.clone().addScaledVector(up, -halfHeight);
-          const end = center.clone().addScaledVector(up, halfHeight);
-          return {
-            id: actuator.id,
-            start: { x: start.x, y: start.y, z: start.z },
-            end: { x: end.x, y: end.y, z: end.z },
-            radius: Math.max((Math.max(actuator.size.x, actuator.size.z) * actuator.transform.scale.x) / 2, 0.02),
-          };
-        });
-      const rootCapsuleIds = actuators
-        .filter((actuator) => actuator.parentId === null && actuator.shape === "capsule")
-        .map((actuator) => actuator.id);
-
-      if (capsules.length === 0) {
-        setRuntimeBindings([]);
-        setBindingsRevision(revision);
-        onSkinningStats({ vertexCount: baseVerticesWorld.length, capsuleCount: 0, averageWeight: 0 });
-        onSkinningComputationStatus({
-          busy: false,
-          revision,
-          completed: true,
-          bindingHash: `bind:${revision}:empty`,
-          meshHash,
-        });
-        return;
-      }
-
-      const nearest = bindVerticesToClosestCapsule(baseVerticesWorld, capsules, {
-        rootCapsuleIds,
-        falloffMultiplier: 2,
-      });
-      if (skinningJobTokenRef.current !== currentToken) return;
-
-      const actuatorById = new Map(
-        actuators.map((actuator) => [
-          actuator.id,
-          {
-            rigId: actuator.rigId,
-            position: new Vector3(
-              actuator.transform.position.x,
-              actuator.transform.position.y,
-              actuator.transform.position.z,
-            ),
-            rotation: new Quaternion(
-              actuator.transform.rotation.x,
-              actuator.transform.rotation.y,
-              actuator.transform.rotation.z,
-              actuator.transform.rotation.w,
-            ),
-          },
-        ]),
-      );
-      const rootIdByRig = new Map<string, string>();
-      for (const actuator of actuators) {
-        if (actuator.parentId !== null || actuator.shape !== "capsule") continue;
-        rootIdByRig.set(actuator.rigId, actuator.id);
-      }
-      const fallbackRootCapsuleId = rootCapsuleIds[0] ?? null;
-
-      const nextBindings: RuntimeVertexBinding[] = nearest.map((binding, index) => {
-        const bindWorld = baseVerticesWorld[index];
-        const influenceActuator = actuatorById.get(binding.capsuleId);
-        const rigScopedRootId =
-          influenceActuator === undefined
-            ? null
-            : (rootIdByRig.get(influenceActuator.rigId) ?? fallbackRootCapsuleId);
-        const rootCapsuleId = rigScopedRootId ?? fallbackRootCapsuleId;
-        const rootActuator = rootCapsuleId === null ? undefined : actuatorById.get(rootCapsuleId);
-        const rootLocalOffset =
-          rootActuator === undefined
-            ? { x: 0, y: 0, z: 0 }
-            : (() => {
-                const offset = new Vector3(bindWorld.x, bindWorld.y, bindWorld.z)
-                  .sub(rootActuator.position)
-                  .applyQuaternion(rootActuator.rotation.clone().invert());
-                return { x: offset.x, y: offset.y, z: offset.z };
-              })();
-
-        if (influenceActuator === undefined) {
-          return {
-            capsuleId: binding.capsuleId,
-            rootCapsuleId,
-            bindWorld,
-            localOffset: { x: 0, y: 0, z: 0 },
-            rootLocalOffset,
-            weight: 0,
-          };
-        }
-
-        const localOffset = new Vector3(bindWorld.x, bindWorld.y, bindWorld.z)
-          .sub(influenceActuator.position)
-          .applyQuaternion(influenceActuator.rotation.clone().invert());
-        return {
-          capsuleId: binding.capsuleId,
-          rootCapsuleId,
-          bindWorld,
-          localOffset: { x: localOffset.x, y: localOffset.y, z: localOffset.z },
-          rootLocalOffset,
-          weight: binding.weight,
-        };
-      });
-
-      const averageWeight = nextBindings.reduce((sum, binding) => sum + binding.weight, 0) / Math.max(nextBindings.length, 1);
-      const bindingHash = `bind:${revision}:${nextBindings.length}:${capsules.length}:${averageWeight.toFixed(6)}`;
-      setRuntimeBindings(nextBindings);
-      setBindingsRevision(revision);
-      onSkinningStats({
-        vertexCount: baseVerticesWorld.length,
-        capsuleCount: capsules.length,
-        averageWeight,
-      });
-      onSkinningComputationStatus({
-        busy: false,
-        revision,
-        completed: true,
-        bindingHash,
-        meshHash,
-      });
-    };
-
-    void run();
-  }, [baseVerticesWorld, meshHash, onSkinningComputationStatus, onSkinningStats, skinningRevision]);
-
-  useEffect(() => {
-    if (displayGeometry === null) return;
-    const position = displayGeometry.getAttribute("position");
-    if (position === undefined) return;
-
-    const actuatorById = new Map(
-      actuators.map((actuator) => [
-        actuator.id,
-        {
-          position: new Vector3(
-            actuator.transform.position.x,
-            actuator.transform.position.y,
-            actuator.transform.position.z,
-          ),
-          rotation: new Quaternion(
-            actuator.transform.rotation.x,
-            actuator.transform.rotation.y,
-            actuator.transform.rotation.z,
-            actuator.transform.rotation.w,
-          ),
-        },
-      ]),
-    );
-
-    const shouldDeformInPose =
-      appMode === "Pose" &&
-      skinningEnabled &&
-      runtimeBindings !== null &&
-      runtimeBindings.length === baseVerticesLocal.length &&
-      bindingsRevision >= skinningRevision;
-
-    const deformed = baseVerticesLocal.map((bindLocal, index) => {
-      if (!shouldDeformInPose) return bindLocal;
-      const binding = runtimeBindings[index];
-      if (binding === undefined) return bindLocal;
-
-      const actuator = actuatorById.get(binding.capsuleId);
-      const rootActuator = binding.rootCapsuleId === null ? undefined : actuatorById.get(binding.rootCapsuleId);
-
-      const bindWorld = new Vector3(binding.bindWorld.x, binding.bindWorld.y, binding.bindWorld.z);
-      const transformedWorld =
-        actuator === undefined
-          ? bindWorld.clone()
-          : new Vector3(binding.localOffset.x, binding.localOffset.y, binding.localOffset.z)
-              .applyQuaternion(actuator.rotation)
-              .add(actuator.position);
-      const rootWorld =
-        rootActuator === undefined
-          ? bindWorld.clone()
-          : new Vector3(binding.rootLocalOffset.x, binding.rootLocalOffset.y, binding.rootLocalOffset.z)
-              .applyQuaternion(rootActuator.rotation)
-              .add(rootActuator.position);
-      const weight = Math.max(0, Math.min(1, binding.weight));
-      const weightedWorld = new Vector3(
-        rootWorld.x + (transformedWorld.x - rootWorld.x) * weight,
-        rootWorld.y + (transformedWorld.y - rootWorld.y) * weight,
-        rootWorld.z + (transformedWorld.z - rootWorld.z) * weight,
-      );
-
-      return {
-        x: weightedWorld.x / meshScale,
-        y: (weightedWorld.y - meshYOffset) / meshScale,
-        z: weightedWorld.z / meshScale,
-      };
-    });
-
-    let finalVertices = deformed;
-    if (shouldDeformInPose && deltaMushEnabled) {
-      const deltaMushIterations = Math.max(0, Math.floor(deltaMushSettings.iterations));
-      const deltaMushStrength = Math.max(0, Math.min(1, deltaMushSettings.strength));
-      const weldedCurrent = weldData.weldedVertices.map((_, weldedIndex) => {
-        const members = weldData.weldedToVertices[weldedIndex] ?? [];
-        if (members.length === 0) return { x: 0, y: 0, z: 0 };
-        let sx = 0;
-        let sy = 0;
-        let sz = 0;
-        for (const vertexIndex of members) {
-          sx += deformed[vertexIndex].x;
-          sy += deformed[vertexIndex].y;
-          sz += deformed[vertexIndex].z;
-        }
-        const inv = 1 / members.length;
-        return { x: sx * inv, y: sy * inv, z: sz * inv };
-      });
-
-      const smoothedWelded = applyDeltaMush(weldedCurrent, weldedNeighbors, deltaMushIterations, deltaMushStrength);
-      finalVertices = deformed.map((_, vertexIndex) => {
-        const weldedIndex = weldData.vertexToWelded[vertexIndex];
-        return smoothedWelded[weldedIndex];
-      });
-    }
-
-    for (let i = 0; i < finalVertices.length; i += 1) {
-      position.setXYZ(i, finalVertices[i].x, finalVertices[i].y, finalVertices[i].z);
-    }
-    position.needsUpdate = true;
-  }, [
-    actuators,
-    appMode,
-    baseVerticesLocal,
-    bindingsRevision,
-    deltaMushEnabled,
-    deltaMushSettings,
-    displayGeometry,
-    runtimeBindings,
-    skinningEnabled,
-    skinningRevision,
-    weldData,
-    weldedNeighbors,
-  ]);
-
-  if (displayGeometry === null) return null;
-
-  const ignoreRaycast = () => {};
-
-  return (
-    <mesh
-      geometry={displayGeometry}
-      scale={[meshScale, meshScale, meshScale]}
-      position={[0, meshYOffset, 0]}
-      castShadow
-      receiveShadow
-      raycast={ignoreRaycast}
-    >
-      <meshStandardMaterial map={colorMap} normalMap={normalMap} roughnessMap={roughnessMap} roughness={1} metalness={0} />
-    </mesh>
-  );
-}
-
-function SceneContent({
-  actuators,
-  appMode,
-  selectedActuatorId,
-  selectedActuatorIds,
-  physicsEnabled,
-  skinningEnabled,
-  skinningRevision,
-  deltaMushEnabled,
-  deltaMushSettings,
-  onSkinningStats,
-  onSkinningComputationStatus,
-  gizmoMode,
-  gizmoSpace,
-  pivotMode,
-  isTransformDragging,
-  onSelectActuator,
-  onClearSelection,
-  onActuatorRef,
-  onTransformStart,
-  onTransformChange,
-  onTransformEnd,
-}: SceneContentProps) {
-  const { scene } = useThree();
-  const xrMode = useXR((state) => state.mode);
-  const isInXR = xrMode !== null;
-  const selectedIdSet = useMemo(() => new Set(selectedActuatorIds), [selectedActuatorIds]);
-  const pivotObjectRef = useRef<Object3D>(new Object3D());
-  const transformControlsRef = useRef<any>(null);
-  const dragStartPivotMatrixRef = useRef(new Matrix4());
-  const dragStartPivotPositionRef = useRef(new Vector3());
-  const dragActuatorIdRef = useRef<string | null>(null);
-  const isDragActiveRef = useRef(false);
-  const hasAcceptedDragFrameRef = useRef(false);
-  const backgroundBlendRef = useRef(appMode === "Pose" ? 1 : 0);
-  const backgroundBlendVelocityRef = useRef(0);
-  const blendedBackgroundRef = useRef(new Color("#d9ecff"));
-  const lightBackground = useMemo(() => new Color("#d9ecff"), []);
-  const darkBackground = useMemo(() => new Color("#1d2230"), []);
-
-  function syncPivotFromSelection() {
-    const pivotObject = pivotObjectRef.current;
-    if (isTransformDragging || isDragActiveRef.current) return;
-
-    if (pivotMode === "world") {
-      pivotObject.position.set(0, 0, 0);
-      pivotObject.quaternion.set(0, 0, 0, 1);
-      pivotObject.scale.set(1, 1, 1);
-      pivotObject.updateMatrixWorld(true);
-      return;
-    }
-
-    if (selectedActuatorId !== null) {
-      const selectedActuator = actuators.find((actuator) => actuator.id === selectedActuatorId);
-      if (selectedActuator === undefined) return;
-      pivotObject.position.set(
-        selectedActuator.transform.position.x,
-        selectedActuator.transform.position.y,
-        selectedActuator.transform.position.z,
-      );
-      pivotObject.quaternion.set(
-        selectedActuator.transform.rotation.x,
-        selectedActuator.transform.rotation.y,
-        selectedActuator.transform.rotation.z,
-        selectedActuator.transform.rotation.w,
-      );
-      pivotObject.scale.set(1, 1, 1);
-      pivotObject.updateMatrixWorld(true);
-    }
-  }
-
-  useEffect(() => {
-    syncPivotFromSelection();
-  }, [isTransformDragging, pivotMode, selectedActuatorId, actuators]);
-
-  useEffect(() => {
-    const controls = transformControlsRef.current;
-    if (controls === null || controls === undefined) return;
-
-    controls.traverse((object: Object3D) => {
-      const mesh = object as Mesh;
-      if (!mesh.isMesh) return;
-
-      const material = mesh.material;
-      if (Array.isArray(material)) {
-        for (const entry of material) {
-          entry.side = DoubleSide;
-          entry.needsUpdate = true;
-        }
-        return;
-      }
-
-      if (material !== undefined && material !== null) {
-        material.side = DoubleSide;
-        material.needsUpdate = true;
-      }
-    });
-  }, [gizmoMode, gizmoSpace, pivotMode, selectedActuatorId]);
-
-  useFrame((_, delta) => {
-    const targetBlend = appMode === "Pose" ? 1 : 0;
-    const blended = smoothDampScalar(
-      backgroundBlendRef.current,
-      targetBlend,
-      backgroundBlendVelocityRef.current,
-      0.15,
-      delta,
-    );
-    backgroundBlendRef.current = blended.value;
-    backgroundBlendVelocityRef.current = blended.velocity;
-    const t = backgroundBlendRef.current;
-    blendedBackgroundRef.current.setRGB(
-      lightBackground.r + (darkBackground.r - lightBackground.r) * t,
-      lightBackground.g + (darkBackground.g - lightBackground.g) * t,
-      lightBackground.b + (darkBackground.b - lightBackground.b) * t,
-    );
-    scene.background = blendedBackgroundRef.current;
-
-    syncPivotFromSelection();
-    const controls = transformControlsRef.current;
-    if (controls === null || controls === undefined) return;
-    controls.traverse((object: Object3D) => {
-      const mesh = object as Mesh;
-      if (!mesh.isMesh) return;
-      const material = mesh.material;
-      if (Array.isArray(material)) {
-        for (const entry of material) entry.side = DoubleSide;
-      } else if (material !== undefined && material !== null) {
-        material.side = DoubleSide;
-      }
-    });
-  });
-
-  function getGeometry(shape: ActuatorShape, size: Vec3) {
-    if (shape === "sphere") return <sphereGeometry args={[Math.max(size.x, size.y, size.z) * 0.5, 18, 14]} />;
-    if (shape === "capsule") return <capsuleGeometry args={[Math.max(size.x, size.z) * 0.5, size.y, 8, 14]} />;
-    return <boxGeometry args={[size.x, size.y, size.z]} />;
-  }
-
-  return (
-    <>
-      <ambientLight intensity={0.6} />
-      <directionalLight position={[4, 6, 3]} intensity={1.1} />
-      <primitive object={pivotObjectRef.current} visible={false} />
-      <ChadReferenceMesh
-        actuators={actuators}
-        appMode={appMode}
-        skinningEnabled={skinningEnabled}
-        skinningRevision={skinningRevision}
-        deltaMushEnabled={deltaMushEnabled}
-        deltaMushSettings={deltaMushSettings}
-        onSkinningStats={onSkinningStats}
-        onSkinningComputationStatus={onSkinningComputationStatus}
-      />
-
-      <Physics gravity={[0, -9.81, 0]} paused={!physicsEnabled}>
-        {actuators.map((actuator) => {
-          const isSelected = selectedIdSet.has(actuator.id);
-          const isRoot = actuator.parentId === null;
-          const color = isSelected ? "#ff6a3d" : isRoot ? "#28a26a" : "#2f7fd1";
-
-          return (
-            <mesh
-              key={actuator.id}
-              ref={(object) => onActuatorRef(actuator.id, object)}
-              position={[actuator.transform.position.x, actuator.transform.position.y, actuator.transform.position.z]}
-              quaternion={
-                new Quaternion(
-                  actuator.transform.rotation.x,
-                  actuator.transform.rotation.y,
-                  actuator.transform.rotation.z,
-                  actuator.transform.rotation.w,
-                )
-              }
-              scale={[actuator.transform.scale.x, actuator.transform.scale.y, actuator.transform.scale.z]}
-              onClick={(event) => {
-                event.stopPropagation();
-                onSelectActuator(actuator.id, {
-                  additive: event.shiftKey,
-                  toggle: event.ctrlKey || event.metaKey,
-                });
-              }}
-              onPointerDown={(event) => event.stopPropagation()}
-              castShadow
-            >
-              {getGeometry(actuator.shape, actuator.size)}
-              <meshStandardMaterial color={color} roughness={0.35} metalness={0.05} />
-            </mesh>
-          );
-        })}
-
-        {selectedActuatorId !== null && !isInXR && gizmoMode !== "select" ? (
-          <TransformControls
-            ref={transformControlsRef}
-            mode={gizmoMode}
-            space={gizmoSpace}
-            size={0.75}
-            object={pivotObjectRef.current}
-            onMouseDown={() => {
-              hasAcceptedDragFrameRef.current = false;
-              syncPivotFromSelection();
-              isDragActiveRef.current = true;
-              dragActuatorIdRef.current = selectedActuatorId;
-              const pivotTarget = pivotObjectRef.current;
-              pivotTarget.updateMatrixWorld(true);
-              dragStartPivotMatrixRef.current.copy(pivotTarget.matrixWorld);
-              dragStartPivotPositionRef.current.setFromMatrixPosition(dragStartPivotMatrixRef.current);
-              onTransformStart();
-            }}
-            onMouseUp={() => {
-              isDragActiveRef.current = false;
-              hasAcceptedDragFrameRef.current = false;
-              dragActuatorIdRef.current = null;
-              onTransformEnd();
-            }}
-            onObjectChange={() => {
-              if (!isDragActiveRef.current) return;
-              const actuatorId = dragActuatorIdRef.current;
-              if (actuatorId === null) return;
-
-              const pivotObject = pivotObjectRef.current;
-              pivotObject.updateMatrixWorld(true);
-
-              const startPivotInverse = dragStartPivotMatrixRef.current.clone().invert();
-              const worldDelta = pivotObject.matrixWorld.clone().multiply(startPivotInverse);
-              const localDelta = startPivotInverse.clone().multiply(pivotObject.matrixWorld.clone());
-              const currentPivotPosition = new Vector3().setFromMatrixPosition(pivotObject.matrixWorld);
-              const worldOffset = currentPivotPosition.sub(dragStartPivotPositionRef.current);
-
-              if (!hasAcceptedDragFrameRef.current) {
-                // Guard against TransformControls first-frame matrix jump.
-                if (worldOffset.length() > 1) {
-                  dragStartPivotMatrixRef.current.copy(pivotObject.matrixWorld);
-                  dragStartPivotPositionRef.current.setFromMatrixPosition(pivotObject.matrixWorld);
-                  return;
-                }
-                hasAcceptedDragFrameRef.current = true;
-              }
-
-              onTransformChange(actuatorId, worldDelta, localDelta, {
-                x: worldOffset.x,
-                y: worldOffset.y,
-                z: worldOffset.z,
-              });
-            }}
-          />
-        ) : null}
-
-        <RigidBody type="fixed" colliders="cuboid">
-          <mesh
-            position={[0, -0.1, 0]}
-            receiveShadow
-            onClick={(event) => {
-              event.stopPropagation();
-              onClearSelection();
-            }}
-          >
-            <boxGeometry args={[8, 0.2, 8]} />
-            <meshStandardMaterial color="#a8b8c8" />
-          </mesh>
-        </RigidBody>
-      </Physics>
-    </>
-  );
-}
-
-type PlaybackDriverProps = {
-  onStep: (deltaSec: number) => void;
-};
-
-function PlaybackDriver({ onStep }: PlaybackDriverProps) {
-  useFrame((_, delta) => {
-    onStep(delta);
-  });
-  return null;
-}
 
 export default function App() {
+  const sceneMeshSources = useMemo<ActiveMeshSource[]>(
+    () => [
+      {
+        id: "mesh_chad",
+        meshUri: "/assets/chad/Chad.fbx",
+        colorMapUri: "/assets/chad/Textures/chad_Col.png",
+        normalMapUri: "/assets/chad/Textures/chad_Norm.png",
+        roughnessMapUri: "/assets/chad/Textures/chad_Pbr.png",
+        worldScale: 0.01,
+        worldYOffset: 0.02,
+      },
+    ],
+    [],
+  );
   const canUseWebXR = typeof navigator !== "undefined" && "xr" in navigator;
   const createdAtRef = useRef(new Date().toISOString());
   const nextActuatorIndexRef = useRef(1);
@@ -1197,15 +106,13 @@ export default function App() {
   });
   const [isTransformDragging, setIsTransformDragging] = useState(false);
   const [gizmoMode, setGizmoMode] = useState<GizmoMode>("translate");
-  const [gizmoSpace, setGizmoSpace] = useState<"world" | "local">("world");
+  const [gizmoSpace, setGizmoSpace] = useState<"world" | "local">("local");
   const [pivotMode, setPivotMode] = useState<PivotMode>("object");
   const [appMode, setAppMode] = useState<AppMode>("Rig");
   const [newActuatorShape, setNewActuatorShape] = useState<ActuatorShape>("capsule");
   const [deltaMushEnabled, setDeltaMushEnabled] = useState(true);
-  const [deltaMushSettings, setDeltaMushSettings] = useState<DeltaMushSettings>({
-    iterations: 2,
-    strength: 0.25,
-  });
+  const [deltaMushSettings, setDeltaMushSettings] = useState<DeltaMushSettings>(DEFAULT_DELTA_MUSH_SETTINGS);
+  const [physicsTuning] = useState<PhysicsTuning>(DEFAULT_PHYSICS_TUNING);
   const [skinningStats, setSkinningStats] = useState<SkinningStats>({
     vertexCount: 0,
     capsuleCount: 0,
@@ -1217,6 +124,7 @@ export default function App() {
   const [syntheticClip, setSyntheticClip] = useState<SyntheticClip | null>(null);
   const [playbackState, setPlaybackState] = useState<"stopped" | "playing">("stopped");
   const [playbackTimeSec, setPlaybackTimeSec] = useState(0);
+  const [isPosePullDragging, setIsPosePullDragging] = useState(false);
   const playbackClockRef = useRef<PlaybackClock | null>(null);
   const transformStartSnapshotRef = useRef<EditorState | null>(null);
   const editorStateRef = useRef<EditorState>(editorState);
@@ -1226,8 +134,12 @@ export default function App() {
   const [skinBindingHash, setSkinBindingHash] = useState("pending");
   const [skinMeshHash, setSkinMeshHash] = useState("pending");
   const [skinningEnabled, setSkinningEnabled] = useState(false);
+  const [physicsEnabled, setPhysicsEnabled] = useState(false);
   const [pendingPoseRevision, setPendingPoseRevision] = useState<number | null>(null);
+  const [poseTargetActuators, setPoseTargetActuators] = useState<ActuatorEntity[] | null>(null);
+  const poseEntrySnapshotRef = useRef<EditorState | null>(null);
   const bindPoseTransformsRef = useRef<Record<string, ActuatorTransformSnapshot> | null>(null);
+  const simulationStartSnapshotRef = useRef<EditorState | null>(null);
   const bindBlendStateRef = useRef<{
     target: Record<string, ActuatorTransformSnapshot>;
     lastTimestampMs: number | null;
@@ -1261,7 +173,6 @@ export default function App() {
       setSkinMeshHash(status.meshHash);
     }
   }, []);
-  const physicsEnabled = false;
 
   useEffect(() => {
     editorStateRef.current = editorState;
@@ -1286,6 +197,7 @@ export default function App() {
   function requestAppMode(nextMode: AppMode) {
     if (nextMode === "Pose") {
       if (appMode === "Pose" && pendingPoseRevision === null) return;
+      poseEntrySnapshotRef.current = cloneEditorState(editorState);
       const requiredRevision = skinningRevision + 1;
       setPendingPoseRevision(requiredRevision);
       setSkinningEnabled(true);
@@ -1293,10 +205,25 @@ export default function App() {
       return;
     }
 
-    if (appMode === "Rig" && pendingPoseRevision === null) return;
+    if (appMode === "Rig" && pendingPoseRevision === null && !physicsEnabled) return;
     setPendingPoseRevision(null);
     setSkinningEnabled(false);
     setAppMode("Rig");
+    setIsPosePullDragging(false);
+    setPoseTargetActuators(null);
+    poseEntrySnapshotRef.current = null;
+
+    const wasSimulating = physicsEnabled;
+    if (wasSimulating) {
+      setPhysicsEnabled(false);
+      const snapshot = simulationStartSnapshotRef.current;
+      simulationStartSnapshotRef.current = null;
+      if (snapshot !== null) {
+        editorStateRef.current = snapshot;
+        setEditorState(snapshot);
+      }
+    }
+    if (wasSimulating) return;
 
     const bindPose = bindPoseTransformsRef.current;
     if (bindPose === null) return;
@@ -1327,21 +254,26 @@ export default function App() {
     if (appMode !== "Rig") return;
     if (pendingPoseRevision !== null) return;
     if (bindBlendStateRef.current !== null) return;
+    if (isTransformDragging) return;
     const timer = setTimeout(() => {
       setSkinningRevision((value) => value + 1);
     }, 60);
     return () => clearTimeout(timer);
-  }, [actuators, appMode, pendingPoseRevision]);
+  }, [actuators, appMode, isTransformDragging, pendingPoseRevision]);
 
   useEffect(() => {
     if (pendingPoseRevision === null) return;
     if (skinningBusy) return;
     if (completedSkinningRevision < pendingPoseRevision) return;
-    bindPoseTransformsRef.current = snapshotActuatorTransforms();
+    const poseEntrySnapshot = poseEntrySnapshotRef.current ?? cloneEditorState(editorState);
+    bindPoseTransformsRef.current = snapshotActuatorTransforms(poseEntrySnapshot.actuators);
+    simulationStartSnapshotRef.current = poseEntrySnapshot;
+    setPoseTargetActuators(poseEntrySnapshot.actuators);
     setSkinningEnabled(true);
     setAppMode("Pose");
+    setPhysicsEnabled(true);
     setPendingPoseRevision(null);
-  }, [actuators, completedSkinningRevision, pendingPoseRevision, skinningBusy]);
+  }, [actuators, completedSkinningRevision, editorState, pendingPoseRevision, skinningBusy]);
 
   useEffect(() => {
     const blend = bindBlendStateRef.current;
@@ -1467,13 +399,17 @@ export default function App() {
       selectedActuatorIds: [...state.selectedActuatorIds],
       actuators: state.actuators.map((actuator) => ({
         ...actuator,
+        pivot: {
+          ...actuator.pivot,
+          offset: { ...actuator.pivot.offset },
+        },
         transform: {
           ...actuator.transform,
           position: { ...actuator.transform.position },
           rotation: { ...actuator.transform.rotation },
           scale: { ...actuator.transform.scale },
         },
-        size: { ...actuator.size },
+        size: normalizePrimitiveSize(actuator.size),
       })),
     };
   }
@@ -1540,19 +476,23 @@ export default function App() {
   }
 
   function createActuator() {
-    const index = nextActuatorIndexRef.current;
-    nextActuatorIndexRef.current += 1;
+    commitEditorChange((previous) => {
+      const activeRigId = previous.selectedRigId;
+      const rigActuators = previous.actuators.filter((actuator) => actuator.rigId === activeRigId);
+      const fallbackRoot = rigActuators.find((actuator) => actuator.parentId === null) ?? createRootActuator(activeRigId);
+      const selectedParents = [...new Set(previous.selectedActuatorIds)]
+        .map((selectedId) => previous.actuators.find((actuator) => actuator.id === selectedId && actuator.rigId === activeRigId))
+        .filter((actuator): actuator is ActuatorEntity => actuator !== undefined);
+      const fallbackParent =
+        previous.actuators.find((actuator) => actuator.id === previous.selectedActuatorId && actuator.rigId === activeRigId) ??
+        fallbackRoot;
+      const parents = selectedParents.length > 0 ? selectedParents : [fallbackParent];
 
-    const id = `act_${index.toString().padStart(4, "0")}`;
-
-    commitEditorChange((previous) => ({
-      actuators: (() => {
-        const activeRigId = previous.selectedRigId;
-        const rigActuators = previous.actuators.filter((actuator) => actuator.rigId === activeRigId);
-        const fallbackRoot = rigActuators.find((actuator) => actuator.parentId === null) ?? createRootActuator(activeRigId);
-        const parent =
-          previous.actuators.find((actuator) => actuator.id === previous.selectedActuatorId && actuator.rigId === activeRigId) ??
-          fallbackRoot;
+      const created: ActuatorEntity[] = [];
+      for (const parent of parents) {
+        const index = nextActuatorIndexRef.current;
+        nextActuatorIndexRef.current += 1;
+        const id = `act_${index.toString().padStart(4, "0")}`;
 
         const parentRotation = new Quaternion(
           parent.transform.rotation.x,
@@ -1560,34 +500,42 @@ export default function App() {
           parent.transform.rotation.z,
           parent.transform.rotation.w,
         );
-        const parentPosition = new Vector3(
-          parent.transform.position.x,
-          parent.transform.position.y,
-          parent.transform.position.z,
+        const parentUp = new Vector3(0, 1, 0).applyQuaternion(parentRotation);
+        const parentCenter = getActuatorPrimitiveCenter(parent);
+
+        const childShape = parent.shape;
+        const childPreset = parent.preset ?? defaultPresetForActuatorType(parent.type);
+        const childPivot = {
+          mode: parent.pivot.mode,
+          offset: { ...parent.pivot.offset },
+        };
+        const childSize = normalizePrimitiveSize({ ...parent.size });
+        const parentHalfExtent = parent.shape === "capsule" ? getCapsuleHalfAxis(parent.size) : parent.size.y * 0.5;
+        const childHalfExtent = childShape === "capsule" ? getCapsuleHalfAxis(childSize) : childSize.y * 0.5;
+        const endOffset = parentUp.clone().multiplyScalar(parentHalfExtent + childHalfExtent + 0.08);
+        const spawnCenter = parentCenter.add(endOffset);
+        const desiredPivotWorld =
+          childShape === "capsule" && childPivot.mode === "capStart"
+            ? spawnCenter.clone().addScaledVector(parentUp, -childHalfExtent)
+            : spawnCenter.clone();
+        const rotatedPivotOffset = new Vector3(childPivot.offset.x, childPivot.offset.y, childPivot.offset.z).applyQuaternion(
+          parentRotation,
         );
+        const spawnTransformPosition = desiredPivotWorld.sub(rotatedPivotOffset);
 
-        const childSize =
-          newActuatorShape === "capsule"
-            ? { x: 0.35, y: 0.7, z: 0.35 }
-            : newActuatorShape === "sphere"
-              ? { x: 0.45, y: 0.45, z: 0.45 }
-              : { x: 0.4, y: 0.4, z: 0.4 };
-        const parentHalfHeight = (parent.size.y * parent.transform.scale.y) / 2;
-        const childHalfHeight = childSize.y / 2;
-        const endOffset = new Vector3(0, parentHalfHeight + childHalfHeight + 0.08, 0).applyQuaternion(parentRotation);
-        const spawnPosition = parentPosition.add(endOffset);
-
-        const actuator: ActuatorEntity = {
+        created.push({
           id: `${activeRigId}_${id}`,
           rigId: activeRigId,
           parentId: parent.id,
           type: "custom",
-          shape: newActuatorShape,
+          shape: childShape,
+          preset: childPreset,
+          pivot: childPivot,
           transform: {
             position: {
-              x: spawnPosition.x,
-              y: spawnPosition.y,
-              z: spawnPosition.z,
+              x: spawnTransformPosition.x,
+              y: spawnTransformPosition.y,
+              z: spawnTransformPosition.z,
             },
             rotation: {
               x: parentRotation.x,
@@ -1597,15 +545,18 @@ export default function App() {
             },
             scale: { x: 1, y: 1, z: 1 },
           },
-          size: childSize,
-        };
+          size: normalizePrimitiveSize(childSize),
+        });
+      }
 
-        return [...previous.actuators, actuator];
-      })(),
-      selectedRigId: previous.selectedRigId,
-      selectedActuatorId: `${previous.selectedRigId}_${id}`,
-      selectedActuatorIds: [`${previous.selectedRigId}_${id}`],
-    }));
+      const createdIds = created.map((actuator) => actuator.id);
+      return {
+        actuators: [...previous.actuators, ...created],
+        selectedRigId: previous.selectedRigId,
+        selectedActuatorId: createdIds[0] ?? previous.selectedActuatorId,
+        selectedActuatorIds: createdIds,
+      };
+    });
   }
 
   function createRig() {
@@ -1764,6 +715,31 @@ export default function App() {
     const deltaScale = new Vector3();
     localDelta.decompose(deltaPosition, deltaRotation, deltaScale);
 
+    if (gizmoMode === "scale") {
+      const selectedSet = new Set(selectedOrdered);
+      const nextActuators = baseState.actuators.map((actuator) => {
+        if (!selectedSet.has(actuator.id)) return actuator;
+        return {
+          ...actuator,
+          size: scalePrimitiveSizeFromGizmoDelta(actuator.size, {
+            x: deltaScale.x,
+            y: deltaScale.y,
+            z: deltaScale.z,
+          }),
+          transform: {
+            ...actuator.transform,
+            scale: { x: 1, y: 1, z: 1 },
+          },
+        };
+      });
+
+      setEditorState((previous) => ({
+        ...previous,
+        actuators: nextActuators,
+      }));
+      return;
+    }
+
     void worldDelta;
     const worldTranslateDelta = new Vector3(worldOffset.x, worldOffset.y, worldOffset.z);
 
@@ -1784,12 +760,6 @@ export default function App() {
         nextPosition.add(worldTranslateDelta);
       } else if (gizmoMode === "rotate") {
         nextRotation.multiply(deltaRotation);
-      } else if (gizmoMode === "scale") {
-        nextScale.set(
-          nextScale.x * deltaScale.x,
-          nextScale.y * deltaScale.y,
-          nextScale.z * deltaScale.z,
-        );
       }
 
       const targetMatrix = new Matrix4().compose(nextPosition, nextRotation, nextScale);
@@ -1821,29 +791,6 @@ export default function App() {
         },
       };
     });
-
-    // Apply scene-object transforms in the same event tick as gizmo movement.
-    for (const actuator of nextActuators) {
-      const object = actuatorObjectRefs.current[actuator.id];
-      if (object === null || object === undefined) continue;
-      object.position.set(
-        actuator.transform.position.x,
-        actuator.transform.position.y,
-        actuator.transform.position.z,
-      );
-      object.quaternion.set(
-        actuator.transform.rotation.x,
-        actuator.transform.rotation.y,
-        actuator.transform.rotation.z,
-        actuator.transform.rotation.w,
-      );
-      object.scale.set(
-        actuator.transform.scale.x,
-        actuator.transform.scale.y,
-        actuator.transform.scale.z,
-      );
-      object.updateMatrixWorld(true);
-    }
 
     setEditorState((previous) => ({
       ...previous,
@@ -1945,18 +892,62 @@ export default function App() {
   const serializedScene = useMemo(() => {
     const sortedActuators = [...actuators].sort((a, b) => a.id.localeCompare(b.id));
     const characters = rigIds.map((rigId, index) => {
+      const meshSource =
+        sceneMeshSources.length === 0 ? null : sceneMeshSources[Math.min(index, sceneMeshSources.length - 1)];
       const rigActuators = sortedActuators.filter((actuator) => actuator.rigId === rigId);
+      const rigActuatorDocuments = rigActuators.map((actuator) => {
+        const presetSettings = getActuatorPresetSettings(actuator);
+        return {
+          id: actuator.id,
+          parentId: actuator.parentId,
+          type: actuator.type,
+          shape: actuator.shape,
+          preset: actuator.preset ?? defaultPresetForActuatorType(actuator.type),
+          pivot: {
+            mode: actuator.pivot.mode,
+            offsetLocal: { ...actuator.pivot.offset },
+          },
+          transform: {
+            position: { ...actuator.transform.position },
+            rotation: { ...actuator.transform.rotation },
+            scale: { ...actuator.transform.scale },
+          },
+          size: { ...actuator.size },
+          joint: {
+            mode: "limited",
+            angularLimitDeg: { x: 45, y: 45, z: 45 },
+            swingLimitDeg: 45,
+            twistLimitDeg: 45,
+          },
+          physics: {
+            mass: getActuatorMassFromPreset(actuator),
+            linearDamping: presetSettings.drag,
+            angularDamping: presetSettings.angularDrag,
+            drivePositionSpring: presetSettings.drivePositionSpring,
+            drivePositionDamper: presetSettings.drivePositionDamper,
+            driveRotationSpring: presetSettings.driveRotationSpring,
+            driveRotationDamper: presetSettings.driveRotationDamper,
+            gravityScale: 1,
+            kinematicInRigMode: true,
+          },
+          influence: {
+            radius: Math.max(actuator.size.x, actuator.size.y, actuator.size.z) * 0.5,
+            falloff: 1,
+            weight: 1,
+          },
+        };
+      });
       const root = rigActuators.find((actuator) => actuator.parentId === null);
       return {
         id: `char_${(index + 1).toString().padStart(3, "0")}`,
         name: `PrototypeCharacter_${rigId}`,
         mesh: {
-          meshId: "mesh_chad_fbx",
-          uri: "assets/chad/Chad.fbx",
+          meshId: meshSource?.id ?? "mesh_active",
+          uri: meshSource?.meshUri.replace(/^\//, "") ?? "",
         },
         rig: {
           rootActuatorId: root?.id ?? "",
-          actuators: rigActuators,
+          actuators: rigActuatorDocuments,
         },
         skinBinding: {
           version: "0.1",
@@ -1990,7 +981,7 @@ export default function App() {
       null,
       2,
     );
-  }, [actuators, rigIds, syntheticClip, skinBindingHash, skinMeshHash, skinningStats.vertexCount]);
+  }, [actuators, rigIds, sceneMeshSources, syntheticClip, skinBindingHash, skinMeshHash, skinningStats.vertexCount]);
 
   useEffect(() => {
     function isTypingTarget(target: EventTarget | null) {
@@ -2046,7 +1037,7 @@ export default function App() {
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [actuators, appMode, pendingPoseRevision, selectedActuatorIds, selectedRigId, skinningRevision]);
+  }, [actuators, appMode, pendingPoseRevision, physicsEnabled, selectedActuatorIds, selectedRigId, skinningRevision]);
 
   async function enterVR() {
     try {
@@ -2253,12 +1244,20 @@ export default function App() {
     <main className="app">
       <header className="app__header">
         <h1>Actuator2 Runtime Bootstrap</h1>
-        <p>Sprint 01 focus: Chad mesh integration for rigging workflows</p>
+        <p>Sprint 03 focus: physics integration foundations</p>
         <div className="app__actions">
-          <button type="button" onClick={() => requestAppMode("Rig")} disabled={appMode === "Rig" && pendingPoseRevision === null}>
+          <button
+            type="button"
+            onClick={() => requestAppMode("Rig")}
+            disabled={appMode === "Rig" && pendingPoseRevision === null}
+          >
             Rig Mode
           </button>
-          <button type="button" onClick={() => requestAppMode("Pose")} disabled={appMode === "Pose" || pendingPoseRevision !== null}>
+          <button
+            type="button"
+            onClick={() => requestAppMode("Pose")}
+            disabled={appMode === "Pose" || pendingPoseRevision !== null}
+          >
             Pose Mode
           </button>
           <button type="button" onClick={enterVR} disabled={!canUseWebXR}>
@@ -2269,7 +1268,8 @@ export default function App() {
           ) : (
             <span>Desktop controls: Alt+LMB orbit, MMB pan, RMB zoom, wheel zoom</span>
           )}
-          <span>Mode: {appMode} (Space toggles Rig/Pose)</span>
+          <span>Mode: {appMode} {physicsEnabled ? "(sim on)" : "(sim off)"} (Space toggles Rig/Pose)</span>
+          <span>Pose Drag: click + drag actuator primitive</span>
           <span>Skinning: {skinningBusy ? "Rebuilding..." : `Ready (rev ${completedSkinningRevision})`}</span>
           <span>Playback: {playbackState} @ {playbackTimeSec.toFixed(2)}s</span>
         </div>
@@ -2277,16 +1277,17 @@ export default function App() {
       <section className="app__viewport">
         <aside className="app__panel">
           <div className="app__panel-actions">
-            <button type="button" onClick={createRig}>
+            <button type="button" onClick={createRig} disabled={physicsEnabled}>
               Create Rig
             </button>
-            <button type="button" onClick={createActuator}>
+            <button type="button" onClick={createActuator} disabled={physicsEnabled}>
               Create Actuator
             </button>
             <button
               type="button"
               onClick={deleteSelectedActuator}
               disabled={
+                physicsEnabled ||
                 selectedActuatorIds.length === 0 ||
                 selectedActuatorIds.every((id) => {
                   const actuator = actuators.find((item) => item.id === id);
@@ -2296,10 +1297,10 @@ export default function App() {
             >
               Delete Selected
             </button>
-            <button type="button" onClick={undo} disabled={undoStackRef.current.length === 0}>
+            <button type="button" onClick={undo} disabled={physicsEnabled || undoStackRef.current.length === 0}>
               Undo
             </button>
-            <button type="button" onClick={redo} disabled={redoStackRef.current.length === 0}>
+            <button type="button" onClick={redo} disabled={physicsEnabled || redoStackRef.current.length === 0}>
               Redo
             </button>
             <button type="button" onClick={recordSynthetic}>
@@ -2387,7 +1388,9 @@ export default function App() {
                 value={deltaMushSettings.iterations}
                 onChange={(event) => {
                   const parsed = Number(event.target.value);
-                  const nextIterations = Number.isFinite(parsed) ? Math.max(0, Math.min(12, Math.round(parsed))) : 0;
+                  const nextIterations = Number.isFinite(parsed)
+                    ? Math.max(0, Math.min(12, Math.round(parsed)))
+                    : DEFAULT_DELTA_MUSH_SETTINGS.iterations;
                   setDeltaMushSettings((previous) => ({
                     ...previous,
                     iterations: nextIterations,
@@ -2406,7 +1409,9 @@ export default function App() {
                 value={deltaMushSettings.strength}
                 onChange={(event) => {
                   const parsed = Number(event.target.value);
-                  const nextStrength = Number.isFinite(parsed) ? Math.max(0, Math.min(1, parsed)) : 0;
+                  const nextStrength = Number.isFinite(parsed)
+                    ? Math.max(0, Math.min(1, parsed))
+                    : DEFAULT_DELTA_MUSH_SETTINGS.strength;
                   setDeltaMushSettings((previous) => ({
                     ...previous,
                     strength: nextStrength,
@@ -2468,13 +1473,16 @@ export default function App() {
             <XR store={xrStore}>
               <PlaybackDriver onStep={onPlaybackStep} />
               <DesktopInertialCameraControls
-                blocked={isTransformDragging}
+                blocked={isTransformDragging || isPosePullDragging}
                 focusRequest={focusRequest}
                 focusNonce={focusNonce}
               />
               <SceneContent
+                meshSources={sceneMeshSources}
                 actuators={actuators}
                 appMode={appMode}
+                pendingPoseRevision={pendingPoseRevision}
+                poseTargetActuators={poseTargetActuators}
                 selectedActuatorId={selectedActuatorId}
                 selectedActuatorIds={selectedActuatorIds}
                 physicsEnabled={physicsEnabled}
@@ -2482,6 +1490,7 @@ export default function App() {
                 skinningRevision={skinningRevision}
                 deltaMushEnabled={deltaMushEnabled}
                 deltaMushSettings={deltaMushSettings}
+                physicsTuning={physicsTuning}
                 onSkinningStats={onSkinningStats}
                 onSkinningComputationStatus={onSkinningComputationStatus}
                 gizmoMode={gizmoMode}
@@ -2494,6 +1503,7 @@ export default function App() {
                 onTransformStart={beginTransformChange}
                 onTransformChange={applyTransformChange}
                 onTransformEnd={endTransformChange}
+                onPosePullDraggingChange={setIsPosePullDragging}
               />
             </XR>
           </Canvas>

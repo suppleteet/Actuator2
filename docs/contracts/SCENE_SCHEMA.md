@@ -44,6 +44,7 @@ Required actuator keys:
 - `parentId`
 - `type`
 - `shape`
+- `pivot`
 - `transform`
 - `size`
 - `joint`
@@ -109,13 +110,24 @@ type ActuatorNodeDocument = {
   parentId: string | null;
   type: "root" | "spine" | "limb" | "joint" | "secondary" | "custom";
   shape: "capsule" | "sphere" | "box";
+  pivot: ActuatorPivotDocument;
   transform: TransformDocument;
   size: Vec3;
   joint: JointDocument;
   physics: PhysicsDocument;
   influence: InfluenceDocument;
 };
+
+type ActuatorPivotDocument = {
+  mode: "capStart" | "center";
+  offsetLocal: Vec3;
+};
 ```
+
+`size` is primitive-dimension data (not transform-scale authoring data):
+- `capsule`: `{ x,z = diameter axes, y = axis distance between cap centers }`
+- `sphere`: `{ x,y,z = diameter axes (uniform spheres should keep equal values) }`
+- `box`: `{ x,y,z = side lengths }`
 
 ## Shared Value Types
 
@@ -193,6 +205,7 @@ type PlaybackDocument = {
 - Actuator graph must be acyclic.
 - `parentId = null` only for the root actuator.
 - Quaternion values must be finite numbers.
+- For capsules, default pivot mode is `capStart` (first cap sphere center) unless explicitly set to `center`.
 - Serialization order must be stable:
   - `characters` sorted by `id`
   - each `actuators` list sorted by `id`
@@ -272,6 +285,10 @@ Use `required_rewrite: yes` only if a saved document must be rewritten to remain
             "parentId": null,
             "type": "root",
             "shape": "capsule",
+            "pivot": {
+              "mode": "capStart",
+              "offsetLocal": { "x": 0, "y": 0, "z": 0 }
+            },
             "transform": {
               "position": { "x": 0, "y": 1, "z": 0 },
               "rotation": { "x": 0, "y": 0, "z": 0, "w": 1 },

@@ -1,11 +1,17 @@
 export type Vec3 = { x: number; y: number; z: number };
 export type Quat = { x: number; y: number; z: number; w: number };
+export type ActuatorPivotDocument = {
+  mode: "capStart" | "center";
+  offsetLocal: Vec3;
+};
 
 export type ActuatorNodeDocument = {
   id: string;
   parentId: string | null;
   type: string;
   shape: "capsule" | "sphere" | "box";
+  preset?: string;
+  pivot: ActuatorPivotDocument;
   transform: {
     position: Vec3;
     rotation: Quat;
@@ -113,9 +119,20 @@ export function validateSceneDocument(scene: SceneDocument): string[] {
     }
 
     for (const actuator of actuators) {
+      if (actuator.pivot === undefined || actuator.pivot === null) {
+        errors.push(`actuator ${actuator.id}: pivot is required`);
+      } else {
+        if (actuator.pivot.mode !== "capStart" && actuator.pivot.mode !== "center") {
+          errors.push(`actuator ${actuator.id}: invalid pivot mode`);
+        }
+        if (!isFiniteVec3(actuator.pivot.offsetLocal)) {
+          errors.push(`actuator ${actuator.id}: invalid pivot offsetLocal`);
+        }
+      }
       if (!isFiniteVec3(actuator.transform.position)) errors.push(`actuator ${actuator.id}: invalid position`);
       if (!isFiniteQuat(actuator.transform.rotation)) errors.push(`actuator ${actuator.id}: invalid rotation`);
       if (!isFiniteVec3(actuator.transform.scale)) errors.push(`actuator ${actuator.id}: invalid scale`);
+      if (!isFiniteVec3(actuator.size)) errors.push(`actuator ${actuator.id}: invalid size`);
     }
   }
 

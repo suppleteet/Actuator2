@@ -85,3 +85,23 @@ Automated evidence:
 Result: pass (desktop + automated)
 Notes:
 - XR lane validation not re-run in this pass; execute XR checklist on target hardware before release gate if XR is in scope.
+
+## Sprint 03 Physics Integration Evidence (Q-010)
+- Tester: Codex (RuntimeAgent + QAAgent simulation run)
+- Date: 2026-02-27
+- Scope: primitive-first physics runtime, pivot semantics, deterministic sim transitions
+
+Desktop evidence:
+- Pass: Physics primitives render directly from actuator primitive dimensions (`size`) rather than transform scale.
+- Pass: Capsule default pivot behavior uses start-cap pivot (`capStart`) with optional center mode support in runtime data.
+- Pass: `Start Sim` / `Stop Sim` transitions restore deterministic authoring state after runtime movement.
+- Pass: Parent-child physics bodies are connected via runtime joints during simulation.
+
+Automated evidence:
+- Pass: `npm test` (18 tests, including new physics authoring + simulation transition tests).
+- Pass: `npm run build`.
+
+Result: pass (desktop + automated)
+Notes:
+- XR lane for physics primitives should still be validated on target hardware before release gate.
+- Unity baseline references used for parity decisions: `c:/Projects/Actuator` commit `30c6ea7` (`Actuator.cs`, `ActuatorRig.cs`, `ActuatorRigEditor.cs`, `ColliderExtensions.cs`).

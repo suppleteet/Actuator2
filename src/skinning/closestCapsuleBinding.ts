@@ -58,70 +58,35 @@ export function closestPointOnSegment(point: Vec3, a: Vec3, b: Vec3): Vec3 {
   return add(a, mul(ab, t));
 }
 
-function evaluateCapsuleBinding(vertex: Vec3, capsule: Capsule, falloffMultiplier: number): VertexBinding {
+function evaluateCapsuleBinding(vertex: Vec3, capsule: Capsule): VertexBinding {
   const axisPoint = closestPointOnSegment(vertex, capsule.start, capsule.end);
   const axisToVertex = sub(vertex, axisPoint);
   const axisDistance = length(axisToVertex);
   const direction = normalize(axisToVertex);
   const surfacePoint = add(axisPoint, mul(direction, capsule.radius));
   const distanceToSurface = Math.max(0, axisDistance - capsule.radius);
-  const weight = clamp01(1 - distanceToSurface / Math.max(capsule.radius * falloffMultiplier, 1e-5));
 
   return {
     capsuleId: capsule.id,
     axisPoint,
     surfacePoint,
     distanceToSurface,
-    weight,
+    weight: 1,
   };
 }
 
-export function bindVerticesToClosestCapsule(vertices: Vec3[], capsules: Capsule[], options?: BindOptions): VertexBinding[] {
+export function bindVerticesToClosestCapsule(vertices: Vec3[], capsules: Capsule[], _options?: BindOptions): VertexBinding[] {
   if (capsules.length === 0) return [];
-  const falloffMultiplier = Math.max(options?.falloffMultiplier ?? 2, 0.0001);
-  const rootIds = new Set(options?.rootCapsuleIds ?? []);
-  const rootCapsules =
-    rootIds.size === 0
-      ? []
-      : capsules.filter((capsule) => rootIds.has(capsule.id));
 
   return vertices.map((vertex) => {
     let best: VertexBinding | null = null;
     let bestDistance = Number.POSITIVE_INFINITY;
-    let bestWithinFalloff: VertexBinding | null = null;
-    let bestWithinFalloffDistance = Number.POSITIVE_INFINITY;
 
     for (const capsule of capsules) {
-      const candidate = evaluateCapsuleBinding(vertex, capsule, falloffMultiplier);
+      const candidate = evaluateCapsuleBinding(vertex, capsule);
       if (candidate.distanceToSurface < bestDistance) {
         bestDistance = candidate.distanceToSurface;
         best = candidate;
-      }
-      if (candidate.weight > 0 && candidate.distanceToSurface < bestWithinFalloffDistance) {
-        bestWithinFalloffDistance = candidate.distanceToSurface;
-        bestWithinFalloff = candidate;
-      }
-    }
-
-    if (bestWithinFalloff !== null) {
-      return bestWithinFalloff;
-    }
-
-    if (rootCapsules.length > 0) {
-      let bestRoot: VertexBinding | null = null;
-      let bestRootDistance = Number.POSITIVE_INFINITY;
-      for (const root of rootCapsules) {
-        const rootCandidate = evaluateCapsuleBinding(vertex, root, falloffMultiplier);
-        if (rootCandidate.distanceToSurface < bestRootDistance) {
-          bestRootDistance = rootCandidate.distanceToSurface;
-          bestRoot = rootCandidate;
-        }
-      }
-      if (bestRoot !== null) {
-        return {
-          ...bestRoot,
-          weight: 1,
-        };
       }
     }
 

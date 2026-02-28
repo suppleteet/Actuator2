@@ -10,6 +10,10 @@ function mul(v: Vec3, scalar: number): Vec3 {
   return { x: v.x * scalar, y: v.y * scalar, z: v.z * scalar };
 }
 
+function sub(a: Vec3, b: Vec3): Vec3 {
+  return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
+}
+
 export function buildVertexNeighbors(vertexCount: number, triangles: Triangle[]): number[][] {
   const neighbors: Array<Set<number>> = Array.from({ length: vertexCount }, () => new Set<number>());
 
@@ -56,4 +60,25 @@ export function applyDeltaMush(
   }
 
   return current;
+}
+
+export function buildDeltaMushDetailOffsets(
+  restPositions: Vec3[],
+  neighbors: number[][],
+  iterations = 5,
+  alpha = 0.5,
+): Vec3[] {
+  const smoothedRest = applyDeltaMush(restPositions, neighbors, iterations, alpha);
+  return restPositions.map((rest, index) => sub(rest, smoothedRest[index] ?? rest));
+}
+
+export function applyDeltaMushWithDetailRestore(
+  input: Vec3[],
+  neighbors: number[][],
+  detailOffsets: Vec3[],
+  iterations = 5,
+  alpha = 0.5,
+): Vec3[] {
+  const smoothed = applyDeltaMush(input, neighbors, iterations, alpha);
+  return smoothed.map((value, index) => add(value, detailOffsets[index] ?? { x: 0, y: 0, z: 0 }));
 }
