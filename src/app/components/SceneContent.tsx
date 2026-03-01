@@ -539,8 +539,8 @@ export function SceneContent({
   const opacityVelocityRef = useRef(0);
   const backgroundBlendRef = useRef(appMode === "Pose" ? 1 : 0);
   const backgroundBlendVelocityRef = useRef(0);
-  const blendedBackgroundRef = useRef(new Color("#d9ecff"));
-  const lightBackground = useMemo(() => new Color("#d9ecff"), []);
+  const blendedBackgroundRef = useRef(new Color("#111a26"));
+  const lightBackground = useMemo(() => new Color("#111a26"), []);
   const darkBackground = useMemo(() => new Color("#1d2230"), []);
   const meshStatsByIdRef = useRef<Record<string, SkinningStats>>({});
   const meshStatusByIdRef = useRef<Record<string, SkinningComputationStatus>>({});
