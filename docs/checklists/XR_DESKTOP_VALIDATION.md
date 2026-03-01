@@ -105,3 +105,24 @@ Result: pass (desktop + automated)
 Notes:
 - XR lane for physics primitives should still be validated on target hardware before release gate.
 - Unity baseline references used for parity decisions: `c:/Projects/Actuator` commit `30c6ea7` (`Actuator.cs`, `ActuatorRig.cs`, `ActuatorRigEditor.cs`, `ColliderExtensions.cs`).
+
+## Sprint 04 Draw UX + Placement Evidence (Q-012)
+- Tester: Codex (InteractionAgent + RuntimeAgent + QAAgent simulation run)
+- Date: 2026-02-28
+- Scope: desktop draw radius UX, inside-mesh placement baseline, mirror/snap deterministic creation
+
+Desktop evidence:
+- Pass: Draw mode shows a live camera-space radius ring at cursor position.
+- Pass: `Ctrl + mouse wheel` adjusts draw radius in fixed steps and clamps to bounds.
+- Pass: Camera wheel zoom is suppressed while `Ctrl` draw radius adjustment is active.
+- Pass: Mouse down creates zero-height capsule(s); drag adjusts capsule end point; mouse up finalizes.
+- Pass: Desktop draw placement derives start/end from interior center probes through mesh thickness.
+- Pass: Mirror toggle duplicates draw creation across center plane; centerline snap suppresses mirrored duplicate.
+
+Automated evidence:
+- Pass: `npm test`
+- Pass: `npm run build`
+
+Result: pass (desktop + automated)
+Notes:
+- XR-specific inside-mesh placement remains out of Sprint 04 scope by plan.

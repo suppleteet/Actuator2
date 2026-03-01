@@ -1,4 +1,4 @@
-import { createRef, useCallback, useEffect, useMemo, useRef, type MutableRefObject, type RefObject } from "react";
+import { createRef, useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type RefObject } from "react";
 import { useFrame, useThree } from "@react-three/fiber";
 import { TransformControls } from "@react-three/drei";
 import {
@@ -17,7 +17,7 @@ import {
 } from "@react-three/rapier";
 import type { ImpulseJoint, RigidBody as RawRigidBody } from "@dimforge/rapier3d-compat";
 import { useXR } from "@react-three/xr";
-import { Color, DoubleSide, Matrix4, Mesh, Object3D, Plane, Quaternion, Vector3 } from "three";
+import { Color, DoubleSide, Matrix4, Mesh, Object3D, Plane, Quaternion, ShaderMaterial, Vector3 } from "three";
 import {
   getActuatorPivotWorldPosition,
   getActuatorPrimitiveCenter,
@@ -26,6 +26,7 @@ import {
   worldPointToActuatorLocal,
 } from "../../runtime/physicsAuthoring";
 import {
+  defaultPresetForActuatorType,
   getActuatorMassFromPreset,
   getActuatorPresetSettings,
   getRuntimeDriveFromPreset,
@@ -34,6 +35,7 @@ import { smoothDampScalar } from "../smoothDamp";
 import type {
   ActiveMeshSource,
   ActuatorEntity,
+  ActuatorPreset,
   AppMode,
   DeltaMushSettings,
   GizmoMode,
@@ -73,6 +75,7 @@ export type SceneContentProps = {
   onTransformChange: (id: string, worldDelta: Matrix4, localDelta: Matrix4, worldOffset: Vec3) => void;
   onTransformEnd: () => void;
   onPosePullDraggingChange: (active: boolean) => void;
+  onDrawSurfaceRef: (id: string, object: Object3D | null) => void;
 };
 
 type ActuatorSphericalJointProps = {
@@ -424,6 +427,69 @@ function getGeometry(shape: ActuatorEntity["shape"], size: ActuatorEntity["size"
   return <boxGeometry args={[size.x, size.y, size.z]} />;
 }
 
+type ActuatorVisualState = "Enabled" | "Hovering" | "Selected" | "Disabled";
+
+const UNITY_ACTUATOR_PRESET_COLORS: Record<ActuatorPreset, { r: number; g: number; b: number }> = {
+  Default: { r: 0.625, g: 0.65, b: 0.8 },
+  Root: { r: 0.71, g: 0.71, b: 0.34 },
+  SpinePelvis: { r: 0.438, g: 0.66, b: 0.295 },
+  NeckHead: { r: 0.294, g: 0.658, b: 0.535 },
+  ArmLeg: { r: 0.294, g: 0.572, b: 0.658 },
+  ElbowKnee: { r: 0.43, g: 0.67, b: 0.73 },
+  Finger: { r: 0.632, g: 0.294, b: 0.658 },
+  MuscleJiggle: { r: 0.725, g: 0.5, b: 0.675 },
+  FatJiggle: { r: 0.7, g: 0.5, b: 0.3 },
+  Dangly: { r: 0.5, g: 0.5, b: 0.5 },
+  Floppy: { r: 0.3, g: 0.5, b: 0.7 },
+};
+
+const UNITY_ACTUATOR_STATE_ALPHA: Record<ActuatorVisualState, number> = {
+  Enabled: 0.2,
+  Hovering: 0.4,
+  Selected: 0.6,
+  Disabled: 0.025,
+};
+
+function getActuatorVisualState(isSelected: boolean, isHovered: boolean): ActuatorVisualState {
+  if (isSelected) return "Selected";
+  if (isHovered) return "Hovering";
+  return "Enabled";
+}
+
+function getUnityActuatorVisual(actuator: Pick<ActuatorEntity, "preset" | "type">, state: ActuatorVisualState) {
+  const preset = actuator.preset ?? defaultPresetForActuatorType(actuator.type);
+  const baseColor = UNITY_ACTUATOR_PRESET_COLORS[preset];
+  const alpha = UNITY_ACTUATOR_STATE_ALPHA[state];
+  const lift = alpha * 0.3;
+  return {
+    r: baseColor.r + lift,
+    g: baseColor.g + lift,
+    b: baseColor.b + lift,
+    alpha,
+  };
+}
+
+const ACTUATOR_VERTEX_SHADER = `
+varying vec3 vViewNormal;
+
+void main() {
+  vViewNormal = normalize(normalMatrix * normal);
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+
+const ACTUATOR_FRAGMENT_SHADER = `
+uniform vec3 uColor;
+uniform float uOpacity;
+varying vec3 vViewNormal;
+
+void main() {
+  vec3 color = uColor;
+  color *= (0.7 * vViewNormal.z + 0.3);
+  gl_FragColor = vec4(color, uOpacity);
+}
+`;
+
 export function SceneContent({
   meshSources,
   actuators,
@@ -451,6 +517,7 @@ export function SceneContent({
   onTransformChange,
   onTransformEnd,
   onPosePullDraggingChange,
+  onDrawSurfaceRef,
 }: SceneContentProps) {
   const { scene } = useThree();
   const xrMode = useXR((state) => state.mode);
@@ -466,6 +533,10 @@ export function SceneContent({
   const dragActuatorIdRef = useRef<string | null>(null);
   const isDragActiveRef = useRef(false);
   const hasAcceptedDragFrameRef = useRef(false);
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
+  const materialRefs = useRef<Record<string, ShaderMaterial | null>>({});
+  const opacityRef = useRef(appMode === "Pose" ? 0.32 : 1);
+  const opacityVelocityRef = useRef(0);
   const backgroundBlendRef = useRef(appMode === "Pose" ? 1 : 0);
   const backgroundBlendVelocityRef = useRef(0);
   const blendedBackgroundRef = useRef(new Color("#d9ecff"));
@@ -740,6 +811,26 @@ export function SceneContent({
   }, [gizmoMode, gizmoSpace, pivotMode, selectedActuatorId]);
 
   useFrame((_, delta) => {
+    // Animate actuator opacity multiplier: rig mode = full, pose mode = ghost
+    const targetOpacity = appMode === "Pose" ? 0.32 : 1;
+    const dampedOpacity = smoothDampScalar(opacityRef.current, targetOpacity, opacityVelocityRef.current, 0.22, delta);
+    opacityRef.current = dampedOpacity.value;
+    opacityVelocityRef.current = dampedOpacity.velocity;
+
+    for (const actuator of actuators) {
+      const mat = materialRefs.current[actuator.id];
+      if (mat === null || mat === undefined) continue;
+      const state = getActuatorVisualState(selectedIdSet.has(actuator.id), hoveredId === actuator.id);
+      const visual = getUnityActuatorVisual(actuator, state);
+      const colorUniform = mat.uniforms.uColor?.value;
+      if (colorUniform instanceof Color) {
+        colorUniform.setRGB(visual.r, visual.g, visual.b);
+      }
+      if (typeof mat.uniforms.uOpacity?.value === "number") {
+        mat.uniforms.uOpacity.value = visual.alpha * opacityRef.current;
+      }
+    }
+
     const targetBlend = appMode === "Pose" ? 1 : 0;
     const blended = smoothDampScalar(
       backgroundBlendRef.current,
@@ -785,6 +876,7 @@ export function SceneContent({
           meshSource={meshSource}
           actuators={actuators}
           appMode={appMode}
+          gizmoMode={gizmoMode}
           pendingPoseRevision={pendingPoseRevision}
           simulationSamplesRef={simulationSamplesRef}
           isTransformDragging={isTransformDragging}
@@ -794,6 +886,7 @@ export function SceneContent({
           deltaMushSettings={deltaMushSettings}
           onSkinningStats={(stats) => onMeshSkinningStats(meshSource.id, stats)}
           onSkinningComputationStatus={(status) => onMeshSkinningComputationStatus(meshSource.id, status)}
+          onDrawSurfaceRef={onDrawSurfaceRef}
         />
       ))}
 
@@ -825,8 +918,10 @@ export function SceneContent({
         <SimulationOverlapFilter physicsEnabled={physicsEnabled} actuators={actuators} colliderRefs={colliderRefById} />
         {actuators.map((actuator) => {
           const isSelected = selectedIdSet.has(actuator.id);
+          const isHovered = hoveredId === actuator.id;
           const isRoot = actuator.parentId === null;
-          const color = isSelected ? "#ff6a3d" : isRoot ? "#28a26a" : "#2f7fd1";
+          const visualState = getActuatorVisualState(isSelected, isHovered);
+          const visual = getUnityActuatorVisual(actuator, visualState);
           const center = getActuatorPrimitiveCenter(actuator);
           const capsuleHalfAxis = getCapsuleHalfAxis(actuator.size);
           const radius = getActuatorRadius(actuator);
@@ -865,7 +960,12 @@ export function SceneContent({
             >
               <mesh
                 ref={(object) => onActuatorRef(actuator.id, object)}
+                renderOrder={isSelected ? 2 : isHovered ? 1 : 0}
                 onClick={(event) => {
+                  if (gizmoMode === "draw") {
+                    event.stopPropagation();
+                    return;
+                  }
                   if (Date.now() < suppressSelectionClickUntilRef.current) {
                     event.stopPropagation();
                     return;
@@ -877,6 +977,7 @@ export function SceneContent({
                   });
                 }}
                 onPointerDown={(event) => {
+                  if (gizmoMode === "draw") return;
                   event.stopPropagation();
                   if (!physicsEnabled || appMode !== "Pose") return;
                   if (rapierRef.current === null || worldRef.current === null) return;
@@ -1004,13 +1105,27 @@ export function SceneContent({
                   event.stopPropagation();
                   clearPosePullState();
                 }}
-                castShadow
+                onPointerEnter={(event) => {
+                  event.stopPropagation();
+                  setHoveredId(actuator.id);
+                }}
+                onPointerLeave={() => {
+                  setHoveredId((prev) => (prev === actuator.id ? null : prev));
+                }}
               >
                 {getGeometry(actuator.shape, actuator.size)}
-                <meshStandardMaterial
-                  color={color}
-                  roughness={0.35}
-                  metalness={0.05}
+                <shaderMaterial
+                  ref={(mat) => { materialRefs.current[actuator.id] = mat; }}
+                  transparent
+                  depthWrite
+                  depthTest
+                  toneMapped={false}
+                  vertexShader={ACTUATOR_VERTEX_SHADER}
+                  fragmentShader={ACTUATOR_FRAGMENT_SHADER}
+                  uniforms={{
+                    uColor: { value: new Color(visual.r, visual.g, visual.b) },
+                    uOpacity: { value: visual.alpha * opacityRef.current },
+                  }}
                 />
               </mesh>
               {actuator.shape === "capsule" ? <CapsuleCollider ref={colliderRefById[actuator.id]} args={[capsuleHalfAxis, radius]} /> : null}
@@ -1052,7 +1167,10 @@ export function SceneContent({
             })
           : null}
 
-        {selectedActuatorId !== null && !isInXR && !physicsEnabled && gizmoMode !== "select" ? (
+        {selectedActuatorId !== null &&
+        !isInXR &&
+        !physicsEnabled &&
+        (gizmoMode === "translate" || gizmoMode === "rotate" || gizmoMode === "scale") ? (
           <TransformControls
             ref={transformControlsRef}
             mode={gizmoMode}
@@ -1116,11 +1234,15 @@ export function SceneContent({
             position={[0, -0.1, 0]}
             receiveShadow
             onClick={(event) => {
+              if (gizmoMode === "draw") {
+                event.stopPropagation();
+                return;
+              }
               event.stopPropagation();
               onClearSelection();
             }}
           >
-            <boxGeometry args={[8, 0.2, 8]} />
+            <boxGeometry args={[200, 0.2, 200]} />
             <meshStandardMaterial color="#a8b8c8" />
           </mesh>
         </RigidBody>

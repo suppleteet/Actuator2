@@ -10,9 +10,31 @@ type DesktopInertialCameraControlsProps = {
   blocked: boolean;
   focusRequest: FocusRequest | null;
   focusNonce: number;
+  suppressCtrlWheelZoom: boolean;
+  viewDirectionRequest: { direction: { x: number; y: number; z: number }; up: { x: number; y: number; z: number } } | null;
+  viewDirectionNonce: number;
+  onActiveCameraChange?: (cameraObject: unknown) => void;
 };
 
-export function DesktopInertialCameraControls({ blocked, focusRequest, focusNonce }: DesktopInertialCameraControlsProps) {
+function shortestSignedAngleDelta(current: number, target: number): number {
+  let delta = target - current;
+  while (delta > Math.PI) delta -= Math.PI * 2;
+  while (delta < -Math.PI) delta += Math.PI * 2;
+  return delta;
+}
+
+const WORLD_UP = new Vector3(0, 1, 0);
+const POLE_DOT_THRESHOLD = 0.985;
+
+export function DesktopInertialCameraControls({
+  blocked,
+  focusRequest,
+  focusNonce,
+  suppressCtrlWheelZoom,
+  viewDirectionRequest,
+  viewDirectionNonce,
+  onActiveCameraChange,
+}: DesktopInertialCameraControlsProps) {
   const { camera, gl } = useThree();
   const mode = useXR((state) => state.mode);
   const isInXR = mode !== null;
@@ -38,7 +60,21 @@ export function DesktopInertialCameraControls({ blocked, focusRequest, focusNonc
   const desiredRadiusRef = useRef<number | null>(null);
   const desiredTargetVelocityRef = useRef<SmoothDampVec3Velocity>({ x: 0, y: 0, z: 0 });
   const desiredRadiusVelocityRef = useRef(0);
+  const desiredThetaRef = useRef<number | null>(null);
+  const desiredPhiRef = useRef<number | null>(null);
+  const desiredThetaVelocityRef = useRef(0);
+  const desiredPhiVelocityRef = useRef(0);
   const focusingRef = useRef(false);
+  const poleUpRef = useRef(new Vector3(0, 0, -1));
+  const forwardRef = useRef(new Vector3());
+  const rightRef = useRef(new Vector3());
+  const upRef = useRef(new Vector3());
+  const parallelRef = useRef(new Vector3());
+  const camOffsetRef = useRef(new Vector3());
+
+  useEffect(() => {
+    onActiveCameraChange?.(camera);
+  }, [camera, onActiveCameraChange]);
 
   useEffect(() => {
     if (focusRequest === null) return;
@@ -54,6 +90,45 @@ export function DesktopInertialCameraControls({ blocked, focusRequest, focusNonc
     desiredRadiusVelocityRef.current = 0;
     focusingRef.current = true;
   }, [camera, focusNonce, focusRequest]);
+
+  useEffect(() => {
+    if (viewDirectionRequest === null) return;
+    const direction = new Vector3(
+      viewDirectionRequest.direction.x,
+      viewDirectionRequest.direction.y,
+      viewDirectionRequest.direction.z,
+    );
+    if (direction.lengthSq() < 1e-8) return;
+    direction.normalize();
+    const clampedY = Math.min(Math.max(direction.y, -0.999), 0.999);
+    desiredThetaRef.current = Math.atan2(direction.x, direction.z);
+    desiredPhiRef.current = Math.min(Math.max(Math.acos(clampedY), 0.06), Math.PI - 0.06);
+    desiredThetaVelocityRef.current = 0;
+    desiredPhiVelocityRef.current = 0;
+    const up = new Vector3(
+      viewDirectionRequest.up.x,
+      viewDirectionRequest.up.y,
+      viewDirectionRequest.up.z,
+    );
+    if (up.lengthSq() > 1e-8) {
+      up.normalize();
+      poleUpRef.current.copy(up);
+      camera.up.copy(up);
+    }
+    velocityRef.current.theta = 0;
+    velocityRef.current.phi = 0;
+    velocityRef.current.panX = 0;
+    velocityRef.current.panY = 0;
+    velocityRef.current.zoom = 0;
+    desiredTargetRef.current = null;
+    desiredRadiusRef.current = null;
+    focusingRef.current = false;
+    if (!initializedRef.current) {
+      thetaRef.current = desiredThetaRef.current ?? thetaRef.current;
+      phiRef.current = desiredPhiRef.current ?? phiRef.current;
+      initializedRef.current = true;
+    }
+  }, [camera, viewDirectionNonce, viewDirectionRequest]);
 
   useEffect(() => {
     const dom = gl.domElement;
@@ -106,6 +181,7 @@ export function DesktopInertialCameraControls({ blocked, focusRequest, focusNonc
 
     function onWheel(event: WheelEvent) {
       if (isInXR || blocked) return;
+      if (suppressCtrlWheelZoom && event.ctrlKey) return;
       event.preventDefault();
       const modeScale = event.deltaMode === 1 ? 14 : event.deltaMode === 2 ? 120 : 1;
       const zoomImpulse = Math.max(radiusRef.current * 0.005, 0.016);
@@ -127,7 +203,7 @@ export function DesktopInertialCameraControls({ blocked, focusRequest, focusNonc
       dom.removeEventListener("pointercancel", onPointerUp);
       dom.removeEventListener("wheel", onWheel);
     };
-  }, [blocked, gl, isInXR]);
+  }, [blocked, gl, isInXR, suppressCtrlWheelZoom]);
 
   useFrame((_, delta) => {
     if (isInXR || blocked) return;
@@ -137,11 +213,20 @@ export function DesktopInertialCameraControls({ blocked, focusRequest, focusNonc
       radiusRef.current = Math.max(offset.length(), 0.5);
       thetaRef.current = Math.atan2(offset.x, offset.z);
       phiRef.current = Math.acos(Math.min(Math.max(offset.y / radiusRef.current, -1), 1));
+      if (camera.up.lengthSq() > 1e-8) {
+        poleUpRef.current.copy(camera.up).normalize();
+      }
       initializedRef.current = true;
     }
 
     const velocity = velocityRef.current;
     const dragging = dragModeRef.current !== null;
+    if (dragging) {
+      desiredThetaRef.current = null;
+      desiredPhiRef.current = null;
+      desiredThetaVelocityRef.current = 0;
+      desiredPhiVelocityRef.current = 0;
+    }
     const followTarget = dragging ? 1 : 0;
     const follow = smoothDampScalar(
       controlFollowRampRef.current,
@@ -154,12 +239,59 @@ export function DesktopInertialCameraControls({ blocked, focusRequest, focusNonc
     controlFollowVelocityRef.current = follow.velocity;
     const followGain = 1 + controlFollowRampRef.current * 1.35;
 
-    thetaRef.current += velocity.theta * delta * followGain;
-    phiRef.current += velocity.phi * delta * followGain;
-    phiRef.current = Math.min(Math.max(phiRef.current, 0.1), Math.PI - 0.1);
+    if (desiredThetaRef.current !== null && desiredPhiRef.current !== null) {
+      const thetaTarget = thetaRef.current + shortestSignedAngleDelta(thetaRef.current, desiredThetaRef.current);
+      const smoothedTheta = smoothDampScalar(
+        thetaRef.current,
+        thetaTarget,
+        desiredThetaVelocityRef.current,
+        0.14,
+        delta,
+      );
+      thetaRef.current = smoothedTheta.value;
+      desiredThetaVelocityRef.current = smoothedTheta.velocity;
 
-    radiusRef.current += velocity.zoom * delta * followGain;
-    radiusRef.current = Math.min(Math.max(radiusRef.current, 0.5), 80);
+      const smoothedPhi = smoothDampScalar(
+        phiRef.current,
+        desiredPhiRef.current,
+        desiredPhiVelocityRef.current,
+        0.14,
+        delta,
+      );
+      phiRef.current = Math.min(Math.max(smoothedPhi.value, 0.1), Math.PI - 0.1);
+      desiredPhiVelocityRef.current = smoothedPhi.velocity;
+
+      const thetaError = Math.abs(shortestSignedAngleDelta(thetaRef.current, desiredThetaRef.current));
+      const phiError = Math.abs(phiRef.current - desiredPhiRef.current);
+      if (
+        thetaError < 0.002 &&
+        phiError < 0.002 &&
+        Math.abs(desiredThetaVelocityRef.current) < 0.01 &&
+        Math.abs(desiredPhiVelocityRef.current) < 0.01
+      ) {
+        thetaRef.current = desiredThetaRef.current;
+        phiRef.current = desiredPhiRef.current;
+        desiredThetaRef.current = null;
+        desiredPhiRef.current = null;
+        desiredThetaVelocityRef.current = 0;
+        desiredPhiVelocityRef.current = 0;
+      }
+    } else {
+      thetaRef.current += velocity.theta * delta * followGain;
+      phiRef.current += velocity.phi * delta * followGain;
+      phiRef.current = Math.min(Math.max(phiRef.current, 0.1), Math.PI - 0.1);
+    }
+
+    if ((camera as any).isOrthographicCamera) {
+      const orthoCamera = camera as any;
+      const currentZoom = orthoCamera.zoom ?? 100;
+      const nextZoom = Math.min(Math.max(currentZoom * Math.exp(-velocity.zoom * delta * 0.02 * followGain), 12), 520);
+      orthoCamera.zoom = nextZoom;
+      orthoCamera.updateProjectionMatrix();
+    } else {
+      radiusRef.current += velocity.zoom * delta * followGain;
+      radiusRef.current = Math.min(Math.max(radiusRef.current, 0.5), 80);
+    }
 
     if (focusingRef.current && desiredTargetRef.current !== null && desiredRadiusRef.current !== null) {
       const smoothedTarget = smoothDampVec3(
@@ -197,19 +329,36 @@ export function DesktopInertialCameraControls({ blocked, focusRequest, focusNonc
       }
     }
 
-    const forward = new Vector3();
-    camera.getWorldDirection(forward);
-    const right = new Vector3().crossVectors(forward, camera.up).normalize();
-    const up = new Vector3().copy(camera.up).normalize();
-    targetRef.current.addScaledVector(right, velocity.panX * delta * followGain);
-    targetRef.current.addScaledVector(up, velocity.panY * delta * followGain);
-
     const sinPhi = Math.sin(phiRef.current);
-    const camOffset = new Vector3(
+    const camOffset = camOffsetRef.current.set(
       radiusRef.current * sinPhi * Math.sin(thetaRef.current),
       radiusRef.current * Math.cos(phiRef.current),
       radiusRef.current * sinPhi * Math.cos(thetaRef.current),
     );
+
+    const forward = forwardRef.current.copy(camOffset).multiplyScalar(-1).normalize();
+    const up = upRef.current;
+    if (Math.abs(forward.dot(WORLD_UP)) > POLE_DOT_THRESHOLD) {
+      up.copy(poleUpRef.current);
+    } else {
+      up.copy(WORLD_UP);
+    }
+
+    parallelRef.current.copy(forward).multiplyScalar(up.dot(forward));
+    up.sub(parallelRef.current);
+    if (up.lengthSq() < 1e-8) {
+      up.set(0, 0, 1);
+      if (Math.abs(up.dot(forward)) > 0.95) up.set(1, 0, 0);
+      parallelRef.current.copy(forward).multiplyScalar(up.dot(forward));
+      up.sub(parallelRef.current);
+    }
+    up.normalize();
+
+    const right = rightRef.current.crossVectors(forward, up).normalize();
+    targetRef.current.addScaledVector(right, velocity.panX * delta * followGain);
+    targetRef.current.addScaledVector(up, velocity.panY * delta * followGain);
+
+    camera.up.copy(up);
     camera.position.copy(targetRef.current).add(camOffset);
     camera.lookAt(targetRef.current);
 

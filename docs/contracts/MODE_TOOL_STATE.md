@@ -24,6 +24,22 @@ Status: finalized for Sprint 01 playback transition baseline (`A-004`).
 - `select`
 - `tumble`
 
+## Sprint 04 Draw Tool Desktop Semantics (`A-009`)
+
+- Desktop-only draw placement is enabled only when:
+  - `mode = Rig`
+  - simulation is disabled
+  - active desktop tool lane is draw (`drawActuator` parity behavior)
+- XR draw placement semantics are unchanged in Sprint 04 (out of scope).
+- Deterministic input behavior:
+  - `Ctrl + mouse wheel` adjusts draw radius in fixed increments with clamped min/max bounds.
+  - Standard wheel zoom must be suppressed while `Ctrl + mouse wheel` draw-radius adjustment is active.
+  - Cursor hit + fixed radius + same mirror/snap toggles must produce the same authored primitive result.
+- Mirror/snap draw parity:
+  - Mirrored creation is evaluated after centerline snap.
+  - If snapped to centerline threshold, mirrored duplicate is suppressed.
+  - Parenting selection for draw creation remains deterministic (stable active-rig parent resolution).
+
 ## Core State Shape
 
 ```ts

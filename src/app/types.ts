@@ -13,7 +13,7 @@ export type ActuatorPreset =
   | "Dangly"
   | "Floppy";
 export type ActuatorPivotMode = "capStart" | "center";
-export type GizmoMode = "select" | "translate" | "rotate" | "scale";
+export type GizmoMode = "select" | "translate" | "rotate" | "scale" | "draw";
 export type PivotMode = "object" | "world";
 export type AppMode = "Rig" | "Pose";
 

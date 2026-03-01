@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import { useFrame, useLoader } from "@react-three/fiber";
-import { BufferGeometry, Mesh, Quaternion, SRGBColorSpace, SkinnedMesh, TextureLoader, Vector3 } from "three";
+import { BufferGeometry, Mesh, MeshStandardMaterial, Object3D, Quaternion, SRGBColorSpace, SkinnedMesh, TextureLoader, Vector3 } from "three";
+import { smoothDampScalar } from "../smoothDamp";
 import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
 import { bindVerticesToClosestCapsule, type Capsule, type Vec3 as SkinVec3 } from "../../skinning/closestCapsuleBinding";
 import { applyDeltaMushWithDetailRestore, buildDeltaMushDetailOffsets, buildVertexNeighbors } from "../../skinning/deltaMush";
@@ -10,6 +11,7 @@ import type {
   ActuatorEntity,
   AppMode,
   DeltaMushSettings,
+  GizmoMode,
   SkinningComputationStatus,
   SkinningStats,
 } from "../types";
@@ -18,6 +20,7 @@ export type ActiveSkinnedMeshProps = {
   meshSource: ActiveMeshSource;
   actuators: ActuatorEntity[];
   appMode: AppMode;
+  gizmoMode: GizmoMode;
   pendingPoseRevision: number | null;
   simulationSamplesRef: MutableRefObject<
     Record<string, { position: SkinVec3; rotation: { x: number; y: number; z: number; w: number } }> | null
@@ -29,6 +32,7 @@ export type ActiveSkinnedMeshProps = {
   deltaMushSettings: DeltaMushSettings;
   onSkinningStats: (stats: SkinningStats) => void;
   onSkinningComputationStatus: (status: SkinningComputationStatus) => void;
+  onDrawSurfaceRef?: (meshId: string, object: Object3D | null) => void;
 };
 
 type RuntimeVertexBinding = {
@@ -44,6 +48,7 @@ export function ActiveSkinnedMesh({
   meshSource,
   actuators,
   appMode,
+  gizmoMode,
   pendingPoseRevision,
   simulationSamplesRef,
   isTransformDragging,
@@ -53,6 +58,7 @@ export function ActiveSkinnedMesh({
   deltaMushSettings,
   onSkinningStats,
   onSkinningComputationStatus,
+  onDrawSurfaceRef,
 }: ActiveSkinnedMeshProps) {
   const meshAsset = useLoader(FBXLoader, meshSource.meshUri);
   const colorMap = useLoader(TextureLoader, meshSource.colorMapUri);
@@ -60,6 +66,9 @@ export function ActiveSkinnedMesh({
   const roughnessMap = useLoader(TextureLoader, meshSource.roughnessMapUri);
   const meshScale = meshSource.worldScale;
   const meshYOffset = meshSource.worldYOffset;
+  const materialRef = useRef<MeshStandardMaterial>(null);
+  const meshOpacityRef = useRef(1);
+  const meshOpacityVelocityRef = useRef(0);
 
   const baseGeometry: BufferGeometry | null = useMemo(() => {
     let foundGeometry: BufferGeometry | null = null;
@@ -384,7 +393,15 @@ export function ActiveSkinnedMesh({
     skinningRevision,
   ]);
 
-  useFrame(() => {
+  useFrame((_, delta) => {
+    const targetOpacity = gizmoMode === "draw" ? 1 : 1;
+    const damped = smoothDampScalar(meshOpacityRef.current, targetOpacity, meshOpacityVelocityRef.current, 0.18, delta);
+    meshOpacityRef.current = damped.value;
+    meshOpacityVelocityRef.current = damped.velocity;
+    if (materialRef.current !== null) {
+      materialRef.current.transparent = false;
+      materialRef.current.opacity = meshOpacityRef.current;
+    }
     if (displayGeometry === null) return;
     const position = displayGeometry.getAttribute("position");
     if (position === undefined) return;
@@ -488,18 +505,16 @@ export function ActiveSkinnedMesh({
 
   if (displayGeometry === null) return null;
 
-  const ignoreRaycast = () => {};
-
   return (
     <mesh
+      ref={(object) => onDrawSurfaceRef?.(meshSource.id, object)}
       geometry={displayGeometry}
       scale={[meshScale, meshScale, meshScale]}
       position={[0, meshYOffset, 0]}
       castShadow
       receiveShadow
-      raycast={ignoreRaycast}
     >
-      <meshStandardMaterial map={colorMap} normalMap={normalMap} roughnessMap={roughnessMap} roughness={1} metalness={0} />
+      <meshStandardMaterial ref={materialRef} map={colorMap} normalMap={normalMap} roughnessMap={roughnessMap} roughness={1} metalness={0} />
     </mesh>
   );
 }
