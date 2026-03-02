@@ -10,8 +10,10 @@ import type { InputAction } from "./interaction/input/types";
 import {
   createInitialXrHandInputState,
   resolveXrToolState,
+  type XRHandedness,
   updateXrHandInputStateFromAction,
 } from "./interaction/xrTools";
+import { resolveXrTriggerIntent } from "./interaction/xrTriggerBridge";
 import {
   adjustDrawRadiusFromWheel,
   buildDrawCapsuleActuator,
@@ -710,6 +712,68 @@ export default function App() {
     if (first === undefined) return null;
     const match = hitTargets.find((entry) => entry.object === first.object);
     return match?.actuator ?? null;
+  }
+
+  function getXrControllerTipPose(handedness: XRHandedness): { position: Vec3; forward: Vec3 } | null {
+    const storeAny = xrStore as any;
+    const state = storeAny.getState?.();
+    const inputStates = (state?.inputSourceStates ?? []) as Array<{
+      type?: string;
+      inputSource?: { handedness?: string };
+      object?: Object3D;
+    }>;
+    const controller = inputStates.find(
+      (inputState) => inputState.type === "controller" && inputState.inputSource?.handedness === handedness,
+    );
+    const controllerObject = controller?.object;
+    if (controllerObject === undefined) return null;
+
+    const worldPosition = new Vector3();
+    const worldQuaternion = new Quaternion();
+    controllerObject.getWorldPosition(worldPosition);
+    controllerObject.getWorldQuaternion(worldQuaternion);
+
+    const offset = new Vector3(0, 0, 0.025).applyQuaternion(worldQuaternion);
+    const forward = new Vector3(0, 0, 1).applyQuaternion(worldQuaternion).normalize();
+    return {
+      position: {
+        x: worldPosition.x + offset.x,
+        y: worldPosition.y + offset.y,
+        z: worldPosition.z + offset.z,
+      },
+      forward: { x: forward.x, y: forward.y, z: forward.z },
+    };
+  }
+
+  function resolveNearestActuatorAtWorldPoint(
+    worldPoint: Vec3,
+    options?: { rigId?: string; maxDistance?: number },
+  ): ActuatorEntity | null {
+    const maxDistance = options?.maxDistance ?? Number.POSITIVE_INFINITY;
+    let best: ActuatorEntity | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+
+    for (const actuator of actuators) {
+      if (options?.rigId !== undefined && actuator.rigId !== options.rigId) continue;
+      const center = getActuatorPrimitiveCenter(actuator);
+      const dx = worldPoint.x - center.x;
+      const dy = worldPoint.y - center.y;
+      const dz = worldPoint.z - center.z;
+      const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      const threshold = Math.max(maxDistance, getActuatorRadius(actuator) * 1.35);
+      if (distance > threshold) continue;
+      if (distance < bestDistance - 1e-6) {
+        best = actuator;
+        bestDistance = distance;
+        continue;
+      }
+      if (Math.abs(distance - bestDistance) <= 1e-6 && best !== null && actuator.id.localeCompare(best.id) < 0) {
+        best = actuator;
+        bestDistance = distance;
+      }
+    }
+
+    return best;
   }
 
   function computeWorldUnitsPerPixelAtPoint(point: Vec3): number {
@@ -1546,18 +1610,18 @@ export default function App() {
     });
   }
 
-  function commitDrawSession(drawSession: NonNullable<typeof drawSessionRef.current>) {
+  function commitDrawDraftActuators(rigId: string, draftActuators: ActuatorEntity[]) {
     const createdIds: string[] = [];
     commitEditorChange((previous) => {
-      const nextActuators = drawDraftActuatorsRef.current.map((draft) => {
+      const nextActuators = draftActuators.map((draft) => {
         const index = nextActuatorIndexRef.current;
         nextActuatorIndexRef.current += 1;
-        const id = `${drawSession.rigId}_act_${index.toString().padStart(4, "0")}`;
+        const id = `${rigId}_act_${index.toString().padStart(4, "0")}`;
         createdIds.push(id);
         return {
           ...draft,
           id,
-          rigId: drawSession.rigId,
+          rigId,
         };
       });
       if (nextActuators.length === 0) return previous;
@@ -1568,6 +1632,10 @@ export default function App() {
         selectedActuatorIds: createdIds,
       };
     });
+  }
+
+  function commitDrawSession(drawSession: NonNullable<typeof drawSessionRef.current>) {
+    commitDrawDraftActuators(drawSession.rigId, drawDraftActuatorsRef.current);
   }
 
   function createRig() {
@@ -2440,12 +2508,89 @@ export default function App() {
   }, [drawInteractionState, gizmoMode]);
 
 
+  function createActuatorFromXrDraw(handedness: XRHandedness): boolean {
+    const pose = getXrControllerTipPose(handedness);
+    if (pose === null) return false;
+
+    const parent = resolveNearestActuatorAtWorldPoint(pose.position, {
+      rigId: selectedRigId,
+      maxDistance: Math.max(0.45, drawRadius * 3),
+    });
+    if (parent === null) return false;
+
+    const startCandidate = drawSnapEnabled ? snapPointToMirrorCenterline(pose.position) : pose.position;
+    const start = projectPointToActuatorCenterAxis(startCandidate, parent);
+    const endCandidate = {
+      x: start.x + pose.forward.x * Math.max(0.16, drawRadius * 2),
+      y: start.y + pose.forward.y * Math.max(0.16, drawRadius * 2),
+      z: start.z + pose.forward.z * Math.max(0.16, drawRadius * 2),
+    };
+    const endSnapped = drawSnapEnabled ? snapPointToMirrorCenterline(endCandidate) : endCandidate;
+    const end = projectPointToActuatorCenterAxis(endSnapped, parent);
+
+    let mirrorSpawn = shouldSpawnMirrored(start, drawMirrorEnabled);
+    const mirrorParentId = mirrorSpawn ? resolveDrawMirrorParentId(parent.id, actuators) : null;
+    if (mirrorSpawn && mirrorParentId === null) {
+      mirrorSpawn = false;
+    }
+
+    const draftActuators = buildDrawDraftActuators(
+      start,
+      end,
+      drawRadius,
+      parent.rigId,
+      parent.id,
+      mirrorParentId,
+      mirrorSpawn,
+      newActuatorPreset,
+    );
+    if (draftActuators.length === 0) return false;
+
+    setDrawInteractionState("OnRelease");
+    commitDrawDraftActuators(parent.rigId, draftActuators);
+    return true;
+  }
+
+  function selectNearestActuatorFromXr(handedness: XRHandedness, toggle: boolean): boolean {
+    const pose = getXrControllerTipPose(handedness);
+    if (pose === null) return false;
+
+    const target = resolveNearestActuatorAtWorldPoint(pose.position, {
+      rigId: selectedRigId,
+      maxDistance: Math.max(0.18, drawRadius * 1.25),
+    });
+    if (target === null) {
+      if (!toggle) {
+        clearSelection();
+      }
+      return false;
+    }
+
+    selectActuator(target.id, toggle ? { toggle: true } : undefined);
+    return true;
+  }
+
   const onInputAction = useCallback((action: InputAction) => {
     if (action.source.provider === "xr") {
       const nextXrHandInputs = updateXrHandInputStateFromAction(xrHandInputsRef.current, action);
       if (nextXrHandInputs !== xrHandInputsRef.current) {
         xrHandInputsRef.current = nextXrHandInputs;
         setXrHandInputs(nextXrHandInputs);
+      }
+      if (xrMode !== "immersive-vr") return;
+
+      const resolvedXrToolState = resolveXrToolState({
+        appMode,
+        physicsEnabled,
+        handInputs: nextXrHandInputs,
+      });
+      const triggerIntent = resolveXrTriggerIntent(action, resolvedXrToolState);
+      if (triggerIntent.handedness === null || triggerIntent.intent === "none") return;
+
+      if (triggerIntent.intent === "draw") {
+        createActuatorFromXrDraw(triggerIntent.handedness);
+      } else if (triggerIntent.intent === "select") {
+        selectNearestActuatorFromXr(triggerIntent.handedness, triggerIntent.toggleSelection);
       }
       return;
     }
@@ -2580,7 +2725,20 @@ export default function App() {
       drawSessionRef.current = null;
       setDrawDraftActuators([]);
     }
-  }, [actuators, appMode, drawMirrorEnabled, drawRadius, drawSnapEnabled, gizmoMode, newActuatorPreset, physicsEnabled, selectedRigId]);
+  }, [
+    actuators,
+    appMode,
+    createActuatorFromXrDraw,
+    drawMirrorEnabled,
+    drawRadius,
+    drawSnapEnabled,
+    gizmoMode,
+    newActuatorPreset,
+    physicsEnabled,
+    selectedRigId,
+    selectNearestActuatorFromXr,
+    xrMode,
+  ]);
 
   useInputRouter({
     targetRef: canvasWrapRef,
