@@ -2271,8 +2271,10 @@ export default function App() {
       const distanceSq = dx * dx + dy * dy;
       const center = getActuatorPrimitiveCenter(candidate);
       const centerPoint = { x: center.x, y: center.y, z: center.z };
+      // Keep hover/capture radius tighter than the visual cursor radius for better desktop precision.
+      const hitRadiusPx = computePixelsForWorldRadiusAtPoint(drawRadius * 0.5, centerPoint);
       const radiusPx = computePixelsForWorldRadiusAtPoint(drawRadius, centerPoint);
-      if (distanceSq > radiusPx * radiusPx) continue;
+      if (distanceSq > hitRadiusPx * hitRadiusPx) continue;
       if (best === null || distanceSq < best.distanceSq) {
         best = { actuator: candidate, center: centerPoint, radiusPx, distanceSq };
       }
@@ -2618,17 +2620,33 @@ export default function App() {
     }
 
     if (action.phase === "OnMove") {
-      if (!pointerInsideCanvas || pointer === null) return;
-      const resolved = resolveDrawParentActuator(pointer.clientX, pointer.clientY, pointer.localX, pointer.localY);
-      if (resolved !== null) {
-        drawCursorAnchorPointRef.current = resolved.center;
-        setDrawHoverActuatorId((previous) => (previous === resolved.actuator.id ? previous : resolved.actuator.id));
-        setDrawCursorHasInRangeAnchor((previous) => (previous ? previous : true));
-        setDrawCursorRadiusPx((prev) => (Math.abs(prev - resolved.radiusPx) > 0.2 ? resolved.radiusPx : prev));
-      } else {
+      if (pointerInsideCanvas && pointer !== null) {
+        const resolved = resolveDrawParentActuator(pointer.clientX, pointer.clientY, pointer.localX, pointer.localY);
+        if (resolved !== null) {
+          drawCursorAnchorPointRef.current = resolved.center;
+          setDrawHoverActuatorId((previous) => (previous === resolved.actuator.id ? previous : resolved.actuator.id));
+          setDrawCursorHasInRangeAnchor((previous) => (previous ? previous : true));
+          setDrawCursorRadiusPx((prev) => (Math.abs(prev - resolved.radiusPx) > 0.2 ? resolved.radiusPx : prev));
+        } else {
+          drawCursorAnchorPointRef.current = null;
+          setDrawHoverActuatorId((previous) => (previous === null ? previous : null));
+          setDrawCursorHasInRangeAnchor((previous) => (previous ? false : previous));
+        }
+      } else if (drawSessionRef.current === null) {
         drawCursorAnchorPointRef.current = null;
         setDrawHoverActuatorId((previous) => (previous === null ? previous : null));
         setDrawCursorHasInRangeAnchor((previous) => (previous ? false : previous));
+      }
+
+      const drawSession = drawSessionRef.current;
+      const pointerHasPrimaryDown = pointer !== null && (pointer.buttons & 1) === 1;
+      if (drawSession !== null && pointer !== null && pointerHasPrimaryDown && !action.modifiers.altKey) {
+        const dragPoint = computeDrawDragPointFromScreen(drawSession, pointer.clientX, pointer.clientY);
+        if (dragPoint !== null) {
+          setDrawInteractionState("OnDrag");
+          const end = drawSnapEnabled ? snapPointToMirrorCenterline(dragPoint) : dragPoint;
+          applyDrawDraftFromSession(drawSession, end, drawSession.worldRadius);
+        }
       }
       return;
     }
@@ -2704,7 +2722,7 @@ export default function App() {
     }
 
     if (action.phase === "OnDrag") {
-      if (pointer === null || !pointerInsideCanvas) return;
+      if (pointer === null) return;
       if (action.modifiers.altKey) return;
       const drawSession = drawSessionRef.current;
       if (drawSession === null) return;
