@@ -63,16 +63,16 @@ const xrStore = createXRStore({
 });
 
 const DEFAULT_PHYSICS_TUNING: PhysicsTuning = {
-  solverIterations: 8,
-  internalPgsIterations: 2,
-  additionalSolverIterations: 4,
-  bodyLinearDamping: 1,
-  bodyAngularDamping: 1,
+  solverIterations: 10,
+  internalPgsIterations: 3,
+  additionalSolverIterations: 6,
+  bodyLinearDamping: 1.1,
+  bodyAngularDamping: 1.2,
   rotationStiffness: 1,
-  rotationVelocityBlend: 1,
-  maxAngularSpeed: 1,
+  rotationVelocityBlend: 0.92,
+  maxAngularSpeed: 0.9,
   pullStiffness: 240,
-  pullDamping: 36,
+  pullDamping: 42,
   pullMaxForce: 4200,
 };
 

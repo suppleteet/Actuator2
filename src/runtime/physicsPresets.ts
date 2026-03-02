@@ -55,9 +55,9 @@ export type RuntimeDriveSettings = {
 
 const FIXED_TIMESTEP_SEC = 1 / 60;
 const ROTATION_SPRING_TO_VELOCITY = 14 / 8000;
-const ROTATION_DAMPER_TO_BLEND_RATE = 0.36;
+const ROTATION_DAMPER_TO_BLEND_RATE = 0.32;
 const POSITION_SPRING_TO_FORCE = 180 / 3500;
-const POSITION_DAMPER_TO_FORCE = 40 / 30;
+const POSITION_DAMPER_TO_FORCE = 46 / 30;
 
 function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value));
@@ -373,7 +373,7 @@ export function getRuntimeDriveFromPreset(actuator: MinimalActuatorLike): Runtim
   const rotationVelocityBlend = clamp01(
     1 - Math.exp(-(Math.max(0, preset.driveRotationDamper) * ROTATION_DAMPER_TO_BLEND_RATE) * FIXED_TIMESTEP_SEC),
   );
-  const maxAngularSpeed = Math.max(2, rotationStiffness * 1.3);
+  const maxAngularSpeed = Math.max(1.8, rotationStiffness * 1.15);
   return {
     positionStiffness,
     positionDamping,

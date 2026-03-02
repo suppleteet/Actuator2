@@ -310,7 +310,7 @@ function PosePhysicsBridge({
         stiffness: Math.max(8, drive.positionStiffness),
         damping: Math.max(1.2, drive.positionDamping),
         maxLinearSpeed: Math.max(1, drive.positionStiffness * 0.04),
-        deadband: 0.0006,
+        deadband: 0.0012,
       };
       const rotationSpring = {
         stiffness: Math.max(0.45, drive.rotationStiffness * Math.max(0, physicsTuning.rotationStiffness)),
@@ -319,7 +319,7 @@ function PosePhysicsBridge({
           Math.min(1, drive.rotationVelocityBlend * Math.max(0, physicsTuning.rotationVelocityBlend)),
         ),
         maxAngularSpeed: Math.max(0.8, drive.maxAngularSpeed * Math.max(0.1, physicsTuning.maxAngularSpeed)),
-        deadband: 0.0006,
+        deadband: 0.0012,
       };
       if (actuator.parentId === null) {
         if (actuator.id === grabbedActuatorId) continue;
@@ -331,12 +331,16 @@ function PosePhysicsBridge({
         );
         const rootDistance = rootError.length();
         const rootCurrentVelocity = new Vector3(safeLinearVelocity.x, safeLinearVelocity.y, safeLinearVelocity.z);
-        const rootPositionGain = Math.max(2.8, Math.min(26, positionSpring.stiffness * 0.09));
-        const rootVelocityDamping = Math.max(1.4, Math.min(9, positionSpring.damping * 0.11));
+        const rootPositionGain = Math.max(2.3, Math.min(20, positionSpring.stiffness * 0.078));
+        const rootVelocityDamping = Math.max(1.8, Math.min(10, positionSpring.damping * 0.13));
+        const rootCurrentSpeed = rootCurrentVelocity.length();
         const desiredRootVelocity =
           rootDistance <= positionSpring.deadband
-            ? rootCurrentVelocity.multiplyScalar(0.4)
+            ? rootCurrentVelocity.multiplyScalar(0.3)
             : rootError.multiplyScalar(rootPositionGain).addScaledVector(rootCurrentVelocity, -rootVelocityDamping);
+        if (rootDistance <= Math.max(positionSpring.deadband * 2.5, 0.004) && rootCurrentSpeed <= 0.04) {
+          desiredRootVelocity.set(0, 0, 0);
+        }
         const maxRootSpeed = Math.max(0.35, Math.min(4.2, positionSpring.maxLinearSpeed * 0.95));
         const desiredRootSpeed = desiredRootVelocity.length();
         if (desiredRootSpeed > maxRootSpeed) {
@@ -358,21 +362,26 @@ function PosePhysicsBridge({
           rootDeltaQ.y * rootDeltaQ.y +
           rootDeltaQ.z * rootDeltaQ.z,
         );
-        let desiredRootAngularVelocity = rootAngularVelocity.clone().multiplyScalar(0.7);
+        let desiredRootAngularVelocity = rootAngularVelocity.clone().multiplyScalar(0.6);
+        let rootAngle = 0;
         if (rootSinHalfAngle >= 1e-6) {
           const rootAxisScale = 1 / rootSinHalfAngle;
-          const rootAngle = 2 * Math.atan2(rootSinHalfAngle, Math.max(-1, Math.min(1, rootDeltaQ.w)));
+          rootAngle = 2 * Math.atan2(rootSinHalfAngle, Math.max(-1, Math.min(1, rootDeltaQ.w)));
           const rootErrorAxis = new Vector3(
             rootDeltaQ.x * rootAxisScale,
             rootDeltaQ.y * rootAxisScale,
             rootDeltaQ.z * rootAxisScale,
           ).multiplyScalar(rootAngle);
-          const rootRotationGain = Math.max(0.5, Math.min(3.8, rotationSpring.stiffness * 0.24));
-          const rootAngularDamping = Math.max(2.2, Math.min(7, 2 + rotationSpring.velocityBlend * 5.5));
+          const rootRotationGain = Math.max(0.45, Math.min(3.2, rotationSpring.stiffness * 0.21));
+          const rootAngularDamping = Math.max(2.6, Math.min(8, 2.2 + rotationSpring.velocityBlend * 5.8));
           desiredRootAngularVelocity = rootErrorAxis.addScaledVector(rootAngularVelocity, -rootAngularDamping);
           desiredRootAngularVelocity.multiplyScalar(rootRotationGain);
+          desiredRootAngularVelocity.lerp(rootAngularVelocity, 0.2);
         }
-        const maxRootAngularSpeed = Math.max(0.35, Math.min(3, rotationSpring.maxAngularSpeed * 0.36));
+        if (rootAngle <= Math.max(rotationSpring.deadband * 3, 0.004) && rootAngularVelocity.length() <= 0.05) {
+          desiredRootAngularVelocity.set(0, 0, 0);
+        }
+        const maxRootAngularSpeed = Math.max(0.3, Math.min(2.6, rotationSpring.maxAngularSpeed * 0.33));
         const desiredRootAngularSpeed = desiredRootAngularVelocity.length();
         if (desiredRootAngularSpeed > maxRootAngularSpeed) {
           desiredRootAngularVelocity.multiplyScalar(maxRootAngularSpeed / desiredRootAngularSpeed);
@@ -397,12 +406,15 @@ function PosePhysicsBridge({
       );
       const childDistance = childPositionError.length();
       const childCurrentVelocity = new Vector3(safeLinearVelocity.x, safeLinearVelocity.y, safeLinearVelocity.z);
-      const childPositionGain = Math.max(1.3, Math.min(14, positionSpring.stiffness * 0.07));
-      const childVelocityDamping = Math.max(0.5, Math.min(6, positionSpring.damping * 0.09));
+      const childPositionGain = Math.max(1.2, Math.min(12, positionSpring.stiffness * 0.066));
+      const childVelocityDamping = Math.max(0.7, Math.min(6.5, positionSpring.damping * 0.1));
       const desiredChildVelocity =
         childDistance <= positionSpring.deadband
-          ? childCurrentVelocity.multiplyScalar(0.5)
+          ? childCurrentVelocity.multiplyScalar(0.4)
           : childPositionError.multiplyScalar(childPositionGain).addScaledVector(childCurrentVelocity, -childVelocityDamping);
+      if (childDistance <= Math.max(positionSpring.deadband * 2.5, 0.0035) && childCurrentVelocity.length() <= 0.035) {
+        desiredChildVelocity.set(0, 0, 0);
+      }
       const maxChildSpeed = Math.max(0.35, Math.min(3.4, positionSpring.maxLinearSpeed * 0.75));
       const desiredChildSpeed = desiredChildVelocity.length();
       if (desiredChildSpeed > maxChildSpeed) {
@@ -455,7 +467,7 @@ function PosePhysicsBridge({
       const worldErrorAxis = localErrorAxis.applyQuaternion(currentParentQ);
       const rotationErrorMagnitude = worldErrorAxis.length();
       const relativeAngularSpeed = Math.hypot(relativeAngularVelocity.x, relativeAngularVelocity.y, relativeAngularVelocity.z);
-      if (rotationErrorMagnitude >= rotationSpring.deadband || relativeAngularSpeed >= 0.02) {
+      if (rotationErrorMagnitude >= rotationSpring.deadband || relativeAngularSpeed >= 0.03) {
         const currentAngularVelocity = new Vector3(angularVelocity.x, angularVelocity.y, angularVelocity.z);
         const desiredAngularVelocity = new Vector3(
           parentAngularVelocitySafe.x,
@@ -469,6 +481,15 @@ function PosePhysicsBridge({
         }
         body.setAngvel(
           { x: blendedAngularVelocity.x, y: blendedAngularVelocity.y, z: blendedAngularVelocity.z },
+          true,
+        );
+      } else {
+        body.setAngvel(
+          {
+            x: parentAngularVelocitySafe.x * 0.98,
+            y: parentAngularVelocitySafe.y * 0.98,
+            z: parentAngularVelocitySafe.z * 0.98,
+          },
           true,
         );
       }
