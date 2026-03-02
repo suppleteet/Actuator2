@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { flushSync } from "react-dom";
 import { Canvas } from "@react-three/fiber";
 import { XR, createXRStore } from "@react-three/xr";
 import { OrthographicCamera, PerspectiveCamera } from "@react-three/drei";
@@ -241,11 +242,16 @@ export default function App() {
     >;
   } | null>(null);
   const [bindBlendNonce, setBindBlendNonce] = useState(0);
+  const suppressClearSelectionUntilRef = useRef(0);
 
   const actuators = editorState.actuators;
+  const showDrawDraftActuators = gizmoMode === "draw" && appMode === "Rig" && !physicsEnabled;
   const sceneActuators = useMemo(
-    () => (drawDraftActuators.length > 0 ? [...actuators, ...drawDraftActuators] : actuators),
-    [actuators, drawDraftActuators],
+    () =>
+      showDrawDraftActuators && drawDraftActuators.length > 0
+        ? [...actuators, ...drawDraftActuators]
+        : actuators,
+    [actuators, drawDraftActuators, showDrawDraftActuators],
   );
   const selectedRigId = editorState.selectedRigId;
   const selectedActuatorId = editorState.selectedActuatorId;
@@ -1334,6 +1340,7 @@ export default function App() {
       if (next === previous) return previous;
       undoStackRef.current.push(cloneEditorState(previous));
       redoStackRef.current = [];
+      editorStateRef.current = next;
       return next;
     });
   }
@@ -1589,6 +1596,7 @@ export default function App() {
       let changed = false;
       const nextActuators = previous.actuators.map((actuator) => {
         if (!selectedIds.has(actuator.id)) return actuator;
+        if (actuator.type === "root" || actuator.parentId === null) return actuator;
         const currentPreset = actuator.preset ?? defaultPresetForActuatorType(actuator.type);
         if (currentPreset === nextPreset) return actuator;
         changed = true;
@@ -1606,8 +1614,8 @@ export default function App() {
   }
 
   function commitDrawDraftActuators(rigId: string, draftActuators: ActuatorEntity[]) {
-    const createdIds: string[] = [];
     commitEditorChange((previous) => {
+      const createdIds: string[] = [];
       const nextActuators = draftActuators.map((draft) => {
         const index = nextActuatorIndexRef.current;
         nextActuatorIndexRef.current += 1;
@@ -1807,30 +1815,58 @@ export default function App() {
     baseActuators: ActuatorEntity[],
     nextActuators: ActuatorEntity[],
     sourceIds: Set<string>,
+    primaryId: string | null,
   ): ActuatorEntity[] {
     if (!drawMirrorEnabled || sourceIds.size === 0) return nextActuators;
     const nextById = new Map(nextActuators.map((actuator) => [actuator.id, actuator]));
+    const baseById = new Map(baseActuators.map((actuator) => [actuator.id, actuator]));
+    const processedPairKeys = new Set<string>();
     const updates = new Map<string, ActuatorEntity>();
     for (const sourceId of sourceIds) {
       const source = nextById.get(sourceId);
       if (source === undefined) continue;
       const counterpartId = resolveMirroredCounterpartId(sourceId, baseActuators);
       if (counterpartId === null) continue;
-      if (sourceIds.has(counterpartId)) continue;
-      const counterpart = nextById.get(counterpartId);
-      if (counterpart === undefined) continue;
-      updates.set(counterpartId, {
-        ...counterpart,
+      if (counterpartId === sourceId) continue;
+
+      const pairKey = sourceId.localeCompare(counterpartId) <= 0 ? `${sourceId}|${counterpartId}` : `${counterpartId}|${sourceId}`;
+      if (processedPairKeys.has(pairKey)) continue;
+      processedPairKeys.add(pairKey);
+
+      const counterpartInSourceSet = sourceIds.has(counterpartId);
+      let driverId = sourceId;
+      if (counterpartInSourceSet) {
+        if (primaryId === sourceId || primaryId === counterpartId) {
+          driverId = primaryId;
+        } else {
+          const sourceBase = baseById.get(sourceId);
+          const counterpartBase = baseById.get(counterpartId);
+          if (sourceBase !== undefined && counterpartBase !== undefined) {
+            const sourceX = getActuatorPrimitiveCenter(sourceBase).x;
+            const counterpartX = getActuatorPrimitiveCenter(counterpartBase).x;
+            driverId = sourceX >= counterpartX ? sourceId : counterpartId;
+          } else {
+            driverId = sourceId.localeCompare(counterpartId) <= 0 ? sourceId : counterpartId;
+          }
+        }
+      }
+
+      const targetId = driverId === sourceId ? counterpartId : sourceId;
+      const driver = nextById.get(driverId);
+      const target = nextById.get(targetId);
+      if (driver === undefined || target === undefined) continue;
+      updates.set(targetId, {
+        ...target,
         pivot: {
-          ...counterpart.pivot,
+          ...target.pivot,
           offset: {
-            x: -source.pivot.offset.x,
-            y: source.pivot.offset.y,
-            z: source.pivot.offset.z,
+            x: -driver.pivot.offset.x,
+            y: driver.pivot.offset.y,
+            z: driver.pivot.offset.z,
           },
         },
-        size: { ...source.size },
-        transform: mirrorTransformAcrossX(source.transform),
+        size: { ...driver.size },
+        transform: mirrorTransformAcrossX(driver.transform),
       });
     }
     if (updates.size === 0) return nextActuators;
@@ -1866,7 +1902,7 @@ export default function App() {
     worldOffset: Vec3,
     options?: { includeDescendants?: boolean },
   ) {
-    const baseState = transformStartSnapshotRef.current ?? editorState;
+    const baseState = transformStartSnapshotRef.current ?? editorStateRef.current;
     const moved = baseState.actuators.find((actuator) => actuator.id === id);
     if (moved === undefined) return;
 
@@ -1948,7 +1984,12 @@ export default function App() {
           },
         };
       });
-      const mirroredActuators = applyMirroredEditOps(baseState.actuators, nextActuators, selectedSet);
+      const mirroredActuators = applyMirroredEditOps(
+        baseState.actuators,
+        nextActuators,
+        selectedSet,
+        baseState.selectedActuatorId,
+      );
 
       setEditorState((previous) => ({
         ...previous,
@@ -2013,7 +2054,12 @@ export default function App() {
         },
       };
     });
-    const mirroredActuators = applyMirroredEditOps(baseState.actuators, nextActuators, transformedSourceIds);
+    const mirroredActuators = applyMirroredEditOps(
+      baseState.actuators,
+      nextActuators,
+      transformedSourceIds,
+      baseState.selectedActuatorId,
+    );
 
     setEditorState((previous) => ({
       ...previous,
@@ -2023,13 +2069,14 @@ export default function App() {
 
   function beginTransformChange() {
     if (transformStartSnapshotRef.current !== null) return;
-    transformStartSnapshotRef.current = cloneEditorState(editorState);
+    transformStartSnapshotRef.current = cloneEditorState(editorStateRef.current);
     marqueeDragRef.current = null;
     setMarqueeRect(null);
     setIsTransformDragging(true);
   }
 
   function endTransformChange() {
+    suppressClearSelectionUntilRef.current = Date.now() + 220;
     setIsTransformDragging(false);
     const startSnapshot = transformStartSnapshotRef.current;
     transformStartSnapshotRef.current = null;
@@ -2184,6 +2231,7 @@ export default function App() {
 
   function onCanvasPointerMissed() {
     if (gizmoMode === "draw") return;
+    if (Date.now() < suppressClearSelectionUntilRef.current) return;
     if (marqueeDragRef.current !== null) return;
     if (isTransformDragging) return;
     clearSelection();
@@ -2377,8 +2425,8 @@ export default function App() {
     const local = clientToCanvasLocal(event.clientX, event.clientY);
     if (event.button !== 0) return;
     if (event.altKey) return;
+    if (gizmoMode !== "select") return;
     if (isTransformDragging) return;
-    if (gizmoMode === "draw" && appMode === "Rig" && !physicsEnabled) return;
     if (hasActuatorHit(event.clientX, event.clientY)) return;
     if (local === null) return;
 
@@ -2396,7 +2444,7 @@ export default function App() {
   }
 
   function onCanvasWrapPointerMove(event: ReactPointerEvent<HTMLDivElement>) {
-    if (gizmoMode === "draw" && appMode === "Rig" && !physicsEnabled) return;
+    if (gizmoMode !== "select") return;
     const local = clientToCanvasLocal(event.clientX, event.clientY);
     const drag = marqueeDragRef.current;
     if (drag === null || drag.pointerId !== event.pointerId) return;
@@ -2412,7 +2460,7 @@ export default function App() {
   }
 
   function onCanvasWrapPointerUp(event: ReactPointerEvent<HTMLDivElement>) {
-    if (gizmoMode === "draw" && appMode === "Rig" && !physicsEnabled) return;
+    if (gizmoMode !== "select") return;
     const drag = marqueeDragRef.current;
     if (drag === null || drag.pointerId !== event.pointerId) return;
 
@@ -2743,10 +2791,14 @@ export default function App() {
       setDrawInteractionState("OnRelease");
       const drawSession = drawSessionRef.current;
       if (drawSession !== null) {
-        commitDrawSession(drawSession);
+        flushSync(() => {
+          commitDrawSession(drawSession);
+          setDrawDraftActuators([]);
+        });
+      } else {
+        setDrawDraftActuators([]);
       }
       drawSessionRef.current = null;
-      setDrawDraftActuators([]);
     }
   }, [
     actuators,

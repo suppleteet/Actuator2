@@ -1472,6 +1472,10 @@ export function SceneContent({
                 event.stopPropagation();
                 return;
               }
+              if (Date.now() < suppressSelectionClickUntilRef.current) {
+                event.stopPropagation();
+                return;
+              }
               event.stopPropagation();
               onClearSelection();
             }}
