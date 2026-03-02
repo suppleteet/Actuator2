@@ -444,18 +444,25 @@ export function ActiveSkinnedMesh({
       if (binding === undefined) return bindLocal;
 
       const actuator = actuatorById.get(binding.capsuleId);
+      const rootActuator = binding.rootCapsuleId === null ? undefined : actuatorById.get(binding.rootCapsuleId);
       const bindWorld = new Vector3(binding.bindWorld.x, binding.bindWorld.y, binding.bindWorld.z);
+      const rootTransformedWorld =
+        rootActuator === undefined
+          ? bindWorld.clone()
+          : new Vector3(binding.rootLocalOffset.x, binding.rootLocalOffset.y, binding.rootLocalOffset.z)
+              .applyQuaternion(rootActuator.rotation)
+              .add(rootActuator.position);
       const transformedWorld =
         actuator === undefined
-          ? bindWorld.clone()
+          ? rootTransformedWorld.clone()
           : new Vector3(binding.localOffset.x, binding.localOffset.y, binding.localOffset.z)
               .applyQuaternion(actuator.rotation)
               .add(actuator.position);
       const weight = Math.max(0, Math.min(1, binding.weight));
       const weightedWorld = new Vector3(
-        bindWorld.x + (transformedWorld.x - bindWorld.x) * weight,
-        bindWorld.y + (transformedWorld.y - bindWorld.y) * weight,
-        bindWorld.z + (transformedWorld.z - bindWorld.z) * weight,
+        rootTransformedWorld.x + (transformedWorld.x - rootTransformedWorld.x) * weight,
+        rootTransformedWorld.y + (transformedWorld.y - rootTransformedWorld.y) * weight,
+        rootTransformedWorld.z + (transformedWorld.z - rootTransformedWorld.z) * weight,
       );
 
       return {
