@@ -19,3 +19,8 @@ Browser-based WebXR migration of the legacy Unity Actuator tool.
 - Animation recorder/playback stub complete (`N-001`)
 - QA test runner + baseline contract tests complete (`Q-001`)
 - QA manual XR/desktop checklist complete (`Q-002`)
+
+## GitHub Pages Build
+
+- Build with base-path safety: set `VITE_BASE_PATH=/<repo-name>/` before `npm run build`.
+- CI workflow `/.github/workflows/sprint-pages.yml` builds on branch pushes and deploys on `main`.
