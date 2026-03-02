@@ -50,4 +50,15 @@ describe("Physics primitive authoring semantics", () => {
     expect(once.y).toBeCloseTo(0.4, 6);
     expect(once.z).toBeCloseTo(0.4375, 6);
   });
+
+  it("keeps capsule radius circular when scaling from x or z axis", () => {
+    const size = normalizePrimitiveSize({ x: 0.35, y: 0.8, z: 0.35 });
+    const scaledFromX = scalePrimitiveSizeFromGizmoDelta(size, { x: 1.6, y: 1, z: 1 }, "capsule");
+    const scaledFromZ = scalePrimitiveSizeFromGizmoDelta(size, { x: 1, y: 1, z: 0.7 }, "capsule");
+
+    expect(scaledFromX.x).toBeCloseTo(0.56, 6);
+    expect(scaledFromX.z).toBeCloseTo(0.56, 6);
+    expect(scaledFromZ.x).toBeCloseTo(0.245, 6);
+    expect(scaledFromZ.z).toBeCloseTo(0.245, 6);
+  });
 });

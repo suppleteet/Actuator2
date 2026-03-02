@@ -10,7 +10,7 @@ type DesktopInertialCameraControlsProps = {
   blocked: boolean;
   focusRequest: FocusRequest | null;
   focusNonce: number;
-  suppressCtrlWheelZoom: boolean;
+  suppressShiftWheelZoom: boolean;
   viewDirectionRequest: { direction: { x: number; y: number; z: number }; up: { x: number; y: number; z: number } } | null;
   viewDirectionNonce: number;
   onActiveCameraChange?: (cameraObject: unknown) => void;
@@ -25,12 +25,51 @@ function shortestSignedAngleDelta(current: number, target: number): number {
 
 const WORLD_UP = new Vector3(0, 1, 0);
 const POLE_DOT_THRESHOLD = 0.985;
+const MIN_RADIUS = 0.5;
+const MAX_RADIUS = 80;
+const MIN_ORTHO_ZOOM = 12;
+const MAX_ORTHO_ZOOM = 1200;
+const ORTHO_ZOOM_SCROLL_GAIN = 0.05;
+const PROJECTION_BLEND_START_ORTHO = 0.985;
+const PROJECTION_BLEND_START_PERSPECTIVE = 1.015;
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+function framingHeightFromPerspective(radius: number, fovDeg: number): number {
+  const safeFov = clamp(fovDeg, 1, 175);
+  const fovRad = (safeFov * Math.PI) / 180;
+  return Math.max(2 * Math.tan(fovRad * 0.5) * Math.max(radius, MIN_RADIUS), 1e-4);
+}
+
+function framingHeightFromOrthographic(cameraObject: any): number {
+  const zoom = Math.max(cameraObject.zoom ?? 1, 1e-4);
+  const frustumHeight = Math.max((cameraObject.top ?? 1) - (cameraObject.bottom ?? -1), 1e-4);
+  return Math.max(frustumHeight / zoom, 1e-4);
+}
+
+function orthographicZoomForFraming(cameraObject: any, framingHeight: number): number {
+  const frustumHeight = Math.max((cameraObject.top ?? 1) - (cameraObject.bottom ?? -1), 1e-4);
+  return clamp(frustumHeight / Math.max(framingHeight, 1e-4), MIN_ORTHO_ZOOM, MAX_ORTHO_ZOOM);
+}
+
+function perspectiveRadiusForFraming(framingHeight: number, fovDeg: number): number {
+  const safeFov = clamp(fovDeg, 1, 175);
+  const fovRad = (safeFov * Math.PI) / 180;
+  const tanHalfFov = Math.max(Math.tan(fovRad * 0.5), 1e-4);
+  return clamp(framingHeight / (2 * tanHalfFov), MIN_RADIUS, MAX_RADIUS);
+}
+
+function projectionModeFromCamera(cameraObject: any): "perspective" | "orthographic" {
+  return cameraObject?.isOrthographicCamera ? "orthographic" : "perspective";
+}
 
 export function DesktopInertialCameraControls({
   blocked,
   focusRequest,
   focusNonce,
-  suppressCtrlWheelZoom,
+  suppressShiftWheelZoom,
   viewDirectionRequest,
   viewDirectionNonce,
   onActiveCameraChange,
@@ -65,6 +104,12 @@ export function DesktopInertialCameraControls({
   const desiredThetaVelocityRef = useRef(0);
   const desiredPhiVelocityRef = useRef(0);
   const focusingRef = useRef(false);
+  const projectionModeRef = useRef<"perspective" | "orthographic" | null>(null);
+  const projectionFramingHeightRef = useRef(1.5);
+  const projectionRadiusTargetRef = useRef<number | null>(null);
+  const projectionRadiusVelocityRef = useRef(0);
+  const projectionZoomTargetRef = useRef<number | null>(null);
+  const projectionZoomVelocityRef = useRef(0);
   const poleUpRef = useRef(new Vector3(0, 0, -1));
   const forwardRef = useRef(new Vector3());
   const rightRef = useRef(new Vector3());
@@ -89,6 +134,10 @@ export function DesktopInertialCameraControls({
     desiredTargetVelocityRef.current = { x: 0, y: 0, z: 0 };
     desiredRadiusVelocityRef.current = 0;
     focusingRef.current = true;
+    projectionRadiusTargetRef.current = null;
+    projectionRadiusVelocityRef.current = 0;
+    projectionZoomTargetRef.current = null;
+    projectionZoomVelocityRef.current = 0;
   }, [camera, focusNonce, focusRequest]);
 
   useEffect(() => {
@@ -181,7 +230,7 @@ export function DesktopInertialCameraControls({
 
     function onWheel(event: WheelEvent) {
       if (isInXR || blocked) return;
-      if (suppressCtrlWheelZoom && event.ctrlKey) return;
+      if (suppressShiftWheelZoom && event.shiftKey) return;
       event.preventDefault();
       const modeScale = event.deltaMode === 1 ? 14 : event.deltaMode === 2 ? 120 : 1;
       const zoomImpulse = Math.max(radiusRef.current * 0.005, 0.016);
@@ -203,20 +252,57 @@ export function DesktopInertialCameraControls({
       dom.removeEventListener("pointercancel", onPointerUp);
       dom.removeEventListener("wheel", onWheel);
     };
-  }, [blocked, gl, isInXR, suppressCtrlWheelZoom]);
+  }, [blocked, gl, isInXR, suppressShiftWheelZoom]);
 
   useFrame((_, delta) => {
     if (isInXR || blocked) return;
 
     if (!initializedRef.current) {
       const offset = camera.position.clone().sub(targetRef.current);
-      radiusRef.current = Math.max(offset.length(), 0.5);
+      radiusRef.current = Math.max(offset.length(), MIN_RADIUS);
       thetaRef.current = Math.atan2(offset.x, offset.z);
       phiRef.current = Math.acos(Math.min(Math.max(offset.y / radiusRef.current, -1), 1));
       if (camera.up.lengthSq() > 1e-8) {
         poleUpRef.current.copy(camera.up).normalize();
       }
       initializedRef.current = true;
+    }
+
+    const activeProjectionMode = projectionModeFromCamera(camera as any);
+    const previousProjectionMode = projectionModeRef.current;
+    if (previousProjectionMode === null) {
+      projectionModeRef.current = activeProjectionMode;
+    } else if (previousProjectionMode !== activeProjectionMode) {
+      projectionModeRef.current = activeProjectionMode;
+      const framingHeight = Math.max(projectionFramingHeightRef.current, 1e-4);
+      if (activeProjectionMode === "orthographic") {
+        const orthoCamera = camera as any;
+        const matchedZoom = orthographicZoomForFraming(orthoCamera, framingHeight);
+        const transitionStartZoom = clamp(
+          matchedZoom * PROJECTION_BLEND_START_ORTHO,
+          MIN_ORTHO_ZOOM,
+          MAX_ORTHO_ZOOM,
+        );
+        orthoCamera.zoom = transitionStartZoom;
+        orthoCamera.updateProjectionMatrix?.();
+        projectionZoomTargetRef.current = matchedZoom;
+        projectionZoomVelocityRef.current = 0;
+        projectionRadiusTargetRef.current = null;
+        projectionRadiusVelocityRef.current = 0;
+      } else {
+        const perspectiveCamera = camera as any;
+        const matchedRadius = perspectiveRadiusForFraming(framingHeight, perspectiveCamera.fov ?? 50);
+        radiusRef.current = clamp(
+          matchedRadius * PROJECTION_BLEND_START_PERSPECTIVE,
+          MIN_RADIUS,
+          MAX_RADIUS,
+        );
+        projectionRadiusTargetRef.current = matchedRadius;
+        projectionRadiusVelocityRef.current = 0;
+        projectionZoomTargetRef.current = null;
+        projectionZoomVelocityRef.current = 0;
+      }
+      velocityRef.current.zoom = 0;
     }
 
     const velocity = velocityRef.current;
@@ -285,12 +371,54 @@ export function DesktopInertialCameraControls({
     if ((camera as any).isOrthographicCamera) {
       const orthoCamera = camera as any;
       const currentZoom = orthoCamera.zoom ?? 100;
-      const nextZoom = Math.min(Math.max(currentZoom * Math.exp(-velocity.zoom * delta * 0.02 * followGain), 12), 520);
+      let nextZoom = clamp(
+        currentZoom * Math.exp(-velocity.zoom * delta * ORTHO_ZOOM_SCROLL_GAIN * followGain),
+        MIN_ORTHO_ZOOM,
+        MAX_ORTHO_ZOOM,
+      );
+      if (projectionZoomTargetRef.current !== null) {
+        const smoothedZoom = smoothDampScalar(
+          nextZoom,
+          projectionZoomTargetRef.current,
+          projectionZoomVelocityRef.current,
+          0.16,
+          delta,
+        );
+        nextZoom = clamp(smoothedZoom.value, MIN_ORTHO_ZOOM, MAX_ORTHO_ZOOM);
+        projectionZoomVelocityRef.current = smoothedZoom.velocity;
+        if (
+          Math.abs(nextZoom - projectionZoomTargetRef.current) < 0.02 &&
+          Math.abs(projectionZoomVelocityRef.current) < 0.06
+        ) {
+          nextZoom = projectionZoomTargetRef.current;
+          projectionZoomTargetRef.current = null;
+          projectionZoomVelocityRef.current = 0;
+        }
+      }
       orthoCamera.zoom = nextZoom;
       orthoCamera.updateProjectionMatrix();
     } else {
       radiusRef.current += velocity.zoom * delta * followGain;
-      radiusRef.current = Math.min(Math.max(radiusRef.current, 0.5), 80);
+      radiusRef.current = clamp(radiusRef.current, MIN_RADIUS, MAX_RADIUS);
+      if (projectionRadiusTargetRef.current !== null) {
+        const smoothedRadius = smoothDampScalar(
+          radiusRef.current,
+          projectionRadiusTargetRef.current,
+          projectionRadiusVelocityRef.current,
+          0.16,
+          delta,
+        );
+        radiusRef.current = clamp(smoothedRadius.value, MIN_RADIUS, MAX_RADIUS);
+        projectionRadiusVelocityRef.current = smoothedRadius.velocity;
+        if (
+          Math.abs(radiusRef.current - projectionRadiusTargetRef.current) < 0.01 &&
+          Math.abs(projectionRadiusVelocityRef.current) < 0.03
+        ) {
+          radiusRef.current = projectionRadiusTargetRef.current;
+          projectionRadiusTargetRef.current = null;
+          projectionRadiusVelocityRef.current = 0;
+        }
+      }
     }
 
     if (focusingRef.current && desiredTargetRef.current !== null && desiredRadiusRef.current !== null) {
@@ -309,7 +437,7 @@ export function DesktopInertialCameraControls({
         0.15,
         delta,
       );
-      radiusRef.current = smoothedRadius.value;
+      radiusRef.current = clamp(smoothedRadius.value, MIN_RADIUS, MAX_RADIUS);
       desiredRadiusVelocityRef.current = smoothedRadius.velocity;
 
       const targetDistance = targetRef.current.distanceTo(desiredTargetRef.current);
@@ -327,6 +455,12 @@ export function DesktopInertialCameraControls({
       ) {
         focusingRef.current = false;
       }
+    }
+
+    if ((camera as any).isOrthographicCamera) {
+      projectionFramingHeightRef.current = framingHeightFromOrthographic(camera as any);
+    } else {
+      projectionFramingHeightRef.current = framingHeightFromPerspective(radiusRef.current, (camera as any).fov ?? 50);
     }
 
     const sinPhi = Math.sin(phiRef.current);

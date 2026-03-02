@@ -17,6 +17,7 @@ import {
 } from "./interaction/drawTool";
 import {
   getActuatorPrimitiveCenter,
+  getActuatorRadius,
   getCapsuleHalfAxis,
   normalizePositiveScale,
   normalizePrimitiveSize,
@@ -24,8 +25,6 @@ import {
 } from "./runtime/physicsAuthoring";
 import {
   defaultPresetForActuatorType,
-  getActuatorMassFromPreset,
-  getActuatorPresetSettings,
 } from "./runtime/physicsPresets";
 import { createRootActuator, composeMatrix } from "./app/actuatorModel";
 import { smoothDampQuat, smoothDampVec3, type SmoothDampQuatVelocity, type SmoothDampVec3Velocity } from "./app/smoothDamp";
@@ -88,6 +87,9 @@ const ACTUATOR_PRESET_OPTIONS: ActuatorPreset[] = [
   "Dangly",
   "Floppy",
 ];
+const MIXED_PRESET_VALUE = "__mixed__";
+
+const POSE_TOOL_MODE: GizmoMode = "translate";
 
 export default function App() {
   const sceneMeshSources = useMemo<ActiveMeshSource[]>(
@@ -104,12 +106,21 @@ export default function App() {
     ],
     [],
   );
-  const createdAtRef = useRef(new Date().toISOString());
   const nextActuatorIndexRef = useRef(1);
   const nextRigIndexRef = useRef(2);
   const actuatorObjectRefs = useRef<Record<string, Object3D | null>>({});
+  const drawSurfaceObjectRefs = useRef<Record<string, Object3D | null>>({});
   const canvasWrapRef = useRef<HTMLDivElement | null>(null);
   const cameraRef = useRef<any>(null);
+  const pendingVrSpawnRef = useRef(false);
+  const vrSpawnFrameRef = useRef<number | null>(null);
+  const vrOriginRestoreRef = useRef<{ origin: Object3D; position: Vector3; quaternion: Quaternion } | null>(null);
+  const projectionSwitchPoseRef = useRef<{
+    position: Vec3;
+    quaternion: { x: number; y: number; z: number; w: number };
+    up: Vec3;
+    orthoZoom: number | null;
+  } | null>(null);
   const raycasterRef = useRef(new Raycaster());
   const pointerNdcRef = useRef(new Vector2());
   const marqueeDragRef = useRef<{
@@ -138,9 +149,18 @@ export default function App() {
   const [viewProjection, setViewProjection] = useState<"perspective" | "orthographic">("perspective");
   const [viewDirectionRequest, setViewDirectionRequest] = useState<{ direction: Vec3; up: Vec3 } | null>(null);
   const [viewDirectionNonce, setViewDirectionNonce] = useState(0);
+  const [xrMode, setXrMode] = useState<XRSessionMode | null>(() => {
+    const storeAny = xrStore as any;
+    const initialState = storeAny.getState?.();
+    return (initialState?.mode as XRSessionMode | null | undefined) ?? null;
+  });
+  const [vrSupported, setVrSupported] = useState<boolean>(false);
+  const [xrBusy, setXrBusy] = useState(false);
   const [newActuatorShape, setNewActuatorShape] = useState<ActuatorShape>("capsule");
-  const [newActuatorPreset, setNewActuatorPreset] = useState<ActuatorPreset>("Default");
+  const [newActuatorPreset, setNewActuatorPreset] = useState<ActuatorPreset>("SpinePelvis");
   const [collapsedNodeIds, setCollapsedNodeIds] = useState<ReadonlySet<string>>(new Set());
+  const [outlinerParentDragSourceId, setOutlinerParentDragSourceId] = useState<string | null>(null);
+  const [outlinerParentDropTargetId, setOutlinerParentDropTargetId] = useState<string | null>(null);
   const [deltaMushEnabled, setDeltaMushEnabled] = useState(true);
   const [deltaMushSettings, setDeltaMushSettings] = useState<DeltaMushSettings>(DEFAULT_DELTA_MUSH_SETTINGS);
   const [physicsTuning] = useState<PhysicsTuning>(DEFAULT_PHYSICS_TUNING);
@@ -164,6 +184,8 @@ export default function App() {
   });
   const [drawInteractionState, setDrawInteractionState] = useState<"Idle" | "OnPress" | "OnDrag" | "OnRelease">("Idle");
   const [drawCursorRadiusPx, setDrawCursorRadiusPx] = useState(18);
+  const [drawCursorHasInRangeAnchor, setDrawCursorHasInRangeAnchor] = useState(false);
+  const [drawHoverActuatorId, setDrawHoverActuatorId] = useState<string | null>(null);
 
   const [drawDraftActuators, setDrawDraftActuators] = useState<ActuatorEntity[]>([]);
   const drawDraftActuatorsRef = useRef<ActuatorEntity[]>([]);
@@ -184,14 +206,13 @@ export default function App() {
     mirrorSpawn: boolean;
     preset: ActuatorPreset;
   } | null>(null);
+  const previousRigToolModeRef = useRef<GizmoMode>("translate");
   const playbackClockRef = useRef<PlaybackClock | null>(null);
   const transformStartSnapshotRef = useRef<EditorState | null>(null);
   const editorStateRef = useRef<EditorState>(editorState);
   const [skinningRevision, setSkinningRevision] = useState(1);
   const [skinningBusy, setSkinningBusy] = useState(false);
   const [completedSkinningRevision, setCompletedSkinningRevision] = useState(0);
-  const [skinBindingHash, setSkinBindingHash] = useState("pending");
-  const [skinMeshHash, setSkinMeshHash] = useState("pending");
   const [skinningEnabled, setSkinningEnabled] = useState(false);
   const [physicsEnabled, setPhysicsEnabled] = useState(false);
   const [pendingPoseRevision, setPendingPoseRevision] = useState<number | null>(null);
@@ -225,6 +246,7 @@ export default function App() {
 
   type OutlinerEntry =
     | { kind: "rig"; rigId: string; collapsed: boolean }
+    | { kind: "mesh"; rigId: string; meshSource: ActiveMeshSource; depth: number }
     | { kind: "node"; actuator: ActuatorEntity; depth: number; hasChildren: boolean };
 
   const outlinerEntries = useMemo<OutlinerEntry[]>(() => {
@@ -250,10 +272,15 @@ export default function App() {
     for (const rigId of rigIds) {
       const rigCollapsed = collapsedNodeIds.has(`rig:${rigId}`);
       result.push({ kind: "rig", rigId, collapsed: rigCollapsed });
-      if (!rigCollapsed) walk(null, rigId, 0);
+      if (!rigCollapsed) {
+        for (const meshSource of sceneMeshSources) {
+          result.push({ kind: "mesh", rigId, meshSource, depth: 0 });
+        }
+        walk(null, rigId, 0);
+      }
     }
     return result;
-  }, [actuators, rigIds, collapsedNodeIds]);
+  }, [actuators, collapsedNodeIds, rigIds, sceneMeshSources]);
 
   function toggleOutlinerNode(key: string) {
     setCollapsedNodeIds((prev) => {
@@ -262,6 +289,37 @@ export default function App() {
       return next;
     });
   }
+
+  function beginOutlinerParentDrag(event: ReactPointerEvent<HTMLLIElement>, sourceId: string) {
+    if (event.button !== 1) return;
+    if (physicsEnabled || appMode !== "Rig") return;
+    event.preventDefault();
+    event.stopPropagation();
+    setOutlinerParentDragSourceId(sourceId);
+    setOutlinerParentDropTargetId(null);
+  }
+
+  function updateOutlinerParentDropTarget(targetId: string) {
+    if (outlinerParentDragSourceId === null || targetId === outlinerParentDragSourceId) {
+      setOutlinerParentDropTargetId(null);
+      return;
+    }
+    const canDrop = canReparentSourcesToTarget([outlinerParentDragSourceId], targetId);
+    setOutlinerParentDropTargetId(canDrop ? targetId : null);
+  }
+
+  function completeOutlinerParentDrag(event: ReactPointerEvent<HTMLLIElement>, targetId: string) {
+    if (event.button !== 1) return;
+    if (outlinerParentDragSourceId === null) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const sourceId = outlinerParentDragSourceId;
+    setOutlinerParentDragSourceId(null);
+    setOutlinerParentDropTargetId(null);
+    if (sourceId === targetId) return;
+    if (!canReparentSourcesToTarget([sourceId], targetId)) return;
+    reparentSourceActuatorsToTarget([sourceId], targetId);
+  }
   const onSkinningStats = useCallback((stats: SkinningStats) => {
     setSkinningStats(stats);
   }, []);
@@ -269,20 +327,283 @@ export default function App() {
     setSkinningBusy(status.busy);
     if (!status.completed) return;
     setCompletedSkinningRevision((previous) => Math.max(previous, status.revision));
-    if (status.bindingHash !== null) {
-      setSkinBindingHash(status.bindingHash);
-    }
-    if (status.meshHash !== null) {
-      setSkinMeshHash(status.meshHash);
-    }
   }, []);
   const onActiveCameraChange = useCallback((cameraObject: any) => {
     cameraRef.current = cameraObject;
+    const pendingPose = projectionSwitchPoseRef.current;
+    if (cameraObject === null || cameraObject === undefined || pendingPose === null) return;
+
+    cameraObject.position.set(
+      pendingPose.position.x,
+      pendingPose.position.y,
+      pendingPose.position.z,
+    );
+    cameraObject.quaternion.set(
+      pendingPose.quaternion.x,
+      pendingPose.quaternion.y,
+      pendingPose.quaternion.z,
+      pendingPose.quaternion.w,
+    );
+    cameraObject.up.set(pendingPose.up.x, pendingPose.up.y, pendingPose.up.z);
+    if ((cameraObject as any).isOrthographicCamera && pendingPose.orthoZoom !== null) {
+      cameraObject.zoom = pendingPose.orthoZoom;
+      cameraObject.updateProjectionMatrix?.();
+    }
+    cameraObject.updateMatrixWorld?.(true);
+    projectionSwitchPoseRef.current = null;
   }, []);
+
+  function toggleProjectionKeepView() {
+    const currentCamera = cameraRef.current as any;
+    if (currentCamera !== null && currentCamera !== undefined) {
+      projectionSwitchPoseRef.current = {
+        position: {
+          x: currentCamera.position.x,
+          y: currentCamera.position.y,
+          z: currentCamera.position.z,
+        },
+        quaternion: {
+          x: currentCamera.quaternion.x,
+          y: currentCamera.quaternion.y,
+          z: currentCamera.quaternion.z,
+          w: currentCamera.quaternion.w,
+        },
+        up: {
+          x: currentCamera.up.x,
+          y: currentCamera.up.y,
+          z: currentCamera.up.z,
+        },
+        orthoZoom: (currentCamera as any).isOrthographicCamera ? currentCamera.zoom ?? null : null,
+      };
+    }
+    setViewProjection((value) => (value === "perspective" ? "orthographic" : "perspective"));
+  }
 
   const requestViewDirection = useCallback((direction: Vec3, up: Vec3) => {
     setViewDirectionRequest({ direction, up });
     setViewDirectionNonce((value) => value + 1);
+  }, []);
+
+  const computeVrSpawnPose = useCallback((): { eye: Vec3; look: Vec3 } | null => {
+    const bounds = new Box3();
+    let hasBounds = false;
+
+    for (const object of Object.values(drawSurfaceObjectRefs.current)) {
+      if (object === null || object === undefined) continue;
+      object.updateWorldMatrix?.(true, true);
+      const meshBounds = new Box3().setFromObject(object);
+      if (meshBounds.isEmpty()) continue;
+      if (!hasBounds) {
+        bounds.copy(meshBounds);
+        hasBounds = true;
+      } else {
+        bounds.union(meshBounds);
+      }
+    }
+
+    if (!hasBounds) {
+      const rigActuators = actuators.filter((actuator) => actuator.rigId === selectedRigId);
+      for (const actuator of rigActuators) {
+        const center = getActuatorPrimitiveCenter(actuator);
+        const halfX = Math.max(actuator.size.x * 0.5, 0.02);
+        const halfY = Math.max(actuator.size.y * 0.5, 0.02);
+        const halfZ = Math.max(actuator.size.z * 0.5, 0.02);
+        bounds.expandByPoint(new Vector3(center.x - halfX, center.y - halfY, center.z - halfZ));
+        bounds.expandByPoint(new Vector3(center.x + halfX, center.y + halfY, center.z + halfZ));
+        hasBounds = true;
+      }
+    }
+
+    if (!hasBounds || bounds.isEmpty()) return null;
+
+    const center = bounds.getCenter(new Vector3());
+    const size = bounds.getSize(new Vector3());
+    const horizontalSpan = Math.max(size.x, size.z, 0.4);
+    const verticalSpan = Math.max(size.y, 0.8);
+    const startDistance = Math.max(horizontalSpan * 1.35, verticalSpan * 0.95, 1.2);
+
+    const eye = {
+      x: center.x,
+      y: center.y + verticalSpan * 0.2,
+      z: center.z + startDistance,
+    };
+    const look = {
+      x: center.x,
+      y: center.y - verticalSpan * 0.08,
+      z: center.z,
+    };
+
+    return { eye, look };
+  }, [actuators, selectedRigId]);
+
+  const restoreVrOriginTransform = useCallback(() => {
+    const restore = vrOriginRestoreRef.current;
+    if (restore === null) return;
+    restore.origin.position.copy(restore.position);
+    restore.origin.quaternion.copy(restore.quaternion);
+    restore.origin.updateMatrixWorld?.(true);
+    vrOriginRestoreRef.current = null;
+  }, []);
+
+  const applyPendingVrSpawnPose = useCallback((): boolean => {
+    const spawn = computeVrSpawnPose();
+    if (spawn === null) return true;
+
+    const storeAny = xrStore as any;
+    const state = storeAny.getState?.();
+    const origin = state?.origin as Object3D | undefined;
+    const cameraObject = cameraRef.current as any;
+    if (origin === undefined || origin === null || cameraObject === null || cameraObject === undefined) {
+      return false;
+    }
+
+    if (vrOriginRestoreRef.current === null || vrOriginRestoreRef.current.origin !== origin) {
+      vrOriginRestoreRef.current = {
+        origin,
+        position: origin.position.clone(),
+        quaternion: origin.quaternion.clone(),
+      };
+    }
+
+    const eyeTarget = new Vector3(spawn.eye.x, spawn.eye.y, spawn.eye.z);
+    const lookTarget = new Vector3(spawn.look.x, spawn.look.y, spawn.look.z);
+
+    const cameraWorldQuat = new Quaternion();
+    if (typeof cameraObject.getWorldQuaternion === "function") {
+      cameraObject.getWorldQuaternion(cameraWorldQuat);
+    } else if (cameraObject.quaternion !== undefined) {
+      cameraWorldQuat.copy(cameraObject.quaternion);
+    }
+
+    const currentForward = new Vector3(0, 0, -1).applyQuaternion(cameraWorldQuat);
+    currentForward.y = 0;
+    if (currentForward.lengthSq() < 1e-6) currentForward.set(0, 0, -1);
+    currentForward.normalize();
+
+    const desiredForward = lookTarget.clone().sub(eyeTarget);
+    desiredForward.y = 0;
+    if (desiredForward.lengthSq() < 1e-6) desiredForward.set(0, 0, -1);
+    desiredForward.normalize();
+
+    const currentYaw = Math.atan2(currentForward.x, currentForward.z);
+    const desiredYaw = Math.atan2(desiredForward.x, desiredForward.z);
+    origin.rotateY(desiredYaw - currentYaw);
+    origin.updateMatrixWorld?.(true);
+
+    const currentEye = new Vector3();
+    if (typeof cameraObject.getWorldPosition === "function") {
+      cameraObject.getWorldPosition(currentEye);
+    } else if (cameraObject.position !== undefined) {
+      currentEye.copy(cameraObject.position);
+    }
+
+    origin.position.add(eyeTarget.sub(currentEye));
+    origin.updateMatrixWorld?.(true);
+    return true;
+  }, [computeVrSpawnPose]);
+
+  const requestEnterVr = useCallback(async () => {
+    if (xrBusy) return;
+    pendingVrSpawnRef.current = true;
+    if (vrSpawnFrameRef.current !== null) {
+      cancelAnimationFrame(vrSpawnFrameRef.current);
+      vrSpawnFrameRef.current = null;
+    }
+    setXrBusy(true);
+    try {
+      await (xrStore as any).enterVR?.();
+    } catch (error) {
+      pendingVrSpawnRef.current = false;
+      console.error("Failed to enter VR session.", error);
+    } finally {
+      setXrBusy(false);
+    }
+  }, [xrBusy]);
+
+  useEffect(() => {
+    if (xrMode === "immersive-vr" && pendingVrSpawnRef.current) {
+      let attempts = 0;
+      const tick = () => {
+        if (xrMode !== "immersive-vr" || !pendingVrSpawnRef.current) {
+          vrSpawnFrameRef.current = null;
+          return;
+        }
+        const applied = applyPendingVrSpawnPose();
+        if (applied || attempts >= 120) {
+          pendingVrSpawnRef.current = false;
+          vrSpawnFrameRef.current = null;
+          return;
+        }
+        attempts += 1;
+        vrSpawnFrameRef.current = requestAnimationFrame(tick);
+      };
+      vrSpawnFrameRef.current = requestAnimationFrame(tick);
+      return () => {
+        if (vrSpawnFrameRef.current !== null) {
+          cancelAnimationFrame(vrSpawnFrameRef.current);
+          vrSpawnFrameRef.current = null;
+        }
+      };
+    }
+
+    if (xrMode === null) {
+      pendingVrSpawnRef.current = false;
+      if (vrSpawnFrameRef.current !== null) {
+        cancelAnimationFrame(vrSpawnFrameRef.current);
+        vrSpawnFrameRef.current = null;
+      }
+      restoreVrOriginTransform();
+    }
+  }, [applyPendingVrSpawnPose, restoreVrOriginTransform, xrMode]);
+
+  const requestExitVr = useCallback(async () => {
+    if (xrBusy) return;
+    setXrBusy(true);
+    try {
+      const storeAny = xrStore as any;
+      const state = storeAny.getState?.();
+      await state?.session?.end?.();
+    } catch (error) {
+      console.error("Failed to end XR session.", error);
+    } finally {
+      setXrBusy(false);
+    }
+  }, [xrBusy]);
+
+  useEffect(() => {
+    const storeAny = xrStore as any;
+    const state = storeAny.getState?.();
+    setXrMode((state?.mode as XRSessionMode | null | undefined) ?? null);
+
+    const unsubscribe = storeAny.subscribe?.((nextState: any) => {
+      setXrMode((nextState?.mode as XRSessionMode | null | undefined) ?? null);
+    });
+
+    return () => {
+      unsubscribe?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let canceled = false;
+    const xrApi = (navigator as any).xr;
+    if (xrApi === undefined || xrApi?.isSessionSupported === undefined) {
+      setVrSupported(false);
+      return;
+    }
+
+    xrApi
+      .isSessionSupported("immersive-vr")
+      .then((supported: boolean) => {
+        if (!canceled) setVrSupported(Boolean(supported));
+      })
+      .catch(() => {
+        if (!canceled) setVrSupported(false);
+      });
+
+    return () => {
+      canceled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -293,12 +614,45 @@ export default function App() {
     drawDraftActuatorsRef.current = drawDraftActuators;
   }, [drawDraftActuators]);
 
+  useEffect(() => {
+    if (appMode !== "Rig") return;
+    previousRigToolModeRef.current = gizmoMode;
+  }, [appMode, gizmoMode]);
+
+  useEffect(() => {
+    if (selectedActuatorIds.length === 0) return;
+    const selected = selectedActuatorIds
+      .map((id) => actuators.find((actuator) => actuator.id === id))
+      .filter((actuator): actuator is ActuatorEntity => actuator !== undefined);
+    if (selected.length === 0) return;
+
+    const presets = new Set<ActuatorPreset>(
+      selected.map((actuator) => actuator.preset ?? defaultPresetForActuatorType(actuator.type)),
+    );
+    if (presets.size !== 1) return;
+    const selectedPreset = [...presets][0];
+    if (selected.length === 1 && selected[0].type === "root" && actuators.length === 1) return;
+    setNewActuatorPreset((previous) => (previous === selectedPreset ? previous : selectedPreset));
+  }, [actuators, selectedActuatorIds]);
+
+  const presetSelectValue = useMemo(() => {
+    if (selectedActuatorIds.length <= 1) return newActuatorPreset;
+    const selected = selectedActuatorIds
+      .map((id) => actuators.find((actuator) => actuator.id === id))
+      .filter((actuator): actuator is ActuatorEntity => actuator !== undefined);
+    if (selected.length <= 1) return newActuatorPreset;
+    const presets = new Set<ActuatorPreset>(
+      selected.map((actuator) => actuator.preset ?? defaultPresetForActuatorType(actuator.type)),
+    );
+    return presets.size === 1 ? [...presets][0] : MIXED_PRESET_VALUE;
+  }, [actuators, newActuatorPreset, selectedActuatorIds]);
+
   function setActuatorObjectRef(id: string, object: Object3D | null) {
     actuatorObjectRefs.current[id] = object;
   }
 
-  function setDrawSurfaceRef(_id: string, _object: Object3D | null) {
-    // Draw flow intentionally ignores mesh surfaces in this mode.
+  function setDrawSurfaceRef(id: string, object: Object3D | null) {
+    drawSurfaceObjectRefs.current[id] = object;
   }
 
   function getActuatorHitAtPointer(clientX: number, clientY: number): ActuatorEntity | null {
@@ -393,12 +747,15 @@ export default function App() {
   function resolveMirroredCounterpartId(
     actuatorId: string,
     sourceActuators: ActuatorEntity[],
-    options?: { preferredParentId?: string | null },
+    options?: { preferredParentId?: string | null; allowSelfOnCenterline?: boolean },
   ): string | null {
     const source = sourceActuators.find((actuator) => actuator.id === actuatorId);
     if (source === undefined) return null;
     const sourceCenter = getActuatorPrimitiveCenter(source);
-    if (Math.abs(sourceCenter.x) < 0.02 && source.parentId === null) return null;
+    const centerlineThreshold = 0.02;
+    if (Math.abs(sourceCenter.x) <= centerlineThreshold) {
+      return options?.allowSelfOnCenterline === true ? source.id : null;
+    }
     const targetCenter = { x: -sourceCenter.x, y: sourceCenter.y, z: sourceCenter.z };
     const preferredParentId = options?.preferredParentId;
 
@@ -439,12 +796,194 @@ export default function App() {
   function resolveDrawMirrorParentId(parentId: string, sourceActuators: ActuatorEntity[]): string | null {
     const sourceParent = sourceActuators.find((actuator) => actuator.id === parentId);
     if (sourceParent === undefined) return null;
-    if (sourceParent.parentId === null) {
-      // Centerline root can act as its own mirrored parent anchor.
-      const center = getActuatorPrimitiveCenter(sourceParent);
-      return Math.abs(center.x) <= 0.02 ? sourceParent.id : null;
+    return resolveMirroredCounterpartId(parentId, sourceActuators, { allowSelfOnCenterline: true });
+  }
+
+  function wouldCreateParentCycle(
+    childId: string,
+    nextParentId: string,
+    byId: Map<string, ActuatorEntity>,
+  ): boolean {
+    let current = byId.get(nextParentId);
+    while (current !== undefined && current.parentId !== null) {
+      if (current.parentId === childId) return true;
+      current = byId.get(current.parentId);
     }
-    return resolveMirroredCounterpartId(parentId, sourceActuators);
+    return false;
+  }
+
+  function canAssignParentToActuator(
+    actuatorId: string,
+    nextParentId: string,
+    byId: Map<string, ActuatorEntity>,
+  ): boolean {
+    const actuator = byId.get(actuatorId);
+    const nextParent = byId.get(nextParentId);
+    if (actuator === undefined || nextParent === undefined) return false;
+    if (actuator.parentId === null) return false;
+    if (actuator.id === nextParent.id) return false;
+    if (actuator.rigId !== nextParent.rigId) return false;
+    if (wouldCreateParentCycle(actuator.id, nextParent.id, byId)) return false;
+    return true;
+  }
+
+  function getPointerRayWorld(clientX: number, clientY: number): { origin: Vector3; direction: Vector3 } | null {
+    const wrap = canvasWrapRef.current;
+    const camera = cameraRef.current;
+    if (wrap === null || camera === null) return null;
+    const rect = wrap.getBoundingClientRect();
+    const x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    const y = -((clientY - rect.top) / rect.height) * 2 + 1;
+    pointerNdcRef.current.set(x, y);
+    raycasterRef.current.setFromCamera(pointerNdcRef.current, camera);
+    return {
+      origin: raycasterRef.current.ray.origin.clone(),
+      direction: raycasterRef.current.ray.direction.clone().normalize(),
+    };
+  }
+
+  function intersectRaySphereInterval(localOrigin: Vector3, localDirection: Vector3, radius: number): [number, number] | null {
+    const a = localDirection.dot(localDirection);
+    const b = 2 * localOrigin.dot(localDirection);
+    const c = localOrigin.dot(localOrigin) - radius * radius;
+    const discriminant = b * b - 4 * a * c;
+    if (discriminant < 0) return null;
+    const sqrtDiscriminant = Math.sqrt(discriminant);
+    const t0 = (-b - sqrtDiscriminant) / (2 * a);
+    const t1 = (-b + sqrtDiscriminant) / (2 * a);
+    const entry = Math.min(t0, t1);
+    const exit = Math.max(t0, t1);
+    if (exit < 0) return null;
+    const entryClamped = Math.max(0, entry);
+    return entryClamped <= exit ? [entryClamped, exit] : null;
+  }
+
+  function intersectRayBoxInterval(localOrigin: Vector3, localDirection: Vector3, halfSize: Vec3): [number, number] | null {
+    const min = { x: -halfSize.x, y: -halfSize.y, z: -halfSize.z };
+    const max = { x: halfSize.x, y: halfSize.y, z: halfSize.z };
+    let tMin = Number.NEGATIVE_INFINITY;
+    let tMax = Number.POSITIVE_INFINITY;
+
+    const axes: Array<"x" | "y" | "z"> = ["x", "y", "z"];
+    for (const axis of axes) {
+      const origin = localOrigin[axis];
+      const direction = localDirection[axis];
+      if (Math.abs(direction) < 1e-8) {
+        if (origin < min[axis] || origin > max[axis]) return null;
+        continue;
+      }
+      const t1 = (min[axis] - origin) / direction;
+      const t2 = (max[axis] - origin) / direction;
+      const near = Math.min(t1, t2);
+      const far = Math.max(t1, t2);
+      tMin = Math.max(tMin, near);
+      tMax = Math.min(tMax, far);
+      if (tMax < tMin) return null;
+    }
+
+    if (tMax < 0) return null;
+    const entryClamped = Math.max(0, tMin);
+    return entryClamped <= tMax ? [entryClamped, tMax] : null;
+  }
+
+  function intersectRayCapsuleInterval(
+    localOrigin: Vector3,
+    localDirection: Vector3,
+    radius: number,
+    halfAxis: number,
+  ): [number, number] | null {
+    const candidates: number[] = [];
+
+    const addSphereCandidates = (centerY: number) => {
+      const oc = localOrigin.clone().sub(new Vector3(0, centerY, 0));
+      const a = localDirection.dot(localDirection);
+      const b = 2 * oc.dot(localDirection);
+      const c = oc.dot(oc) - radius * radius;
+      const discriminant = b * b - 4 * a * c;
+      if (discriminant < 0) return;
+      const sqrtDiscriminant = Math.sqrt(discriminant);
+      const t0 = (-b - sqrtDiscriminant) / (2 * a);
+      const t1 = (-b + sqrtDiscriminant) / (2 * a);
+      if (Number.isFinite(t0)) candidates.push(t0);
+      if (Number.isFinite(t1)) candidates.push(t1);
+    };
+
+    const a = localDirection.x * localDirection.x + localDirection.z * localDirection.z;
+    if (a > 1e-8) {
+      const b = 2 * (localOrigin.x * localDirection.x + localOrigin.z * localDirection.z);
+      const c = localOrigin.x * localOrigin.x + localOrigin.z * localOrigin.z - radius * radius;
+      const discriminant = b * b - 4 * a * c;
+      if (discriminant >= 0) {
+        const sqrtDiscriminant = Math.sqrt(discriminant);
+        const t0 = (-b - sqrtDiscriminant) / (2 * a);
+        const t1 = (-b + sqrtDiscriminant) / (2 * a);
+        const y0 = localOrigin.y + t0 * localDirection.y;
+        const y1 = localOrigin.y + t1 * localDirection.y;
+        if (Number.isFinite(t0) && y0 >= -halfAxis && y0 <= halfAxis) candidates.push(t0);
+        if (Number.isFinite(t1) && y1 >= -halfAxis && y1 <= halfAxis) candidates.push(t1);
+      }
+    }
+
+    addSphereCandidates(halfAxis);
+    addSphereCandidates(-halfAxis);
+
+    const unique = [...new Set(candidates.filter((t) => Number.isFinite(t)))].sort((lhs, rhs) => lhs - rhs);
+    if (unique.length === 0) return null;
+
+    let entry = unique[0];
+    let exit = unique[unique.length - 1];
+
+    if (unique.length === 1) {
+      const clampedY = Math.max(-halfAxis, Math.min(halfAxis, localOrigin.y));
+      const dy = localOrigin.y - clampedY;
+      const inside = localOrigin.x * localOrigin.x + dy * dy + localOrigin.z * localOrigin.z <= radius * radius;
+      if (!inside || unique[0] < 0) return null;
+      entry = 0;
+      exit = unique[0];
+    }
+
+    if (exit < 0) return null;
+    const entryClamped = Math.max(0, entry);
+    return entryClamped <= exit ? [entryClamped, exit] : null;
+  }
+
+  function computeDrawSnapMidpointInActuator(clientX: number, clientY: number, actuator: ActuatorEntity): Vec3 | null {
+    const ray = getPointerRayWorld(clientX, clientY);
+    if (ray === null) return null;
+
+    const center = getActuatorPrimitiveCenter(actuator);
+    const rotation = new Quaternion(
+      actuator.transform.rotation.x,
+      actuator.transform.rotation.y,
+      actuator.transform.rotation.z,
+      actuator.transform.rotation.w,
+    );
+    const inverseRotation = rotation.clone().invert();
+    const localOrigin = ray.origin.clone().sub(center).applyQuaternion(inverseRotation);
+    const localDirection = ray.direction.clone().applyQuaternion(inverseRotation).normalize();
+
+    let interval: [number, number] | null = null;
+    if (actuator.shape === "sphere") {
+      interval = intersectRaySphereInterval(localOrigin, localDirection, getActuatorRadius(actuator));
+    } else if (actuator.shape === "box") {
+      interval = intersectRayBoxInterval(localOrigin, localDirection, {
+        x: actuator.size.x * 0.5,
+        y: actuator.size.y * 0.5,
+        z: actuator.size.z * 0.5,
+      });
+    } else {
+      interval = intersectRayCapsuleInterval(
+        localOrigin,
+        localDirection,
+        getActuatorRadius(actuator),
+        getCapsuleHalfAxis(actuator.size),
+      );
+    }
+    if (interval === null) return null;
+
+    const tMid = (interval[0] + interval[1]) * 0.5;
+    const midpoint = ray.origin.clone().addScaledVector(ray.direction, tMid);
+    return { x: midpoint.x, y: midpoint.y, z: midpoint.z };
   }
 
   function projectPointToActuatorCenterAxis(point: Vec3, actuator: ActuatorEntity): Vec3 {
@@ -483,6 +1022,8 @@ export default function App() {
   function requestAppMode(nextMode: AppMode) {
     if (nextMode === "Pose") {
       if (appMode === "Pose" && pendingPoseRevision === null) return;
+      previousRigToolModeRef.current = gizmoMode;
+      setGizmoMode(POSE_TOOL_MODE);
       poseEntrySnapshotRef.current = cloneEditorState(editorState);
       const requiredRevision = skinningRevision + 1;
       setPendingPoseRevision(requiredRevision);
@@ -495,6 +1036,7 @@ export default function App() {
     setPendingPoseRevision(null);
     setSkinningEnabled(false);
     setAppMode("Rig");
+    setGizmoMode(previousRigToolModeRef.current);
     setIsPosePullDragging(false);
     setPoseTargetActuators(null);
     poseEntrySnapshotRef.current = null;
@@ -747,58 +1289,6 @@ export default function App() {
     });
   }
 
-  function setSelectionTransient(nextIds: string[], preferredId?: string | null) {
-    setEditorState((previous) => {
-      const sortedUnique = [...new Set(nextIds)].sort((a, b) => a.localeCompare(b));
-      const primary =
-        preferredId !== undefined && preferredId !== null && sortedUnique.includes(preferredId)
-          ? preferredId
-          : (sortedUnique[0] ?? null);
-      const selectedPrimary = primary === null ? null : previous.actuators.find((actuator) => actuator.id === primary);
-      const primaryRigId = selectedPrimary?.rigId ?? previous.selectedRigId;
-      const rigConstrained =
-        appMode === "Rig"
-          ? sortedUnique.filter((id) => {
-              const actuator = previous.actuators.find((item) => item.id === id);
-              return actuator?.rigId === primaryRigId;
-            })
-          : sortedUnique;
-      const nextPrimary =
-        preferredId !== undefined && preferredId !== null && rigConstrained.includes(preferredId)
-          ? preferredId
-          : (rigConstrained[0] ?? null);
-      const nextRigId = primaryRigId;
-      const samePrimary = previous.selectedActuatorId === nextPrimary;
-      const sameRig = previous.selectedRigId === nextRigId;
-      const sameIds =
-        previous.selectedActuatorIds.length === rigConstrained.length &&
-        previous.selectedActuatorIds.every((id, index) => id === rigConstrained[index]);
-      if (samePrimary && sameIds && sameRig) return previous;
-      const nextState: EditorState = {
-        actuators: previous.actuators,
-        selectedRigId: nextRigId,
-        selectedActuatorId: nextPrimary,
-        selectedActuatorIds: rigConstrained,
-      };
-      editorStateRef.current = nextState;
-      return nextState;
-    });
-  }
-
-  function setActiveRig(rigId: string) {
-    commitEditorChange((previous) => {
-      const rigActuators = previous.actuators.filter((actuator) => actuator.rigId === rigId);
-      const preferred = rigActuators.find((actuator) => actuator.id === previous.selectedActuatorId) ?? rigActuators[0] ?? null;
-      const nextSelection = preferred === null ? [] : [preferred.id];
-      return {
-        actuators: previous.actuators,
-        selectedRigId: rigId,
-        selectedActuatorId: preferred?.id ?? null,
-        selectedActuatorIds: nextSelection,
-      };
-    });
-  }
-
   function createActuator() {
     commitEditorChange((previous) => {
       const activeRigId = previous.selectedRigId;
@@ -876,7 +1366,8 @@ export default function App() {
           size: normalizePrimitiveSize(childSize),
         });
 
-        if (shouldSpawnMirrored({ x: spawnCenter.x, y: spawnCenter.y, z: spawnCenter.z }, drawMirrorEnabled)) {
+        // Centerline parents should create only one actuator even if child offset drifts.
+        if (shouldSpawnMirrored({ x: parentCenter.x, y: parentCenter.y, z: parentCenter.z }, drawMirrorEnabled)) {
           const mirrorParentId = resolveMirroredCounterpartId(parent.id, previous.actuators);
           if (mirrorParentId !== null && !selectedParentIdSet.has(mirrorParentId)) {
             const source = created[created.length - 1];
@@ -999,6 +1490,35 @@ export default function App() {
     };
   }
 
+  function applyPresetToSelection(nextPreset: ActuatorPreset) {
+    commitEditorChange((previous) => {
+      if (previous.selectedActuatorIds.length === 0) return previous;
+      const selectedIds = new Set(previous.selectedActuatorIds);
+      if (drawMirrorEnabled) {
+        for (const selectedId of previous.selectedActuatorIds) {
+          const mirrorId = resolveMirroredCounterpartId(selectedId, previous.actuators);
+          if (mirrorId !== null) selectedIds.add(mirrorId);
+        }
+      }
+      let changed = false;
+      const nextActuators = previous.actuators.map((actuator) => {
+        if (!selectedIds.has(actuator.id)) return actuator;
+        const currentPreset = actuator.preset ?? defaultPresetForActuatorType(actuator.type);
+        if (currentPreset === nextPreset) return actuator;
+        changed = true;
+        return {
+          ...actuator,
+          preset: nextPreset,
+        };
+      });
+      if (!changed) return previous;
+      return {
+        ...previous,
+        actuators: nextActuators,
+      };
+    });
+  }
+
   function commitDrawSession(drawSession: NonNullable<typeof drawSessionRef.current>) {
     const createdIds: string[] = [];
     commitEditorChange((previous) => {
@@ -1102,6 +1622,83 @@ export default function App() {
     setSelection([id], id);
   }
 
+  function canReparentSourcesToTarget(sourceIds: string[], targetParentId: string): boolean {
+    if (physicsEnabled || appMode !== "Rig") return false;
+    const byId = new Map(actuators.map((actuator) => [actuator.id, actuator]));
+    if (!byId.has(targetParentId)) return false;
+    const selected = [...new Set(sourceIds)].filter((id) => byId.has(id));
+    if (selected.length === 0) return false;
+    for (const sourceId of selected) {
+      if (canAssignParentToActuator(sourceId, targetParentId, byId)) return true;
+    }
+    if (!drawMirrorEnabled) return false;
+    const mirrorTargetId = resolveMirroredCounterpartId(targetParentId, actuators, { allowSelfOnCenterline: true });
+    if (mirrorTargetId === null) return false;
+    const selectedSet = new Set(selected);
+    for (const sourceId of selected) {
+      const mirrorId = resolveMirroredCounterpartId(sourceId, actuators);
+      if (mirrorId === null || selectedSet.has(mirrorId)) continue;
+      if (canAssignParentToActuator(mirrorId, mirrorTargetId, byId)) return true;
+    }
+    return false;
+  }
+
+  function reparentSourceActuatorsToTarget(sourceIds: string[], targetParentId: string) {
+    commitEditorChange((previous) => {
+      if (sourceIds.length === 0) return previous;
+      const byId = new Map(previous.actuators.map((actuator) => [actuator.id, actuator]));
+      if (!byId.has(targetParentId)) return previous;
+
+      const selected = [...new Set(sourceIds)]
+        .filter((id) => byId.has(id))
+        .sort((lhs, rhs) => lhs.localeCompare(rhs));
+      if (selected.length === 0) return previous;
+
+      const selectedSet = new Set(selected);
+      const parentUpdates = new Map<string, string>();
+
+      for (const selectedId of selected) {
+        if (!canAssignParentToActuator(selectedId, targetParentId, byId)) continue;
+        parentUpdates.set(selectedId, targetParentId);
+      }
+
+      if (drawMirrorEnabled) {
+        const mirrorTargetId = resolveMirroredCounterpartId(targetParentId, previous.actuators, {
+          allowSelfOnCenterline: true,
+        });
+        if (mirrorTargetId !== null) {
+          for (const selectedId of selected) {
+            const mirrorId = resolveMirroredCounterpartId(selectedId, previous.actuators);
+            if (mirrorId === null || selectedSet.has(mirrorId) || parentUpdates.has(mirrorId)) continue;
+            if (!canAssignParentToActuator(mirrorId, mirrorTargetId, byId)) continue;
+            parentUpdates.set(mirrorId, mirrorTargetId);
+          }
+        }
+      }
+
+      if (parentUpdates.size === 0) return previous;
+      const nextActuators = previous.actuators.map((actuator) => {
+        const nextParentId = parentUpdates.get(actuator.id);
+        if (nextParentId === undefined || actuator.parentId === nextParentId) return actuator;
+        return {
+          ...actuator,
+          parentId: nextParentId,
+        };
+      });
+      return {
+        ...previous,
+        actuators: nextActuators,
+      };
+    });
+  }
+
+  function parentCurrentSelectionToActiveActuator() {
+    if (selectedActuatorId === null) return;
+    const sourceIds = selectedActuatorIds.filter((id) => id !== selectedActuatorId);
+    if (sourceIds.length === 0) return;
+    reparentSourceActuatorsToTarget(sourceIds, selectedActuatorId);
+  }
+
   function clearSelection() {
     setSelection([], null);
   }
@@ -1162,7 +1759,13 @@ export default function App() {
     });
   }
 
-  function applyTransformChange(id: string, worldDelta: Matrix4, localDelta: Matrix4, worldOffset: Vec3) {
+  function applyTransformChange(
+    id: string,
+    worldDelta: Matrix4,
+    localDelta: Matrix4,
+    worldOffset: Vec3,
+    options?: { includeDescendants?: boolean },
+  ) {
     const baseState = transformStartSnapshotRef.current ?? editorState;
     const moved = baseState.actuators.find((actuator) => actuator.id === id);
     if (moved === undefined) return;
@@ -1230,11 +1833,15 @@ export default function App() {
         if (!selectedSet.has(actuator.id)) return actuator;
         return {
           ...actuator,
-          size: scalePrimitiveSizeFromGizmoDelta(actuator.size, {
-            x: deltaScale.x,
-            y: deltaScale.y,
-            z: deltaScale.z,
-          }),
+          size: scalePrimitiveSizeFromGizmoDelta(
+            actuator.size,
+            {
+              x: deltaScale.x,
+              y: deltaScale.y,
+              z: deltaScale.z,
+            },
+            actuator.shape,
+          ),
           transform: {
             ...actuator.transform,
             scale: { x: 1, y: 1, z: 1 },
@@ -1251,6 +1858,7 @@ export default function App() {
     }
 
     void worldDelta;
+    const includeDescendants = options?.includeDescendants ?? true;
     const worldTranslateDelta = new Vector3(worldOffset.x, worldOffset.y, worldOffset.z);
     const transformedSourceIds = new Set<string>();
 
@@ -1277,7 +1885,9 @@ export default function App() {
       const targetMatrix = new Matrix4().compose(nextPosition, nextRotation, nextScale);
       worldMatrixById.set(selectedId, targetMatrix);
       const subtreeDelta = targetMatrix.clone().multiply(original.clone().invert());
-      applyDeltaToDescendants(selectedId, subtreeDelta, transformedSourceIds);
+      if (includeDescendants) {
+        applyDeltaToDescendants(selectedId, subtreeDelta, transformedSourceIds);
+      }
     }
 
     const nextActuators = baseState.actuators.map((actuator) => {
@@ -1366,100 +1976,6 @@ export default function App() {
 
   }
 
-  const serializedScene = useMemo(() => {
-    const sortedActuators = [...actuators].sort((a, b) => a.id.localeCompare(b.id));
-    const characters = rigIds.map((rigId, index) => {
-      const meshSource =
-        sceneMeshSources.length === 0 ? null : sceneMeshSources[Math.min(index, sceneMeshSources.length - 1)];
-      const rigActuators = sortedActuators.filter((actuator) => actuator.rigId === rigId);
-      const rigActuatorDocuments = rigActuators.map((actuator) => {
-        const presetSettings = getActuatorPresetSettings(actuator);
-        return {
-          id: actuator.id,
-          parentId: actuator.parentId,
-          type: actuator.type,
-          shape: actuator.shape,
-          preset: actuator.preset ?? defaultPresetForActuatorType(actuator.type),
-          pivot: {
-            mode: actuator.pivot.mode,
-            offsetLocal: { ...actuator.pivot.offset },
-          },
-          transform: {
-            position: { ...actuator.transform.position },
-            rotation: { ...actuator.transform.rotation },
-            scale: { ...actuator.transform.scale },
-          },
-          size: { ...actuator.size },
-          joint: {
-            mode: "limited",
-            angularLimitDeg: { x: 45, y: 45, z: 45 },
-            swingLimitDeg: 45,
-            twistLimitDeg: 45,
-          },
-          physics: {
-            mass: getActuatorMassFromPreset(actuator),
-            linearDamping: presetSettings.drag,
-            angularDamping: presetSettings.angularDrag,
-            drivePositionSpring: presetSettings.drivePositionSpring,
-            drivePositionDamper: presetSettings.drivePositionDamper,
-            driveRotationSpring: presetSettings.driveRotationSpring,
-            driveRotationDamper: presetSettings.driveRotationDamper,
-            gravityScale: 1,
-            kinematicInRigMode: true,
-          },
-          influence: {
-            radius: Math.max(actuator.size.x, actuator.size.y, actuator.size.z) * 0.5,
-            falloff: 1,
-            weight: 1,
-          },
-        };
-      });
-      const root = rigActuators.find((actuator) => actuator.parentId === null);
-      return {
-        id: `char_${(index + 1).toString().padStart(3, "0")}`,
-        name: `PrototypeCharacter_${rigId}`,
-        mesh: {
-          meshId: meshSource?.id ?? "mesh_active",
-          uri: meshSource?.meshUri.replace(/^\//, "") ?? "",
-        },
-        rig: {
-          rootActuatorId: root?.id ?? "",
-          actuators: rigActuatorDocuments,
-        },
-        skinBinding: {
-          version: "0.1",
-          solver: "closestVolume",
-          meshHash: skinMeshHash,
-          bindingHash: skinBindingHash,
-          generatedAtUtc: new Date().toISOString(),
-          influenceCount: skinningStats.vertexCount,
-        },
-        channels: {
-          look: { yaw: 0, pitch: 0 },
-          blink: { left: 0, right: 0 },
-          custom: {},
-        },
-      };
-    });
-
-    return JSON.stringify(
-      {
-        version: "0.1.0",
-        sceneId: "scene_main",
-        createdAtUtc: createdAtRef.current,
-        updatedAtUtc: new Date().toISOString(),
-        characters,
-        playback: {
-          fps: syntheticClip?.fps ?? 60,
-          durationSec: syntheticClip?.durationSec ?? 10,
-          activeClipId: syntheticClip?.clipId ?? null,
-        },
-      },
-      null,
-      2,
-    );
-  }, [actuators, rigIds, sceneMeshSources, syntheticClip, skinBindingHash, skinMeshHash, skinningStats.vertexCount]);
-
   useEffect(() => {
     function isTypingTarget(target: EventTarget | null) {
       if (!(target instanceof HTMLElement)) return false;
@@ -1502,11 +2018,23 @@ export default function App() {
         return;
       }
 
-      if (key === "q") setGizmoMode("select");
-      if (key === "w") setGizmoMode("translate");
-      if (key === "e") setGizmoMode("rotate");
-      if (key === "r") setGizmoMode("scale");
-      if (key === "d") setGizmoMode("draw");
+      if (key === "p" && appMode === "Rig" && !physicsEnabled) {
+        event.preventDefault();
+        parentCurrentSelectionToActiveActuator();
+        return;
+      }
+
+      if (appMode === "Pose") {
+        if (key === "w" || key === "q" || key === "e" || key === "r" || key === "d") {
+          setGizmoMode(POSE_TOOL_MODE);
+        }
+      } else {
+        if (key === "q") setGizmoMode("select");
+        if (key === "w") setGizmoMode("translate");
+        if (key === "e") setGizmoMode("rotate");
+        if (key === "r") setGizmoMode("scale");
+        if (key === "d") setGizmoMode("draw");
+      }
       if (key === "f") {
         const idsToFrame =
           selectedActuatorIds.length > 0
@@ -1521,14 +2049,38 @@ export default function App() {
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [actuators, appMode, pendingPoseRevision, physicsEnabled, selectedActuatorIds, selectedRigId, skinningRevision]);
+  }, [actuators, appMode, pendingPoseRevision, physicsEnabled, selectedActuatorId, selectedActuatorIds, selectedRigId, skinningRevision]);
 
   useEffect(() => {
-    if (gizmoMode === "draw" && appMode === "Rig" && !physicsEnabled) return;
+    if (outlinerParentDragSourceId === null) return;
+    const clearDrag = () => {
+      setOutlinerParentDragSourceId(null);
+      setOutlinerParentDropTargetId(null);
+    };
+    window.addEventListener("pointerup", clearDrag);
+    window.addEventListener("pointercancel", clearDrag);
+    window.addEventListener("blur", clearDrag);
+    return () => {
+      window.removeEventListener("pointerup", clearDrag);
+      window.removeEventListener("pointercancel", clearDrag);
+      window.removeEventListener("blur", clearDrag);
+    };
+  }, [outlinerParentDragSourceId]);
+
+  useEffect(() => {
+    if (gizmoMode === "draw" && appMode === "Rig" && !physicsEnabled) {
+      if (isTransformDragging || transformStartSnapshotRef.current !== null) {
+        endTransformChange();
+      }
+      clearSelection();
+      return;
+    }
     drawSessionRef.current = null;
     setDrawDraftActuators([]);
     setDrawCursor((previous) => ({ ...previous, visible: false }));
-  }, [appMode, gizmoMode, physicsEnabled]);
+    setDrawCursorHasInRangeAnchor(false);
+    setDrawHoverActuatorId(null);
+  }, [appMode, gizmoMode, isTransformDragging, physicsEnabled]);
 
   function onCanvasPointerMissed() {
     if (gizmoMode === "draw") return;
@@ -1547,6 +2099,12 @@ export default function App() {
       width: rect.width,
       height: rect.height,
     };
+  }
+
+  function isPointerInsideCanvas(clientX: number, clientY: number): boolean {
+    const local = clientToCanvasLocal(clientX, clientY);
+    if (local === null) return false;
+    return local.x >= 0 && local.y >= 0 && local.x <= local.width && local.y <= local.height;
   }
 
   function getActuatorScreenRect(actuator: ActuatorEntity): { minX: number; minY: number; maxX: number; maxY: number } | null {
@@ -1589,12 +2147,25 @@ export default function App() {
     return { minX: projectedMinX, minY: projectedMinY, maxX: projectedMaxX, maxY: projectedMaxY };
   }
 
-  function resolveDrawParentActuator(clientX: number, clientY: number, localX: number, localY: number): ActuatorEntity | null {
-    let parent = getActuatorHitAtPointer(clientX, clientY);
-    if (parent !== null) return parent;
+  function resolveDrawParentActuator(
+    clientX: number,
+    clientY: number,
+    localX: number,
+    localY: number,
+  ): { actuator: ActuatorEntity; center: Vec3; radiusPx: number } | null {
+    const directHit = getActuatorHitAtPointer(clientX, clientY);
+    if (directHit !== null) {
+      const center = getActuatorPrimitiveCenter(directHit);
+      const centerPoint = { x: center.x, y: center.y, z: center.z };
+      return {
+        actuator: directHit,
+        center: centerPoint,
+        radiusPx: computePixelsForWorldRadiusAtPoint(drawRadius, centerPoint),
+      };
+    }
 
     const candidates = appMode === "Rig" ? actuators.filter((actuator) => actuator.rigId === selectedRigId) : actuators;
-    let best: { actuator: ActuatorEntity; distanceSq: number } | null = null;
+    let best: { actuator: ActuatorEntity; center: Vec3; radiusPx: number; distanceSq: number } | null = null;
     for (const candidate of candidates) {
       const rect = getActuatorScreenRect(candidate);
       if (rect === null) continue;
@@ -1603,11 +2174,16 @@ export default function App() {
       const dx = localX - closestX;
       const dy = localY - closestY;
       const distanceSq = dx * dx + dy * dy;
+      const center = getActuatorPrimitiveCenter(candidate);
+      const centerPoint = { x: center.x, y: center.y, z: center.z };
+      const radiusPx = computePixelsForWorldRadiusAtPoint(drawRadius, centerPoint);
+      if (distanceSq > radiusPx * radiusPx) continue;
       if (best === null || distanceSq < best.distanceSq) {
-        best = { actuator: candidate, distanceSq };
+        best = { actuator: candidate, center: centerPoint, radiusPx, distanceSq };
       }
     }
-    return best?.actuator ?? null;
+    if (best === null) return null;
+    return { actuator: best.actuator, center: best.center, radiusPx: best.radiusPx };
   }
 
 
@@ -1793,32 +2369,36 @@ export default function App() {
     const updateDrawCursorPerFrame = () => {
       if (gizmoMode === "draw" && appMode === "Rig" && !physicsEnabled && drawCursor.visible) {
         const pointer = drawPointerClientRef.current;
-        let anchor = drawCursorAnchorPointRef.current;
         if (pointer !== null) {
-          const parent = getActuatorHitAtPointer(pointer.x, pointer.y);
-          if (parent !== null) {
-            const center = getActuatorPrimitiveCenter(parent);
-            anchor = { x: center.x, y: center.y, z: center.z };
-            drawCursorAnchorPointRef.current = anchor;
+          const local = clientToCanvasLocal(pointer.x, pointer.y);
+          if (local !== null) {
+            const resolved = resolveDrawParentActuator(pointer.x, pointer.y, local.x, local.y);
+            if (resolved !== null) {
+              drawCursorAnchorPointRef.current = resolved.center;
+              setDrawHoverActuatorId((previous) => (previous === resolved.actuator.id ? previous : resolved.actuator.id));
+              setDrawCursorHasInRangeAnchor((previous) => (previous ? previous : true));
+              setDrawCursorRadiusPx((prev) => (Math.abs(prev - resolved.radiusPx) > 0.2 ? resolved.radiusPx : prev));
+            } else {
+              drawCursorAnchorPointRef.current = null;
+              setDrawHoverActuatorId((previous) => (previous === null ? previous : null));
+              setDrawCursorHasInRangeAnchor((previous) => (previous ? false : previous));
+            }
+          } else {
+            drawCursorAnchorPointRef.current = null;
+            setDrawHoverActuatorId((previous) => (previous === null ? previous : null));
+            setDrawCursorHasInRangeAnchor((previous) => (previous ? false : previous));
           }
-        }
-        if (anchor === null && selectedActuatorId !== null) {
-          const selected = actuators.find((actuator) => actuator.id === selectedActuatorId);
-          if (selected !== undefined) {
-            const center = getActuatorPrimitiveCenter(selected);
-            anchor = { x: center.x, y: center.y, z: center.z };
-          }
-        }
-        if (anchor !== null) {
-          const nextRadiusPx = computePixelsForWorldRadiusAtPoint(drawRadius, anchor);
-          setDrawCursorRadiusPx((prev) => (Math.abs(prev - nextRadiusPx) > 0.2 ? nextRadiusPx : prev));
+        } else {
+          drawCursorAnchorPointRef.current = null;
+          setDrawHoverActuatorId((previous) => (previous === null ? previous : null));
+          setDrawCursorHasInRangeAnchor((previous) => (previous ? false : previous));
         }
       }
       frame = requestAnimationFrame(updateDrawCursorPerFrame);
     };
     frame = requestAnimationFrame(updateDrawCursorPerFrame);
     return () => cancelAnimationFrame(frame);
-  }, [actuators, appMode, drawCursor.visible, drawRadius, gizmoMode, physicsEnabled, selectedActuatorId]);
+  }, [actuators, appMode, drawCursor.visible, drawRadius, gizmoMode, physicsEnabled, selectedRigId]);
 
   useEffect(() => {
     if (gizmoMode !== "draw") {
@@ -1835,38 +2415,42 @@ export default function App() {
 
   const onInputAction = useCallback((action: InputAction) => {
     const pointer = action.pointer;
+    const pointerInsideCanvas =
+      pointer === null ? false : isPointerInsideCanvas(pointer.clientX, pointer.clientY);
+
     if (pointer !== null) {
       drawPointerClientRef.current = { x: pointer.clientX, y: pointer.clientY };
       drawPointerButtonsRef.current = pointer.buttons;
-      setDrawCursor({ x: pointer.localX, y: pointer.localY, visible: true });
+      setDrawCursor({ x: pointer.localX, y: pointer.localY, visible: pointerInsideCanvas });
+    } else {
+      setDrawHoverActuatorId(null);
+      setDrawCursorHasInRangeAnchor(false);
+      setDrawCursor((previous) => (previous.visible ? { ...previous, visible: false } : previous));
+    }
+
+    if (action.phase !== "OnRelease" && !pointerInsideCanvas && drawSessionRef.current === null) {
+      return;
     }
 
     if (action.phase === "OnMove") {
-      if (pointer === null) return;
-      const hit = getActuatorHitAtPointer(pointer.clientX, pointer.clientY);
-      if (drawSessionRef.current === null) {
-        if (hit !== null) {
-          setSelectionTransient([hit.id], hit.id);
-        } else {
-          setSelectionTransient([], null);
-        }
-      }
-      if (hit !== null) {
-        const parent = hit;
-        const center = getActuatorPrimitiveCenter(parent);
-        drawCursorAnchorPointRef.current = { x: center.x, y: center.y, z: center.z };
-        setDrawCursorRadiusPx(
-          computePixelsForWorldRadiusAtPoint(drawRadius, { x: center.x, y: center.y, z: center.z }),
-        );
+      if (!pointerInsideCanvas || pointer === null) return;
+      const resolved = resolveDrawParentActuator(pointer.clientX, pointer.clientY, pointer.localX, pointer.localY);
+      if (resolved !== null) {
+        drawCursorAnchorPointRef.current = resolved.center;
+        setDrawHoverActuatorId((previous) => (previous === resolved.actuator.id ? previous : resolved.actuator.id));
+        setDrawCursorHasInRangeAnchor((previous) => (previous ? previous : true));
+        setDrawCursorRadiusPx((prev) => (Math.abs(prev - resolved.radiusPx) > 0.2 ? resolved.radiusPx : prev));
       } else {
         drawCursorAnchorPointRef.current = null;
+        setDrawHoverActuatorId((previous) => (previous === null ? previous : null));
+        setDrawCursorHasInRangeAnchor((previous) => (previous ? false : previous));
       }
       return;
     }
 
     if (action.phase === "OnWheel") {
       if (action.control.kind !== "axis1") return;
-      if (!action.modifiers.ctrlKey) return;
+      if (!action.modifiers.shiftKey) return;
       const wheelDelta = action.control.value;
       setDrawRadius((current) => {
         const next = adjustDrawRadiusFromWheel(current, wheelDelta);
@@ -1880,35 +2464,23 @@ export default function App() {
     }
 
     if (action.phase === "OnPress") {
-      setDrawInteractionState("OnPress");
-      if (pointer === null) return;
+      if (pointer === null || !pointerInsideCanvas) return;
       if (action.modifiers.altKey) return;
       if (pointer.button !== 0) return;
       if (action.control.kind !== "button" || !action.control.pressed) return;
 
-      let parent = resolveDrawParentActuator(pointer.clientX, pointer.clientY, pointer.localX, pointer.localY);
-      if (parent === null) {
-        const selected = selectedActuatorId === null ? null : actuators.find((actuator) => actuator.id === selectedActuatorId) ?? null;
-        const fallbackRigRoot =
-          selected ??
-          actuators.find((actuator) => actuator.rigId === selectedRigId && actuator.parentId === null) ??
-          actuators.find((actuator) => actuator.parentId === null) ??
-          null;
-        parent = fallbackRigRoot;
-      }
-      if (parent === null) return;
-      setSelectionTransient([parent.id], parent.id);
-      const parentCenter = getActuatorPrimitiveCenter(parent);
-      drawCursorAnchorPointRef.current = { x: parentCenter.x, y: parentCenter.y, z: parentCenter.z };
-      const radiusPxAtParent = computePixelsForWorldRadiusAtPoint(drawRadius, {
-        x: parentCenter.x,
-        y: parentCenter.y,
-        z: parentCenter.z,
-      });
-      setDrawCursorRadiusPx(radiusPxAtParent);
+      const resolvedParent = resolveDrawParentActuator(pointer.clientX, pointer.clientY, pointer.localX, pointer.localY);
+      if (resolvedParent === null) return;
+      setDrawInteractionState("OnPress");
+      const parent = resolvedParent.actuator;
+      const parentCenter = resolvedParent.center;
+      drawCursorAnchorPointRef.current = parentCenter;
+      setDrawHoverActuatorId((previous) => (previous === parent.id ? previous : parent.id));
+      setDrawCursorHasInRangeAnchor(true);
+      setDrawCursorRadiusPx((prev) => (Math.abs(prev - resolvedParent.radiusPx) > 0.2 ? resolvedParent.radiusPx : prev));
 
       const camera = cameraRef.current as any;
-      const parentNdc = parentCenter.clone().project(camera);
+      const parentNdc = new Vector3(parentCenter.x, parentCenter.y, parentCenter.z).project(camera);
       const rect = (canvasWrapRef.current as HTMLDivElement).getBoundingClientRect();
       const startNdcX = ((pointer.clientX - rect.left) / rect.width) * 2 - 1;
       const startNdcY = -((pointer.clientY - rect.top) / rect.height) * 2 + 1;
@@ -1916,7 +2488,11 @@ export default function App() {
       const startCandidate = drawSnapEnabled
         ? snapPointToMirrorCenterline({ x: startWorld.x, y: startWorld.y, z: parentCenter.z })
         : { x: startWorld.x, y: startWorld.y, z: parentCenter.z };
-      const start = projectPointToActuatorCenterAxis(startCandidate, parent);
+      const snappedMidpoint = drawSnapEnabled
+        ? computeDrawSnapMidpointInActuator(pointer.clientX, pointer.clientY, parent)
+        : null;
+      const start =
+        snappedMidpoint ?? projectPointToActuatorCenterAxis(startCandidate, parent);
       let mirrorSpawn = shouldSpawnMirrored(start, drawMirrorEnabled);
       const mirrorParentId = mirrorSpawn ? resolveDrawMirrorParentId(parent.id, actuators) : null;
       if (mirrorSpawn && mirrorParentId === null) {
@@ -1943,60 +2519,9 @@ export default function App() {
     }
 
     if (action.phase === "OnDrag") {
-      if (pointer === null) return;
+      if (pointer === null || !pointerInsideCanvas) return;
       if (action.modifiers.altKey) return;
-      let drawSession = drawSessionRef.current;
-      const dragPressed = action.control.kind === "button" ? action.control.pressed : true;
-      if (drawSession === null && dragPressed) {
-        // Fallback: if browser/input path missed OnPress, bootstrap session from first drag sample.
-        const parent = resolveDrawParentActuator(pointer.clientX, pointer.clientY, pointer.localX, pointer.localY);
-        if (parent !== null) {
-          const parentCenter = getActuatorPrimitiveCenter(parent);
-          const camera = cameraRef.current as any;
-          const parentNdc = parentCenter.clone().project(camera);
-          const rect = (canvasWrapRef.current as HTMLDivElement).getBoundingClientRect();
-          const startNdcX = ((pointer.clientX - rect.left) / rect.width) * 2 - 1;
-          const startNdcY = -((pointer.clientY - rect.top) / rect.height) * 2 + 1;
-          const startWorld = new Vector3(startNdcX, startNdcY, parentNdc.z).unproject(camera);
-          const startCandidate = drawSnapEnabled
-            ? snapPointToMirrorCenterline({ x: startWorld.x, y: startWorld.y, z: parentCenter.z })
-            : { x: startWorld.x, y: startWorld.y, z: parentCenter.z };
-          const start = projectPointToActuatorCenterAxis(startCandidate, parent);
-          let mirrorSpawn = shouldSpawnMirrored(start, drawMirrorEnabled);
-          const mirrorParentId = mirrorSpawn ? resolveDrawMirrorParentId(parent.id, actuators) : null;
-          if (mirrorSpawn && mirrorParentId === null) {
-            mirrorSpawn = false;
-          }
-          drawSession = {
-            pointerId: pointer.pointerId,
-            startPoint: start,
-            endPoint: start,
-            worldRadius: drawRadius,
-            screenStartX: pointer.localX,
-            screenStartY: pointer.localY,
-            startNdcZ: parentNdc.z,
-            parentId: parent.id,
-            mirrorParentId,
-            rigId: parent.rigId,
-            mirrorSpawn,
-            preset: newActuatorPreset,
-          };
-          drawSessionRef.current = drawSession;
-          setDrawDraftActuators(
-            buildDrawDraftActuators(
-              start,
-              start,
-              drawRadius,
-              parent.rigId,
-              parent.id,
-              mirrorParentId,
-              mirrorSpawn,
-              newActuatorPreset,
-            ),
-          );
-          setDrawInteractionState("OnPress");
-        }
-      }
+      const drawSession = drawSessionRef.current;
       if (drawSession === null) return;
       setDrawInteractionState("OnDrag");
       const dragPoint = computeDrawDragPointFromScreen(drawSession, pointer.clientX, pointer.clientY);
@@ -2015,7 +2540,7 @@ export default function App() {
       drawSessionRef.current = null;
       setDrawDraftActuators([]);
     }
-  }, [actuators, drawMirrorEnabled, drawRadius, drawSnapEnabled, newActuatorPreset]);
+  }, [actuators, appMode, drawMirrorEnabled, drawRadius, drawSnapEnabled, newActuatorPreset, selectedRigId]);
 
   useInputRouter({
     targetRef: canvasWrapRef,
@@ -2057,7 +2582,15 @@ export default function App() {
           >
             Pose Mode
           </button>
-          <span className="app__header-hint">Alt+LMB orbit · MMB pan · RMB zoom · Ctrl+wheel draw radius</span>
+          <button
+            type="button"
+            onClick={xrMode === null ? requestEnterVr : requestExitVr}
+            disabled={xrBusy || (xrMode === null && !vrSupported)}
+            title={xrMode === null && !vrSupported ? "WebXR immersive VR is not available on this device/browser." : undefined}
+          >
+            {xrMode === null ? "Enter VR" : "Exit VR"}
+          </button>
+          <span className="app__header-hint">Alt+LMB orbit · MMB pan · RMB zoom · Shift+wheel draw radius</span>
         </div>
       </header>
       <section className="app__viewport">
@@ -2109,65 +2642,76 @@ export default function App() {
             <div className="app__panel-section-body">
               <div className="app__panel-tools">
                 <div className="app__tool-buttons">
-                  <button type="button" className={gizmoMode === "select" ? "is-selected" : ""} onClick={() => setGizmoMode("select")}>
-                    Select (Q)
-                  </button>
-                  <button type="button" className={gizmoMode === "translate" ? "is-selected" : ""} onClick={() => setGizmoMode("translate")}>
-                    Move (W)
-                  </button>
-                  <button type="button" className={gizmoMode === "rotate" ? "is-selected" : ""} onClick={() => setGizmoMode("rotate")}>
-                    Rotate (E)
-                  </button>
-                  <button type="button" className={gizmoMode === "scale" ? "is-selected" : ""} onClick={() => setGizmoMode("scale")}>
-                    Scale (R)
-                  </button>
-                  <button type="button" className={gizmoMode === "draw" ? "is-selected" : ""} onClick={() => setGizmoMode("draw")}>
-                    Draw (D)
-                  </button>
+                  {appMode === "Pose" ? (
+                    <button type="button" className={gizmoMode === "translate" ? "is-selected" : ""} onClick={() => setGizmoMode("translate")}>
+                      Grab (W)
+                    </button>
+                  ) : (
+                    <>
+                      <button type="button" className={gizmoMode === "select" ? "is-selected" : ""} onClick={() => setGizmoMode("select")}>
+                        Select (Q)
+                      </button>
+                      <button type="button" className={gizmoMode === "translate" ? "is-selected" : ""} onClick={() => setGizmoMode("translate")}>
+                        Move (W)
+                      </button>
+                      <button type="button" className={gizmoMode === "rotate" ? "is-selected" : ""} onClick={() => setGizmoMode("rotate")}>
+                        Rotate (E)
+                      </button>
+                      <button type="button" className={gizmoMode === "scale" ? "is-selected" : ""} onClick={() => setGizmoMode("scale")}>
+                        Scale (R)
+                      </button>
+                      <button type="button" className={gizmoMode === "draw" ? "is-selected" : ""} onClick={() => setGizmoMode("draw")}>
+                        Draw (D)
+                      </button>
+                    </>
+                  )}
                 </div>
+                {appMode === "Rig" ? (
+                  <>
+                    <div className="app__tool-row app__tool-row--dual">
+                      <label htmlFor="space-select">Orientation</label>
+                      <select id="space-select" value={gizmoSpace} onChange={(event) => setGizmoSpace(event.target.value as "world" | "local") }>
+                        <option value="world">World</option>
+                        <option value="local">Local</option>
+                      </select>
+                      <label htmlFor="pivot-select">Pivot</label>
+                      <select id="pivot-select" value={pivotMode} onChange={(event) => setPivotMode(event.target.value as PivotMode)}>
+                        <option value="object">Object Center</option>
+                        <option value="world">World Origin</option>
+                      </select>
+                    </div>
+                    <div className="app__tool-separator" />
+                  </>
+                ) : null}
+                {appMode === "Rig" ? (
+                  <div className="app__tool-row">
+                    <label htmlFor="new-actuator-shape">New Actuator</label>
+                    <select
+                      id="new-actuator-shape"
+                      value={newActuatorShape}
+                      onChange={(event) => setNewActuatorShape(event.target.value as ActuatorShape)}
+                    >
+                      <option value="capsule">Capsule (Default)</option>
+                      <option value="sphere">Sphere</option>
+                      <option value="box">Box</option>
+                    </select>
+                  </div>
+                ) : null}
                 <div className="app__tool-row">
-                  <label htmlFor="space-select">Orientation</label>
-                  <select id="space-select" value={gizmoSpace} onChange={(event) => setGizmoSpace(event.target.value as "world" | "local") }>
-                    <option value="world">World</option>
-                    <option value="local">Local</option>
-                  </select>
-                </div>
-                <div className="app__tool-row">
-                  <label htmlFor="pivot-select">Pivot</label>
-                  <select id="pivot-select" value={pivotMode} onChange={(event) => setPivotMode(event.target.value as PivotMode)}>
-                    <option value="object">Object Center</option>
-                    <option value="world">World Origin</option>
-                  </select>
-                </div>
-                <div className="app__tool-row">
-                  <label htmlFor="rig-select">Active Rig</label>
-                  <select id="rig-select" value={selectedRigId} onChange={(event) => setActiveRig(event.target.value)}>
-                    {rigIds.map((rigId) => (
-                      <option key={rigId} value={rigId}>
-                        {rigId}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="app__tool-row">
-                  <label htmlFor="new-actuator-shape">New Actuator</label>
-                  <select
-                    id="new-actuator-shape"
-                    value={newActuatorShape}
-                    onChange={(event) => setNewActuatorShape(event.target.value as ActuatorShape)}
-                  >
-                    <option value="capsule">Capsule (Default)</option>
-                    <option value="sphere">Sphere</option>
-                    <option value="box">Box</option>
-                  </select>
-                </div>
-                <div className="app__tool-row">
-                  <label htmlFor="new-actuator-preset">New Preset</label>
+                  <label htmlFor="new-actuator-preset">Preset</label>
                   <select
                     id="new-actuator-preset"
-                    value={newActuatorPreset}
-                    onChange={(event) => setNewActuatorPreset(event.target.value as ActuatorPreset)}
+                    value={presetSelectValue}
+                    onChange={(event) => {
+                      if (event.target.value === MIXED_PRESET_VALUE) return;
+                      const nextPreset = event.target.value as ActuatorPreset;
+                      setNewActuatorPreset(nextPreset);
+                      applyPresetToSelection(nextPreset);
+                    }}
                   >
+                    {presetSelectValue === MIXED_PRESET_VALUE ? (
+                      <option value={MIXED_PRESET_VALUE}>Mixed (multi-select)</option>
+                    ) : null}
                     {ACTUATOR_PRESET_OPTIONS.map((preset) => (
                       <option key={preset} value={preset}>
                         {preset}
@@ -2175,114 +2719,110 @@ export default function App() {
                     ))}
                   </select>
                 </div>
-                <div className="app__tool-row">
-                  <label htmlFor="draw-radius">Draw Radius</label>
-                  <input
-                    id="draw-radius"
-                    type="number"
-                    min={0.01}
-                    max={1}
-                    step={0.01}
-                    value={drawRadius}
-                    onChange={(event) => {
-                      const parsed = Number(event.target.value);
-                      if (!Number.isFinite(parsed)) return;
-                      setDrawRadius(Math.max(0.01, Math.min(1, parsed)));
-                    }}
-                  />
-                </div>
-                <div className="app__tool-row">
-                  <label htmlFor="draw-mirror-toggle">Draw Mirror</label>
-                  <select
-                    id="draw-mirror-toggle"
-                    value={drawMirrorEnabled ? "on" : "off"}
-                    onChange={(event) => setDrawMirrorEnabled(event.target.value === "on")}
-                  >
-                    <option value="on">On</option>
-                    <option value="off">Off</option>
-                  </select>
-                </div>
-                <div className="app__tool-row">
-                  <label htmlFor="draw-snap-toggle">Draw Center Snap</label>
-                  <select
-                    id="draw-snap-toggle"
-                    value={drawSnapEnabled ? "on" : "off"}
-                    onChange={(event) => setDrawSnapEnabled(event.target.value === "on")}
-                  >
-                    <option value="on">On</option>
-                    <option value="off">Off</option>
-                  </select>
-                </div>
-                <div className="app__tool-row">
-                  <label htmlFor="delta-mush-toggle">Delta Mush</label>
-                  <select
-                    id="delta-mush-toggle"
-                    value={deltaMushEnabled ? "on" : "off"}
-                    onChange={(event) => setDeltaMushEnabled(event.target.value === "on")}
-                  >
-                    <option value="on">On</option>
-                    <option value="off">Off</option>
-                  </select>
-                </div>
-                <div className="app__tool-row">
-                  <label htmlFor="delta-mush-iterations">Mush Iterations</label>
-                  <input
-                    id="delta-mush-iterations"
-                    type="number"
-                    min={0}
-                    max={12}
-                    step={1}
-                    value={deltaMushSettings.iterations}
-                    onChange={(event) => {
-                      const parsed = Number(event.target.value);
-                      const nextIterations = Number.isFinite(parsed)
-                        ? Math.max(0, Math.min(12, Math.round(parsed)))
-                        : DEFAULT_DELTA_MUSH_SETTINGS.iterations;
-                      setDeltaMushSettings((previous) => ({
-                        ...previous,
-                        iterations: nextIterations,
-                      }));
-                    }}
-                  />
-                </div>
-                <div className="app__tool-row">
-                  <label htmlFor="delta-mush-strength">Mush Strength</label>
-                  <input
-                    id="delta-mush-strength"
-                    type="number"
-                    min={0}
-                    max={1}
-                    step={0.05}
-                    value={deltaMushSettings.strength}
-                    onChange={(event) => {
-                      const parsed = Number(event.target.value);
-                      const nextStrength = Number.isFinite(parsed)
-                        ? Math.max(0, Math.min(1, parsed))
-                        : DEFAULT_DELTA_MUSH_SETTINGS.strength;
-                      setDeltaMushSettings((previous) => ({
-                        ...previous,
-                        strength: nextStrength,
-                      }));
-                    }}
-                  />
-                </div>
+                <div className="app__tool-separator" />
+                {appMode === "Rig" && gizmoMode === "draw" ? (
+                  <>
+                    <div className="app__tool-row">
+                      <label htmlFor="draw-radius">Draw Radius</label>
+                      <input
+                        id="draw-radius"
+                        type="number"
+                        min={0.01}
+                        max={1}
+                        step={0.01}
+                        value={drawRadius}
+                        onChange={(event) => {
+                          const parsed = Number(event.target.value);
+                          if (!Number.isFinite(parsed)) return;
+                          setDrawRadius(Math.max(0.01, Math.min(1, parsed)));
+                        }}
+                      />
+                    </div>
+                    <div className="app__tool-row">
+                      <label htmlFor="draw-mirror-toggle">Draw Mirror</label>
+                      <select
+                        id="draw-mirror-toggle"
+                        value={drawMirrorEnabled ? "on" : "off"}
+                        onChange={(event) => setDrawMirrorEnabled(event.target.value === "on")}
+                      >
+                        <option value="on">On</option>
+                        <option value="off">Off</option>
+                      </select>
+                    </div>
+                    <div className="app__tool-row">
+                      <label htmlFor="draw-snap-toggle">Draw Center Snap</label>
+                      <select
+                        id="draw-snap-toggle"
+                        value={drawSnapEnabled ? "on" : "off"}
+                        onChange={(event) => setDrawSnapEnabled(event.target.value === "on")}
+                      >
+                        <option value="on">On</option>
+                        <option value="off">Off</option>
+                      </select>
+                    </div>
+                  </>
+                ) : null}
+                <details className="app__nested-settings">
+                  <summary className="app__nested-settings-header">Delta Mush Settings</summary>
+                  <div className="app__nested-settings-body">
+                    <div className="app__tool-row">
+                      <label htmlFor="delta-mush-toggle">Delta Mush</label>
+                      <select
+                        id="delta-mush-toggle"
+                        value={deltaMushEnabled ? "on" : "off"}
+                        onChange={(event) => setDeltaMushEnabled(event.target.value === "on")}
+                      >
+                        <option value="on">On</option>
+                        <option value="off">Off</option>
+                      </select>
+                    </div>
+                    <div className="app__tool-row">
+                      <label htmlFor="delta-mush-iterations">Mush Iterations</label>
+                      <input
+                        id="delta-mush-iterations"
+                        type="number"
+                        min={0}
+                        max={12}
+                        step={1}
+                        value={deltaMushSettings.iterations}
+                        onChange={(event) => {
+                          const parsed = Number(event.target.value);
+                          const nextIterations = Number.isFinite(parsed)
+                            ? Math.max(0, Math.min(12, Math.round(parsed)))
+                            : DEFAULT_DELTA_MUSH_SETTINGS.iterations;
+                          setDeltaMushSettings((previous) => ({
+                            ...previous,
+                            iterations: nextIterations,
+                          }));
+                        }}
+                      />
+                    </div>
+                    <div className="app__tool-row">
+                      <label htmlFor="delta-mush-strength">Mush Strength</label>
+                      <input
+                        id="delta-mush-strength"
+                        type="number"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={deltaMushSettings.strength}
+                        onChange={(event) => {
+                          const parsed = Number(event.target.value);
+                          const nextStrength = Number.isFinite(parsed)
+                            ? Math.max(0, Math.min(1, parsed))
+                            : DEFAULT_DELTA_MUSH_SETTINGS.strength;
+                          setDeltaMushSettings((previous) => ({
+                            ...previous,
+                            strength: nextStrength,
+                          }));
+                        }}
+                      />
+                    </div>
+                  </div>
+                </details>
               </div>
             </div>
           </details>
-
-          <details className="app__panel-section" open>
-            <summary className="app__panel-section-header">Status</summary>
-            <div className="app__panel-section-body">
-              <div className="app__panel-status">
-                <strong>Rig:</strong> {selectedRigId} | <strong>Selected:</strong>{" "}
-                {selectedActuatorIds.length === 0 ? "none" : `${selectedActuatorIds.length} (active: ${selectedActuatorId})`}
-                <br />
-                <strong>Skin:</strong> {skinningStats.vertexCount} verts � {skinningStats.capsuleCount} capsules � avg w{" "}
-                {skinningStats.averageWeight.toFixed(3)}
-              </div>
-            </div>
-          </details>
-
           <details className="app__panel-section app__panel-section--fill" open>
             <summary className="app__panel-section-header">Outliner</summary>
             <div className="app__panel-section-body app__panel-section-body--fill">
@@ -2304,12 +2844,39 @@ export default function App() {
                       </li>
                     );
                   }
+                  if (entry.kind === "mesh") {
+                    const { meshSource, depth, rigId } = entry;
+                    return (
+                      <li key={`mesh:${rigId}:${meshSource.id}`} className="app__outliner-item app__outliner-item--mesh">
+                        <span className="app__outliner-indent" style={{ width: depth * 16 + 4 }} />
+                        <button type="button" className="app__outliner-toggle" disabled tabIndex={-1} aria-hidden>
+                          {" "}
+                        </button>
+                        <span className="app__outliner-icon app__outliner-icon--mesh" />
+                        <span className="app__outliner-label app__outliner-label--readonly">{meshSource.id}</span>
+                      </li>
+                    );
+                  }
                   const { actuator, depth, hasChildren } = entry;
                   const isSelected = selectedActuatorIds.includes(actuator.id);
+                  const isParentDragSource = outlinerParentDragSourceId === actuator.id;
+                  const isParentDropTarget = outlinerParentDropTargetId === actuator.id;
                   return (
                     <li
                       key={actuator.id}
-                      className={`app__outliner-item${isSelected ? " is-selected" : ""}`}
+                      className={
+                        `app__outliner-item${isSelected ? " is-selected" : ""}` +
+                        `${isParentDragSource ? " is-parent-drag-source" : ""}` +
+                        `${isParentDropTarget ? " is-parent-drop-target" : ""}`
+                      }
+                      onPointerDown={(event) => beginOutlinerParentDrag(event, actuator.id)}
+                      onPointerEnter={() => updateOutlinerParentDropTarget(actuator.id)}
+                      onPointerLeave={() => {
+                        if (outlinerParentDropTargetId === actuator.id) {
+                          setOutlinerParentDropTargetId(null);
+                        }
+                      }}
+                      onPointerUp={(event) => completeOutlinerParentDrag(event, actuator.id)}
                     >
                       <span className="app__outliner-indent" style={{ width: depth * 16 + 4 }} />
                       <button
@@ -2334,9 +2901,9 @@ export default function App() {
                             toggle: event.ctrlKey || event.metaKey,
                           })
                         }
-                      >
-                        {actuator.id}
-                      </button>
+                        >
+                          {actuator.id}
+                        </button>
                     </li>
                   );
                 })}
@@ -2344,10 +2911,16 @@ export default function App() {
             </div>
           </details>
 
-          <details className="app__panel-section app__panel-section--json" open>
-            <summary className="app__panel-section-header">Serialized SceneDocument</summary>
-            <div className="app__panel-section-body app__panel-section-body--json">
-              <textarea id="scene-json" className="app__serialized" value={serializedScene} readOnly />
+          <details className="app__panel-section app__panel-section--status" open>
+            <summary className="app__panel-section-header">Status</summary>
+            <div className="app__panel-section-body">
+              <div className="app__panel-status">
+                <strong>Rig:</strong> {selectedRigId} | <strong>Selected:</strong>{" "}
+                {selectedActuatorIds.length === 0 ? "none" : `${selectedActuatorIds.length} (active: ${selectedActuatorId})`}
+                <br />
+                <strong>Skin:</strong> {skinningStats.vertexCount} verts · {skinningStats.capsuleCount} capsules · avg w{" "}
+                {skinningStats.averageWeight.toFixed(3)}
+              </div>
             </div>
           </details>
         </aside>
@@ -2376,14 +2949,14 @@ export default function App() {
               {viewProjection === "perspective" ? (
                 <PerspectiveCamera makeDefault position={[2.5, 2.5, 3]} fov={50} near={0.01} far={800} />
               ) : (
-                <OrthographicCamera makeDefault position={[2.5, 2.5, 3]} zoom={120} near={0.01} far={800} />
+                <OrthographicCamera makeDefault position={[2.5, 2.5, 3]} zoom={120} near={-1000} far={2000} />
               )}
               <PlaybackDriver onStep={onPlaybackStep} />
               <DesktopInertialCameraControls
                 blocked={isTransformDragging || isPosePullDragging}
                 focusRequest={focusRequest}
                 focusNonce={focusNonce}
-                suppressCtrlWheelZoom={gizmoMode === "draw" && appMode === "Rig" && !physicsEnabled}
+                suppressShiftWheelZoom={gizmoMode === "draw" && appMode === "Rig" && !physicsEnabled}
                 viewDirectionRequest={viewDirectionRequest}
                 viewDirectionNonce={viewDirectionNonce}
                 onActiveCameraChange={onActiveCameraChange}
@@ -2416,20 +2989,18 @@ export default function App() {
                 onTransformEnd={endTransformChange}
                 onPosePullDraggingChange={setIsPosePullDragging}
                 onDrawSurfaceRef={setDrawSurfaceRef}
+                drawHoverActuatorId={drawHoverActuatorId}
               />
             </XR>
           </Canvas>
           <ViewCube
             cameraRef={cameraRef}
-            projection={viewProjection}
-            onToggleProjection={() => {
-              setViewProjection((value) => (value === "perspective" ? "orthographic" : "perspective"));
-            }}
+            onToggleProjection={toggleProjectionKeepView}
             onRequestViewDirection={requestViewDirection}
           />
           {gizmoMode === "draw" && appMode === "Rig" && !physicsEnabled && drawCursor.visible ? (
             <div
-              className="app__draw-cursor"
+              className={`app__draw-cursor${drawCursorHasInRangeAnchor ? "" : " app__draw-cursor--inactive"}`}
               style={{
                 left: drawCursor.x,
                 top: drawCursor.y,

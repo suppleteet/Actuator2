@@ -1,4 +1,4 @@
-import { createRef, useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type RefObject } from "react";
+import { createRef, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MutableRefObject, type RefObject } from "react";
 import { useFrame, useThree } from "@react-three/fiber";
 import { TransformControls } from "@react-three/drei";
 import {
@@ -17,7 +17,7 @@ import {
 } from "@react-three/rapier";
 import type { ImpulseJoint, RigidBody as RawRigidBody } from "@dimforge/rapier3d-compat";
 import { useXR } from "@react-three/xr";
-import { Color, DoubleSide, Matrix4, Mesh, Object3D, Plane, Quaternion, ShaderMaterial, Vector3 } from "three";
+import { Color, Matrix4, MeshStandardMaterial, NormalBlending, Object3D, Plane, Quaternion, Vector3 } from "three";
 import {
   getActuatorPivotWorldPosition,
   getActuatorPrimitiveCenter,
@@ -72,10 +72,17 @@ export type SceneContentProps = {
   onClearSelection: () => void;
   onActuatorRef: (id: string, object: Object3D | null) => void;
   onTransformStart: () => void;
-  onTransformChange: (id: string, worldDelta: Matrix4, localDelta: Matrix4, worldOffset: Vec3) => void;
+  onTransformChange: (
+    id: string,
+    worldDelta: Matrix4,
+    localDelta: Matrix4,
+    worldOffset: Vec3,
+    options?: { includeDescendants?: boolean },
+  ) => void;
   onTransformEnd: () => void;
   onPosePullDraggingChange: (active: boolean) => void;
   onDrawSurfaceRef: (id: string, object: Object3D | null) => void;
+  drawHoverActuatorId: string | null;
 };
 
 type ActuatorSphericalJointProps = {
@@ -264,11 +271,12 @@ function PosePhysicsBridge({
       }
 
       const linearVelocity = body.linvel();
+      const safeLinearVelocity = isFiniteVec3(linearVelocity) ? linearVelocity : ({ x: 0, y: 0, z: 0 } as const);
       if (!isFiniteVec3(linearVelocity)) {
         body.setLinvel({ x: 0, y: 0, z: 0 }, true);
       }
 
-      const sampledPosition = body.translation();
+      let sampledPosition = body.translation();
       if (
         !isFiniteVec3(sampledPosition) ||
         Math.abs(sampledPosition.x) > maxDistance ||
@@ -277,6 +285,7 @@ function PosePhysicsBridge({
       ) {
         body.setTranslation(target.position, true);
         body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+        sampledPosition = target.position;
       }
 
       const currentRotation = body.rotation();
@@ -291,29 +300,111 @@ function PosePhysicsBridge({
         continue;
       }
       const drive = getRuntimeDriveFromPreset(actuator);
+      const positionSpring = {
+        // Pose recovery should always provide some positional return force,
+        // even for presets with zero authored position spring.
+        stiffness: Math.max(8, drive.positionStiffness),
+        damping: Math.max(1.2, drive.positionDamping),
+        maxLinearSpeed: Math.max(1, drive.positionStiffness * 0.04),
+        deadband: 0.0006,
+      };
       const rotationSpring = {
-        stiffness: Math.max(0, drive.rotationStiffness * Math.max(0, physicsTuning.rotationStiffness)),
+        stiffness: Math.max(0.45, drive.rotationStiffness * Math.max(0, physicsTuning.rotationStiffness)),
         velocityBlend: Math.max(
-          0,
+          0.08,
           Math.min(1, drive.rotationVelocityBlend * Math.max(0, physicsTuning.rotationVelocityBlend)),
         ),
-        maxAngularSpeed: Math.max(0.1, drive.maxAngularSpeed * Math.max(0.1, physicsTuning.maxAngularSpeed)),
+        maxAngularSpeed: Math.max(0.8, drive.maxAngularSpeed * Math.max(0.1, physicsTuning.maxAngularSpeed)),
         deadband: 0.0006,
       };
       if (actuator.parentId === null) {
-        body.setNextKinematicTranslation(target.position);
-        body.setNextKinematicRotation(target.rotation);
-        body.setLinvel({ x: 0, y: 0, z: 0 }, true);
-        body.setAngvel({ x: 0, y: 0, z: 0 }, true);
-        if (actuator.id === grabbedActuatorId) {
-          continue;
+        if (actuator.id === grabbedActuatorId) continue;
+
+        const rootError = new Vector3(
+          target.position.x - sampledPosition.x,
+          target.position.y - sampledPosition.y,
+          target.position.z - sampledPosition.z,
+        );
+        const rootDistance = rootError.length();
+        const rootCurrentVelocity = new Vector3(safeLinearVelocity.x, safeLinearVelocity.y, safeLinearVelocity.z);
+        const rootPositionGain = Math.max(2.8, Math.min(26, positionSpring.stiffness * 0.09));
+        const rootVelocityDamping = Math.max(1.4, Math.min(9, positionSpring.damping * 0.11));
+        const desiredRootVelocity =
+          rootDistance <= positionSpring.deadband
+            ? rootCurrentVelocity.multiplyScalar(0.4)
+            : rootError.multiplyScalar(rootPositionGain).addScaledVector(rootCurrentVelocity, -rootVelocityDamping);
+        const maxRootSpeed = Math.max(0.35, Math.min(4.2, positionSpring.maxLinearSpeed * 0.95));
+        const desiredRootSpeed = desiredRootVelocity.length();
+        if (desiredRootSpeed > maxRootSpeed) {
+          desiredRootVelocity.multiplyScalar(maxRootSpeed / desiredRootSpeed);
         }
+
+        const rootCurrentQ = new Quaternion(currentRotation.x, currentRotation.y, currentRotation.z, currentRotation.w);
+        const rootTargetQ = new Quaternion(target.rotation.x, target.rotation.y, target.rotation.z, target.rotation.w);
+        const rootDeltaQ = rootTargetQ.clone().multiply(rootCurrentQ.clone().invert()).normalize();
+        if (rootDeltaQ.w < 0) {
+          rootDeltaQ.x = -rootDeltaQ.x;
+          rootDeltaQ.y = -rootDeltaQ.y;
+          rootDeltaQ.z = -rootDeltaQ.z;
+          rootDeltaQ.w = -rootDeltaQ.w;
+        }
+        const rootAngularVelocity = new Vector3(angularVelocity.x, angularVelocity.y, angularVelocity.z);
+        const rootSinHalfAngle = Math.sqrt(
+          rootDeltaQ.x * rootDeltaQ.x +
+          rootDeltaQ.y * rootDeltaQ.y +
+          rootDeltaQ.z * rootDeltaQ.z,
+        );
+        let desiredRootAngularVelocity = rootAngularVelocity.clone().multiplyScalar(0.7);
+        if (rootSinHalfAngle >= 1e-6) {
+          const rootAxisScale = 1 / rootSinHalfAngle;
+          const rootAngle = 2 * Math.atan2(rootSinHalfAngle, Math.max(-1, Math.min(1, rootDeltaQ.w)));
+          const rootErrorAxis = new Vector3(
+            rootDeltaQ.x * rootAxisScale,
+            rootDeltaQ.y * rootAxisScale,
+            rootDeltaQ.z * rootAxisScale,
+          ).multiplyScalar(rootAngle);
+          const rootRotationGain = Math.max(0.5, Math.min(3.8, rotationSpring.stiffness * 0.24));
+          const rootAngularDamping = Math.max(2.2, Math.min(7, 2 + rotationSpring.velocityBlend * 5.5));
+          desiredRootAngularVelocity = rootErrorAxis.addScaledVector(rootAngularVelocity, -rootAngularDamping);
+          desiredRootAngularVelocity.multiplyScalar(rootRotationGain);
+        }
+        const maxRootAngularSpeed = Math.max(0.35, Math.min(3, rotationSpring.maxAngularSpeed * 0.36));
+        const desiredRootAngularSpeed = desiredRootAngularVelocity.length();
+        if (desiredRootAngularSpeed > maxRootAngularSpeed) {
+          desiredRootAngularVelocity.multiplyScalar(maxRootAngularSpeed / desiredRootAngularSpeed);
+        }
+
+        body.setLinvel({ x: desiredRootVelocity.x, y: desiredRootVelocity.y, z: desiredRootVelocity.z }, true);
+        body.setAngvel(
+          { x: desiredRootAngularVelocity.x, y: desiredRootAngularVelocity.y, z: desiredRootAngularVelocity.z },
+          true,
+        );
         continue;
       }
       if (actuator.id === grabbedActuatorId) continue;
       const parentBody = bodyRefs[actuator.parentId]?.current;
       const parentTarget = targetPoseRef.current[actuator.parentId];
       if (parentBody === undefined || parentBody === null || parentTarget === undefined) continue;
+
+      const childPositionError = new Vector3(
+        target.position.x - sampledPosition.x,
+        target.position.y - sampledPosition.y,
+        target.position.z - sampledPosition.z,
+      );
+      const childDistance = childPositionError.length();
+      const childCurrentVelocity = new Vector3(safeLinearVelocity.x, safeLinearVelocity.y, safeLinearVelocity.z);
+      const childPositionGain = Math.max(1.3, Math.min(14, positionSpring.stiffness * 0.07));
+      const childVelocityDamping = Math.max(0.5, Math.min(6, positionSpring.damping * 0.09));
+      const desiredChildVelocity =
+        childDistance <= positionSpring.deadband
+          ? childCurrentVelocity.multiplyScalar(0.5)
+          : childPositionError.multiplyScalar(childPositionGain).addScaledVector(childCurrentVelocity, -childVelocityDamping);
+      const maxChildSpeed = Math.max(0.35, Math.min(3.4, positionSpring.maxLinearSpeed * 0.75));
+      const desiredChildSpeed = desiredChildVelocity.length();
+      if (desiredChildSpeed > maxChildSpeed) {
+        desiredChildVelocity.multiplyScalar(maxChildSpeed / desiredChildSpeed);
+      }
+      body.setLinvel({ x: desiredChildVelocity.x, y: desiredChildVelocity.y, z: desiredChildVelocity.z }, true);
 
       const parentRotation = parentBody.rotation();
       if (!isFiniteQuat(parentRotation)) continue;
@@ -444,9 +535,9 @@ const UNITY_ACTUATOR_PRESET_COLORS: Record<ActuatorPreset, { r: number; g: numbe
 };
 
 const UNITY_ACTUATOR_STATE_ALPHA: Record<ActuatorVisualState, number> = {
-  Enabled: 0.2,
-  Hovering: 0.4,
-  Selected: 0.6,
+  Enabled: 0.16,
+  Hovering: 0.42,
+  Selected: 0.95,
   Disabled: 0.025,
 };
 
@@ -456,39 +547,25 @@ function getActuatorVisualState(isSelected: boolean, isHovered: boolean): Actuat
   return "Enabled";
 }
 
-function getUnityActuatorVisual(actuator: Pick<ActuatorEntity, "preset" | "type">, state: ActuatorVisualState) {
+function getUnityActuatorVisual(
+  actuator: Pick<ActuatorEntity, "preset" | "type">,
+  state: ActuatorVisualState,
+) {
   const preset = actuator.preset ?? defaultPresetForActuatorType(actuator.type);
   const baseColor = UNITY_ACTUATOR_PRESET_COLORS[preset];
   const alpha = UNITY_ACTUATOR_STATE_ALPHA[state];
-  const lift = alpha * 0.3;
+  const highlight = state === "Selected" ? 0.34 : state === "Hovering" ? 0.16 : 0;
+  const lift = state === "Selected" ? 0.08 : state === "Hovering" ? 0.04 : 0.015;
+  const r = Math.min(1, baseColor.r + (1 - baseColor.r) * highlight + lift);
+  const g = Math.min(1, baseColor.g + (1 - baseColor.g) * highlight + lift);
+  const b = Math.min(1, baseColor.b + (1 - baseColor.b) * highlight + lift);
   return {
-    r: baseColor.r + lift,
-    g: baseColor.g + lift,
-    b: baseColor.b + lift,
+    r,
+    g,
+    b,
     alpha,
   };
 }
-
-const ACTUATOR_VERTEX_SHADER = `
-varying vec3 vViewNormal;
-
-void main() {
-  vViewNormal = normalize(normalMatrix * normal);
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-}
-`;
-
-const ACTUATOR_FRAGMENT_SHADER = `
-uniform vec3 uColor;
-uniform float uOpacity;
-varying vec3 vViewNormal;
-
-void main() {
-  vec3 color = uColor;
-  color *= (0.7 * vViewNormal.z + 0.3);
-  gl_FragColor = vec4(color, uOpacity);
-}
-`;
 
 export function SceneContent({
   meshSources,
@@ -518,11 +595,16 @@ export function SceneContent({
   onTransformEnd,
   onPosePullDraggingChange,
   onDrawSurfaceRef,
+  drawHoverActuatorId,
 }: SceneContentProps) {
   const { scene } = useThree();
   const xrMode = useXR((state) => state.mode);
   const isInXR = xrMode !== null;
-  const selectedIdSet = useMemo(() => new Set(selectedActuatorIds), [selectedActuatorIds]);
+  const selectedIdSet = useMemo(() => {
+    const resolved = new Set(selectedActuatorIds);
+    if (selectedActuatorId !== null) resolved.add(selectedActuatorId);
+    return resolved;
+  }, [selectedActuatorId, selectedActuatorIds]);
   const actuatorById = useMemo(() => new Map(actuators.map((actuator) => [actuator.id, actuator])), [actuators]);
   const pivotObjectRef = useRef<Object3D>(new Object3D());
   const transformControlsRef = useRef<any>(null);
@@ -534,7 +616,9 @@ export function SceneContent({
   const isDragActiveRef = useRef(false);
   const hasAcceptedDragFrameRef = useRef(false);
   const [hoveredId, setHoveredId] = useState<string | null>(null);
-  const materialRefs = useRef<Record<string, ShaderMaterial | null>>({});
+  const [isAltPressed, setIsAltPressed] = useState(false);
+  const isShiftPressedRef = useRef(false);
+  const materialRefs = useRef<Record<string, MeshStandardMaterial | null>>({});
   const opacityRef = useRef(appMode === "Pose" ? 0.32 : 1);
   const opacityVelocityRef = useRef(0);
   const backgroundBlendRef = useRef(appMode === "Pose" ? 1 : 0);
@@ -754,9 +838,63 @@ export function SceneContent({
 
   useEffect(() => clearPosePullState, [clearPosePullState]);
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Alt") setIsAltPressed(true);
+      if (event.key === "Shift") isShiftPressedRef.current = true;
+    };
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.key === "Alt") setIsAltPressed(false);
+      if (event.key === "Shift") isShiftPressedRef.current = false;
+    };
+    const onBlur = () => {
+      setIsAltPressed(false);
+      isShiftPressedRef.current = false;
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isAltPressed || !isDragActiveRef.current) return;
+    isDragActiveRef.current = false;
+    hasAcceptedDragFrameRef.current = false;
+    dragActuatorIdRef.current = null;
+    onTransformEnd();
+  }, [isAltPressed, onTransformEnd]);
+
+  useEffect(() => {
+    const isTransformMode = gizmoMode === "translate" || gizmoMode === "rotate" || gizmoMode === "scale";
+    if (isTransformMode) return;
+    if (!isDragActiveRef.current && dragActuatorIdRef.current === null) return;
+    isDragActiveRef.current = false;
+    hasAcceptedDragFrameRef.current = false;
+    dragActuatorIdRef.current = null;
+    onTransformEnd();
+  }, [gizmoMode, onTransformEnd]);
+
+  useEffect(() => {
+    setHoveredId(null);
+  }, [appMode, gizmoMode, physicsEnabled, selectedActuatorId]);
+
+  useEffect(() => {
+    const targetOpacity = appMode === "Pose" ? 0.32 : 1;
+    opacityRef.current = targetOpacity;
+    opacityVelocityRef.current = 0;
+    const targetBlend = appMode === "Pose" ? 1 : 0;
+    backgroundBlendRef.current = targetBlend;
+    backgroundBlendVelocityRef.current = 0;
+  }, [appMode]);
+
   function syncPivotFromSelection() {
     const pivotObject = pivotObjectRef.current;
-    if (isTransformDragging || isDragActiveRef.current) return;
+    if (isDragActiveRef.current) return;
 
     if (pivotMode === "world") {
       pivotObject.position.set(0, 0, 0);
@@ -766,8 +904,11 @@ export function SceneContent({
       return;
     }
 
-    if (selectedActuatorId !== null) {
-      const selectedActuator = actuators.find((actuator) => actuator.id === selectedActuatorId);
+    const primarySelectionId = selectedActuatorId ?? selectedActuatorIds[0] ?? null;
+    if (primarySelectionId !== null) {
+      const selectedActuator =
+        actuators.find((actuator) => actuator.id === primarySelectionId) ??
+        actuators.find((actuator) => selectedIdSet.has(actuator.id));
       if (selectedActuator === undefined) return;
       const pivotWorld = getActuatorPivotWorldPosition(selectedActuator);
       pivotObject.position.set(pivotWorld.x, pivotWorld.y, pivotWorld.z);
@@ -784,63 +925,60 @@ export function SceneContent({
 
   useEffect(() => {
     syncPivotFromSelection();
-  }, [isTransformDragging, pivotMode, selectedActuatorId, actuators]);
+  }, [actuators, isTransformDragging, pivotMode, selectedActuatorId, selectedActuatorIds, selectedIdSet]);
 
-  useEffect(() => {
-    const controls = transformControlsRef.current;
-    if (controls === null || controls === undefined) return;
-
-    controls.traverse((object: Object3D) => {
-      const mesh = object as Mesh;
-      if (!mesh.isMesh) return;
-
-      const material = mesh.material;
-      if (Array.isArray(material)) {
-        for (const entry of material) {
-          entry.side = DoubleSide;
-          entry.needsUpdate = true;
-        }
-        return;
-      }
-
-      if (material !== undefined && material !== null) {
-        material.side = DoubleSide;
-        material.needsUpdate = true;
-      }
-    });
-  }, [gizmoMode, gizmoSpace, pivotMode, selectedActuatorId]);
-
-  useFrame((_, delta) => {
-    // Animate actuator opacity multiplier: rig mode = full, pose mode = ghost
-    const targetOpacity = appMode === "Pose" ? 0.32 : 1;
-    const dampedOpacity = smoothDampScalar(opacityRef.current, targetOpacity, opacityVelocityRef.current, 0.22, delta);
-    opacityRef.current = dampedOpacity.value;
-    opacityVelocityRef.current = dampedOpacity.velocity;
-
+  const applyActuatorVisuals = useCallback(() => {
     for (const actuator of actuators) {
       const mat = materialRefs.current[actuator.id];
       if (mat === null || mat === undefined) continue;
-      const state = getActuatorVisualState(selectedIdSet.has(actuator.id), hoveredId === actuator.id);
+      mat.transparent = true;
+      mat.depthWrite = false;
+      mat.depthTest = true;
+      mat.blending = NormalBlending;
+      const isSelected = selectedIdSet.has(actuator.id);
+      const pointerHovered = gizmoMode !== "draw" && hoveredId === actuator.id;
+      const drawHovered = gizmoMode === "draw" && drawHoverActuatorId === actuator.id;
+      const state = getActuatorVisualState(isSelected, pointerHovered || drawHovered);
       const visual = getUnityActuatorVisual(actuator, state);
-      const colorUniform = mat.uniforms.uColor?.value;
-      if (colorUniform instanceof Color) {
-        colorUniform.setRGB(visual.r, visual.g, visual.b);
-      }
-      if (typeof mat.uniforms.uOpacity?.value === "number") {
-        mat.uniforms.uOpacity.value = visual.alpha * opacityRef.current;
-      }
+      const modeOpacity = appMode === "Pose" && isSelected ? 1 : opacityRef.current;
+      mat.color.setRGB(visual.r, visual.g, visual.b);
+      mat.opacity = visual.alpha * modeOpacity;
+      mat.needsUpdate = true;
+    }
+  }, [actuators, appMode, drawHoverActuatorId, gizmoMode, hoveredId, selectedIdSet]);
+
+  useLayoutEffect(() => {
+    applyActuatorVisuals();
+  }, [applyActuatorVisuals]);
+
+  useFrame((_, delta) => {
+    // Rig mode must snap to full visibility immediately to avoid stale pose ghosting.
+    if (appMode === "Pose") {
+      const dampedOpacity = smoothDampScalar(opacityRef.current, 0.32, opacityVelocityRef.current, 0.22, delta);
+      opacityRef.current = dampedOpacity.value;
+      opacityVelocityRef.current = dampedOpacity.velocity;
+    } else {
+      opacityRef.current = 1;
+      opacityVelocityRef.current = 0;
     }
 
-    const targetBlend = appMode === "Pose" ? 1 : 0;
-    const blended = smoothDampScalar(
-      backgroundBlendRef.current,
-      targetBlend,
-      backgroundBlendVelocityRef.current,
-      0.15,
-      delta,
-    );
-    backgroundBlendRef.current = blended.value;
-    backgroundBlendVelocityRef.current = blended.velocity;
+    // Keep visuals deterministically synced to selection/hover/preset every frame.
+    applyActuatorVisuals();
+
+    if (appMode === "Pose") {
+      const blended = smoothDampScalar(
+        backgroundBlendRef.current,
+        1,
+        backgroundBlendVelocityRef.current,
+        0.15,
+        delta,
+      );
+      backgroundBlendRef.current = blended.value;
+      backgroundBlendVelocityRef.current = blended.velocity;
+    } else {
+      backgroundBlendRef.current = 0;
+      backgroundBlendVelocityRef.current = 0;
+    }
     const t = backgroundBlendRef.current;
     blendedBackgroundRef.current.setRGB(
       lightBackground.r + (darkBackground.r - lightBackground.r) * t,
@@ -851,17 +989,19 @@ export function SceneContent({
 
     syncPivotFromSelection();
     const controls = transformControlsRef.current;
-    if (controls === null || controls === undefined) return;
-    controls.traverse((object: Object3D) => {
-      const mesh = object as Mesh;
-      if (!mesh.isMesh) return;
-      const material = mesh.material;
-      if (Array.isArray(material)) {
-        for (const entry of material) entry.side = DoubleSide;
-      } else if (material !== undefined && material !== null) {
-        material.side = DoubleSide;
-      }
-    });
+    if (controls !== null && controls !== undefined) {
+      const helper = (controls as any).getHelper?.() ?? controls;
+      helper.traverse((object: Object3D) => {
+        if (object.name.length === 0) return;
+        // Keep gizmo visuals locked to positive axis orientation by
+        // removing camera-side sign flips applied via negative scales.
+        object.scale.set(
+          Math.abs(object.scale.x),
+          Math.abs(object.scale.y),
+          Math.abs(object.scale.z),
+        );
+      });
+    }
 
   });
 
@@ -918,7 +1058,9 @@ export function SceneContent({
         <SimulationOverlapFilter physicsEnabled={physicsEnabled} actuators={actuators} colliderRefs={colliderRefById} />
         {actuators.map((actuator) => {
           const isSelected = selectedIdSet.has(actuator.id);
-          const isHovered = hoveredId === actuator.id;
+          const pointerHovered = gizmoMode !== "draw" && hoveredId === actuator.id;
+          const drawHovered = gizmoMode === "draw" && drawHoverActuatorId === actuator.id;
+          const isHovered = pointerHovered || drawHovered;
           const isRoot = actuator.parentId === null;
           const visualState = getActuatorVisualState(isSelected, isHovered);
           const visual = getUnityActuatorVisual(actuator, visualState);
@@ -927,7 +1069,14 @@ export function SceneContent({
           const radius = getActuatorRadius(actuator);
           const presetSettings = getActuatorPresetSettings(actuator);
           const bodyMass = getActuatorMassFromPreset(actuator);
-          const bodyType = physicsEnabled ? (isRoot ? "kinematicPosition" : "dynamic") : "kinematicPosition";
+          const isPoseRoot = physicsEnabled && appMode === "Pose" && isRoot;
+          const poseRootMass = isPoseRoot ? Math.max(bodyMass, 40) : bodyMass;
+          const bodyType =
+            physicsEnabled && appMode === "Pose"
+              ? "dynamic"
+              : physicsEnabled
+                ? (isRoot ? "kinematicPosition" : "dynamic")
+                : "kinematicPosition";
           const bodyRef = bodyRefById[actuator.id];
 
           return (
@@ -938,18 +1087,32 @@ export function SceneContent({
               colliders={false}
               canSleep={false}
               additionalSolverIterations={
-                physicsEnabled ? Math.max(0, Math.round(physicsTuning.additionalSolverIterations)) : 0
+                physicsEnabled
+                  ? Math.max(
+                      isPoseRoot ? 18 : 0,
+                      Math.round(physicsTuning.additionalSolverIterations),
+                    )
+                  : 0
               }
               linearDamping={
-                physicsEnabled ? Math.max(0, presetSettings.drag * Math.max(0, physicsTuning.bodyLinearDamping)) : 0
+                physicsEnabled
+                  ? Math.max(
+                      isPoseRoot ? 10 : 0,
+                      presetSettings.drag * Math.max(0, physicsTuning.bodyLinearDamping),
+                    )
+                  : 0
               }
               angularDamping={
                 physicsEnabled
-                  ? Math.max(0, presetSettings.angularDrag * Math.max(0, physicsTuning.bodyAngularDamping))
+                  ? Math.max(
+                      isPoseRoot ? 8 : 0,
+                      presetSettings.angularDrag * Math.max(0, physicsTuning.bodyAngularDamping),
+                    )
                   : 0
               }
               gravityScale={physicsEnabled && isRoot ? 0 : 1}
-              mass={bodyMass}
+              enabledRotations={[true, true, true]}
+              mass={poseRootMass}
               position={[center.x, center.y, center.z]}
               quaternion={[
                 actuator.transform.rotation.x,
@@ -962,6 +1125,10 @@ export function SceneContent({
                 ref={(object) => onActuatorRef(actuator.id, object)}
                 renderOrder={isSelected ? 2 : isHovered ? 1 : 0}
                 onClick={(event) => {
+                  if (event.altKey) {
+                    event.stopPropagation();
+                    return;
+                  }
                   if (gizmoMode === "draw") {
                     event.stopPropagation();
                     return;
@@ -977,6 +1144,7 @@ export function SceneContent({
                   });
                 }}
                 onPointerDown={(event) => {
+                  if (event.altKey) return;
                   if (gizmoMode === "draw") return;
                   event.stopPropagation();
                   if (!physicsEnabled || appMode !== "Pose") return;
@@ -1063,6 +1231,10 @@ export function SceneContent({
                     return;
                   }
                   event.stopPropagation();
+                  if (event.altKey) {
+                    clearPosePullState();
+                    return;
+                  }
                   if (event.buttons === 0) {
                     clearPosePullState();
                     return;
@@ -1106,26 +1278,27 @@ export function SceneContent({
                   clearPosePullState();
                 }}
                 onPointerEnter={(event) => {
+                  if (gizmoMode === "draw") return;
+                  if (event.altKey) return;
                   event.stopPropagation();
                   setHoveredId(actuator.id);
                 }}
                 onPointerLeave={() => {
+                  if (gizmoMode === "draw") return;
                   setHoveredId((prev) => (prev === actuator.id ? null : prev));
                 }}
               >
                 {getGeometry(actuator.shape, actuator.size)}
-                <shaderMaterial
+                <meshStandardMaterial
                   ref={(mat) => { materialRefs.current[actuator.id] = mat; }}
                   transparent
-                  depthWrite
+                  depthWrite={false}
                   depthTest
                   toneMapped={false}
-                  vertexShader={ACTUATOR_VERTEX_SHADER}
-                  fragmentShader={ACTUATOR_FRAGMENT_SHADER}
-                  uniforms={{
-                    uColor: { value: new Color(visual.r, visual.g, visual.b) },
-                    uOpacity: { value: visual.alpha * opacityRef.current },
-                  }}
+                  color={new Color(visual.r, visual.g, visual.b)}
+                  opacity={visual.alpha * opacityRef.current}
+                  roughness={0.58}
+                  metalness={0.03}
                 />
               </mesh>
               {actuator.shape === "capsule" ? <CapsuleCollider ref={colliderRefById[actuator.id]} args={[capsuleHalfAxis, radius]} /> : null}
@@ -1176,8 +1349,10 @@ export function SceneContent({
             mode={gizmoMode}
             space={gizmoSpace}
             size={0.75}
+            enabled={!isAltPressed}
             object={pivotObjectRef.current}
             onMouseDown={() => {
+              if (isAltPressed) return;
               suppressSelectionClickUntilRef.current = Date.now() + 220;
               hasAcceptedDragFrameRef.current = false;
               syncPivotFromSelection();
@@ -1224,6 +1399,8 @@ export function SceneContent({
                 x: worldOffset.x,
                 y: worldOffset.y,
                 z: worldOffset.z,
+              }, {
+                includeDescendants: !isShiftPressedRef.current,
               });
             }}
           />
@@ -1234,6 +1411,7 @@ export function SceneContent({
             position={[0, -0.1, 0]}
             receiveShadow
             onClick={(event) => {
+              if (event.altKey) return;
               if (gizmoMode === "draw") {
                 event.stopPropagation();
                 return;
@@ -1243,7 +1421,7 @@ export function SceneContent({
             }}
           >
             <boxGeometry args={[200, 0.2, 200]} />
-            <meshStandardMaterial color="#a8b8c8" />
+            <meshStandardMaterial color="#4a5563" />
           </mesh>
         </RigidBody>
       </Physics>

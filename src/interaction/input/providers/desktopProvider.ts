@@ -30,6 +30,16 @@ export function useDesktopInputProvider({ targetRef, enabled, onAction }: Deskto
       return { x: clientX - rect.left, y: clientY - rect.top };
     }
 
+    function isInsideTarget(clientX: number, clientY: number) {
+      const rect = target.getBoundingClientRect();
+      return clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom;
+    }
+
+    function isBlockedSceneUiEventTarget(targetNode: EventTarget | null): boolean {
+      if (!(targetNode instanceof Element)) return false;
+      return targetNode.closest("[data-scene-ui='true']") !== null;
+    }
+
     function emitPointer(
       phase: InputAction["phase"],
       event: PointerEvent | MouseEvent | WheelEvent,
@@ -82,6 +92,7 @@ export function useDesktopInputProvider({ targetRef, enabled, onAction }: Deskto
 
     const onPointerDown = (event: PointerEvent) => {
       if (event.pointerType !== "mouse" && event.pointerType !== "pen") return;
+      if (isBlockedSceneUiEventTarget(event.target)) return;
       activePointers.add(event.pointerId);
       emitPointer("OnPress", event, "pointer.primary", {
         kind: "button",
@@ -92,12 +103,16 @@ export function useDesktopInputProvider({ targetRef, enabled, onAction }: Deskto
 
     const onPointerMove = (event: PointerEvent) => {
       if (event.pointerType !== "mouse" && event.pointerType !== "pen") return;
+      if (isBlockedSceneUiEventTarget(event.target)) return;
+      const startedOnTarget = activePointers.has(event.pointerId);
+      const insideTarget = isInsideTarget(event.clientX, event.clientY);
+      if (!startedOnTarget && !insideTarget) return;
       emitPointer("OnMove", event, "pointer.move", {
         kind: "axis2",
         x: event.movementX ?? 0,
         y: event.movementY ?? 0,
       });
-      if (activePointers.has(event.pointerId) || (event.pointerType === "mouse" && (event.buttons & 1) === 1)) {
+      if (startedOnTarget) {
         emitPointer("OnDrag", event, "pointer.primary", {
           kind: "button",
           pressed: true,
@@ -108,6 +123,11 @@ export function useDesktopInputProvider({ targetRef, enabled, onAction }: Deskto
 
     const onPointerUp = (event: PointerEvent) => {
       if (event.pointerType !== "mouse" && event.pointerType !== "pen") return;
+      if (isBlockedSceneUiEventTarget(event.target)) {
+        activePointers.delete(event.pointerId);
+        return;
+      }
+      if (!activePointers.has(event.pointerId) && !isInsideTarget(event.clientX, event.clientY)) return;
       activePointers.delete(event.pointerId);
       emitPointer("OnRelease", event, "pointer.primary", {
         kind: "button",
@@ -118,6 +138,11 @@ export function useDesktopInputProvider({ targetRef, enabled, onAction }: Deskto
 
     const onPointerCancel = (event: PointerEvent) => {
       if (event.pointerType !== "mouse" && event.pointerType !== "pen") return;
+      if (isBlockedSceneUiEventTarget(event.target)) {
+        activePointers.delete(event.pointerId);
+        return;
+      }
+      if (!activePointers.has(event.pointerId) && !isInsideTarget(event.clientX, event.clientY)) return;
       activePointers.delete(event.pointerId);
       emitPointer("OnRelease", event, "pointer.primary", {
         kind: "button",
@@ -127,6 +152,7 @@ export function useDesktopInputProvider({ targetRef, enabled, onAction }: Deskto
     };
 
     const onWheel = (event: WheelEvent) => {
+      if (isBlockedSceneUiEventTarget(event.target)) return;
       emitPointer("OnWheel", event, "scroll.vertical", {
         kind: "axis1",
         value: event.deltaY,
@@ -134,6 +160,8 @@ export function useDesktopInputProvider({ targetRef, enabled, onAction }: Deskto
     };
 
     const onMouseMove = (event: MouseEvent) => {
+      if (isBlockedSceneUiEventTarget(event.target)) return;
+      if (!isInsideTarget(event.clientX, event.clientY)) return;
       emitPointer("OnMove", event, "pointer.move", {
         kind: "axis2",
         x: event.movementX ?? 0,
@@ -149,6 +177,7 @@ export function useDesktopInputProvider({ targetRef, enabled, onAction }: Deskto
     };
 
     const onMouseUp = (event: MouseEvent) => {
+      if (!isInsideTarget(event.clientX, event.clientY)) return;
       emitPointer("OnRelease", event, "pointer.primary", {
         kind: "button",
         pressed: false,

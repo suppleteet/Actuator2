@@ -96,8 +96,22 @@ export function getActuatorPrimitiveCenter(actuator: ActuatorPrimitiveLike): Vec
   return pivotWorld.addScaledVector(up, getCapsuleHalfAxis(actuator.size));
 }
 
-export function scalePrimitiveSizeFromGizmoDelta(size: Vec3, deltaScale: Vec3): Vec3 {
+export function scalePrimitiveSizeFromGizmoDelta(
+  size: Vec3,
+  deltaScale: Vec3,
+  shape?: ActuatorShape,
+): Vec3 {
   const scale = normalizePositiveScale(deltaScale);
+  if (shape === "capsule") {
+    const deltaFromOneX = Math.abs(scale.x - 1);
+    const deltaFromOneZ = Math.abs(scale.z - 1);
+    const radialScale = deltaFromOneX >= deltaFromOneZ ? scale.x : scale.z;
+    return normalizePrimitiveSize({
+      x: size.x * radialScale,
+      y: size.y * scale.y,
+      z: size.z * radialScale,
+    });
+  }
   return normalizePrimitiveSize({
     x: size.x * scale.x,
     y: size.y * scale.y,
