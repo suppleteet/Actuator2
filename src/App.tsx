@@ -197,7 +197,6 @@ export default function App() {
   const xrHandInputsRef = useRef(xrHandInputs);
 
   const [drawDraftActuators, setDrawDraftActuators] = useState<ActuatorEntity[]>([]);
-  const drawDraftActuatorsRef = useRef<ActuatorEntity[]>([]);
   const drawPointerClientRef = useRef<{ x: number; y: number } | null>(null);
   const drawPointerButtonsRef = useRef(0);
   const drawCursorAnchorPointRef = useRef<Vec3 | null>(null);
@@ -627,10 +626,6 @@ export default function App() {
   useEffect(() => {
     editorStateRef.current = editorState;
   }, [editorState]);
-
-  useEffect(() => {
-    drawDraftActuatorsRef.current = drawDraftActuators;
-  }, [drawDraftActuators]);
 
   useEffect(() => {
     xrHandInputsRef.current = xrHandInputs;
@@ -1635,7 +1630,17 @@ export default function App() {
   }
 
   function commitDrawSession(drawSession: NonNullable<typeof drawSessionRef.current>) {
-    commitDrawDraftActuators(drawSession.rigId, drawDraftActuatorsRef.current);
+    const finalDraft = buildDrawDraftActuators(
+      drawSession.startPoint,
+      drawSession.endPoint,
+      drawSession.worldRadius,
+      drawSession.rigId,
+      drawSession.parentId,
+      drawSession.mirrorParentId,
+      drawSession.mirrorSpawn,
+      drawSession.preset,
+    );
+    commitDrawDraftActuators(drawSession.rigId, finalDraft);
   }
 
   function createRig() {
