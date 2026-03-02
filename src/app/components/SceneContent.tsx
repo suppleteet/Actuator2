@@ -386,8 +386,13 @@ function PosePhysicsBridge({
       };
       if (actuator.parentId === null) {
         hasRoot = true;
-        const moverStiffness = Math.max(80, Math.min(1200, positionSpring.stiffness * 1.6));
-        const moverDamping = Math.max(6, Math.min(240, positionSpring.damping * 1.8));
+        const rootMass = Math.max(1, body.mass());
+        const moverStiffness = Math.max(900, Math.min(18000, positionSpring.stiffness * 32));
+        const criticalDamping = 2 * Math.sqrt(rootMass * moverStiffness);
+        const moverDamping = Math.max(
+          80,
+          Math.min(3200, Math.max(positionSpring.damping * 10, criticalDamping * 0.9)),
+        );
         const moverTarget = actuator.id === grabbedActuatorId ? sampledPosition : target.position;
         ensureRootMoverBridge(actuator.id, body, moverTarget, moverStiffness, moverDamping);
         if (actuator.id === grabbedActuatorId) continue;
@@ -1145,7 +1150,7 @@ export function SceneContent({
           const presetSettings = getActuatorPresetSettings(actuator);
           const bodyMass = getActuatorMassFromPreset(actuator);
           const isPoseRoot = physicsEnabled && appMode === "Pose" && isRoot;
-          const poseRootMass = isPoseRoot ? Math.max(bodyMass, 40) : bodyMass;
+          const poseRootMass = isPoseRoot ? Math.max(bodyMass, 12) : bodyMass;
           const bodyType =
             physicsEnabled && appMode === "Pose"
               ? "dynamic"
@@ -1164,7 +1169,7 @@ export function SceneContent({
               additionalSolverIterations={
                 physicsEnabled
                   ? Math.max(
-                      isPoseRoot ? 18 : 0,
+                      isPoseRoot ? 12 : 0,
                       Math.round(physicsTuning.additionalSolverIterations),
                     )
                   : 0
@@ -1172,7 +1177,7 @@ export function SceneContent({
               linearDamping={
                 physicsEnabled
                   ? Math.max(
-                      isPoseRoot ? 10 : 0,
+                      isPoseRoot ? 4 : 0,
                       presetSettings.drag * Math.max(0, physicsTuning.bodyLinearDamping),
                     )
                   : 0
@@ -1180,7 +1185,7 @@ export function SceneContent({
               angularDamping={
                 physicsEnabled
                   ? Math.max(
-                      isPoseRoot ? 8 : 0,
+                      isPoseRoot ? 3.5 : 0,
                       presetSettings.angularDrag * Math.max(0, physicsTuning.bodyAngularDamping),
                     )
                   : 0
