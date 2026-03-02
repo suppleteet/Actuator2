@@ -126,3 +126,33 @@ Automated evidence:
 Result: pass (desktop + automated)
 Notes:
 - XR-specific inside-mesh placement remains out of Sprint 04 scope by plan.
+
+## Sprint 06 Physics Feel + XR Tool Parity + Deploy Evidence (Q-015)
+- Tester: Codex (InteractionAgent + RuntimeAgent + QAAgent simulation run)
+- Date: 2026-03-02
+- Scope: XR tool visuals/mapping, XR trigger author-select bridge, pose feel tuning, GitHub Pages workflow
+
+Desktop + automated evidence:
+- Pass: Unity tool FBX assets imported and rendered per hand in XR runtime path.
+- Pass: Deterministic XR tool-lane mapping tests (`xr-tools`, `xr-trigger-bridge`) are passing.
+- Pass: Runtime tuning updates for root/child recovery compile and pass automated regression tests.
+- Pass: `npm test`
+- Pass: `npm run build`
+- Pass: base-path build (`VITE_BASE_PATH=/<repo-name>/ npm run build`)
+
+Manual XR/device evidence:
+- Not run in this environment: no physical headset/controller hardware was available.
+- Pending check on target hardware:
+  - XR tool mesh visibility/alignment during mode transitions
+  - Trigger/squeeze/thumbstick behavior parity
+  - Pose enter/exit root stability feel regression
+
+GitHub Pages deployment evidence:
+- Pass: `.github/workflows/sprint-pages.yml` added for branch build + artifact upload and `main` deploy.
+- Pending check in remote repo: first Actions run + Pages environment verification.
+
+Known limits:
+- XR behavior and physics feel parity claims are automated + code-level only until hardware pass.
+- GitHub Pages deploy cannot be fully confirmed locally without repository Actions execution.
+
+Result: partial-pass (automation complete, hardware/deploy environment checks pending)
