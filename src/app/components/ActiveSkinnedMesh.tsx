@@ -4,7 +4,7 @@ import { BufferGeometry, Mesh, MeshStandardMaterial, Object3D, Quaternion, SRGBC
 import { smoothDampScalar } from "../smoothDamp";
 import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
 import { bindVerticesToClosestCapsule, type Capsule, type Vec3 as SkinVec3 } from "../../skinning/closestCapsuleBinding";
-import { applyDeltaMushWithDetailRestore, buildDeltaMushDetailOffsets, buildVertexNeighbors } from "../../skinning/deltaMush";
+import { applyDeltaMush, buildDeltaMushDetailOffsets, buildVertexNeighbors } from "../../skinning/deltaMush";
 import { getActuatorPrimitiveCenter, getActuatorRadius, getCapsuleHalfAxis } from "../../runtime/physicsAuthoring";
 import type {
   ActiveMeshSource,
@@ -41,6 +41,7 @@ type RuntimeVertexBinding = {
   bindWorld: SkinVec3;
   localOffset: SkinVec3;
   rootLocalOffset: SkinVec3;
+  rootBindRotation: { x: number; y: number; z: number; w: number };
   weight: number;
 };
 
@@ -334,6 +335,15 @@ export function ActiveSkinnedMesh({
                   .applyQuaternion(rootActuator.rotation.clone().invert());
                 return { x: offset.x, y: offset.y, z: offset.z };
               })();
+        const rootBindRotation =
+          rootActuator === undefined
+            ? { x: 0, y: 0, z: 0, w: 1 }
+            : {
+                x: rootActuator.rotation.x,
+                y: rootActuator.rotation.y,
+                z: rootActuator.rotation.z,
+                w: rootActuator.rotation.w,
+              };
 
         if (influenceActuator === undefined) {
           return {
@@ -342,6 +352,7 @@ export function ActiveSkinnedMesh({
             bindWorld,
             localOffset: { x: 0, y: 0, z: 0 },
             rootLocalOffset,
+            rootBindRotation,
             weight: 0,
           };
         }
@@ -355,6 +366,7 @@ export function ActiveSkinnedMesh({
           bindWorld,
           localOffset: { x: localOffset.x, y: localOffset.y, z: localOffset.z },
           rootLocalOffset,
+          rootBindRotation,
           weight: binding.weight,
         };
       });
@@ -491,16 +503,42 @@ export function ActiveSkinnedMesh({
         return { x: sx * inv, y: sy * inv, z: sz * inv };
       });
 
-      const smoothedWelded = applyDeltaMushWithDetailRestore(
+      const smoothedWelded = applyDeltaMush(
         weldedCurrent,
         weldedNeighbors,
-        deltaMushDetailOffsets,
         deltaMushIterations,
         deltaMushStrength,
       );
+      const rotatedDetailOffsets = weldData.weldedVertices.map((_, weldedIndex) => {
+        const detailOffset = deltaMushDetailOffsets[weldedIndex] ?? { x: 0, y: 0, z: 0 };
+        const members = weldData.weldedToVertices[weldedIndex];
+        if (members === undefined || members.length === 0) return detailOffset;
+        const binding = runtimeBindings[members[0]];
+        if (binding === undefined || binding.rootCapsuleId === null) return detailOffset;
+        const rootActuator = actuatorById.get(binding.rootCapsuleId);
+        if (rootActuator === undefined) return detailOffset;
+
+        const bindRootRotation = new Quaternion(
+          binding.rootBindRotation.x,
+          binding.rootBindRotation.y,
+          binding.rootBindRotation.z,
+          binding.rootBindRotation.w,
+        ).normalize();
+        const rootRotationDelta = rootActuator.rotation.clone().multiply(bindRootRotation.invert()).normalize();
+        const rotatedDetail = new Vector3(detailOffset.x, detailOffset.y, detailOffset.z).applyQuaternion(rootRotationDelta);
+        return { x: rotatedDetail.x, y: rotatedDetail.y, z: rotatedDetail.z };
+      });
+      const restoredWelded = smoothedWelded.map((value, weldedIndex) => {
+        const detail = rotatedDetailOffsets[weldedIndex] ?? { x: 0, y: 0, z: 0 };
+        return {
+          x: value.x + detail.x,
+          y: value.y + detail.y,
+          z: value.z + detail.z,
+        };
+      });
       finalVertices = deformed.map((_, vertexIndex) => {
         const weldedIndex = weldData.vertexToWelded[vertexIndex];
-        return smoothedWelded[weldedIndex];
+        return restoredWelded[weldedIndex];
       });
     }
 

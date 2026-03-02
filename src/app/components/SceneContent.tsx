@@ -338,7 +338,6 @@ function PosePhysicsBridge({
       }
 
       const linearVelocity = body.linvel();
-      const safeLinearVelocity = isFiniteVec3(linearVelocity) ? linearVelocity : ({ x: 0, y: 0, z: 0 } as const);
       if (!isFiniteVec3(linearVelocity)) {
         body.setLinvel({ x: 0, y: 0, z: 0 }, true);
       }
@@ -447,29 +446,6 @@ function PosePhysicsBridge({
       const parentBody = bodyRefs[actuator.parentId]?.current;
       const parentTarget = targetPoseRef.current[actuator.parentId];
       if (parentBody === undefined || parentBody === null || parentTarget === undefined) continue;
-
-      const childPositionError = new Vector3(
-        target.position.x - sampledPosition.x,
-        target.position.y - sampledPosition.y,
-        target.position.z - sampledPosition.z,
-      );
-      const childDistance = childPositionError.length();
-      const childCurrentVelocity = new Vector3(safeLinearVelocity.x, safeLinearVelocity.y, safeLinearVelocity.z);
-      const childPositionGain = Math.max(1.2, Math.min(12, positionSpring.stiffness * 0.066));
-      const childVelocityDamping = Math.max(0.7, Math.min(6.5, positionSpring.damping * 0.1));
-      const desiredChildVelocity =
-        childDistance <= positionSpring.deadband
-          ? childCurrentVelocity.multiplyScalar(0.4)
-          : childPositionError.multiplyScalar(childPositionGain).addScaledVector(childCurrentVelocity, -childVelocityDamping);
-      if (childDistance <= Math.max(positionSpring.deadband * 2.5, 0.0035) && childCurrentVelocity.length() <= 0.035) {
-        desiredChildVelocity.set(0, 0, 0);
-      }
-      const maxChildSpeed = Math.max(0.35, Math.min(3.4, positionSpring.maxLinearSpeed * 0.75));
-      const desiredChildSpeed = desiredChildVelocity.length();
-      if (desiredChildSpeed > maxChildSpeed) {
-        desiredChildVelocity.multiplyScalar(maxChildSpeed / desiredChildSpeed);
-      }
-      body.setLinvel({ x: desiredChildVelocity.x, y: desiredChildVelocity.y, z: desiredChildVelocity.z }, true);
 
       const parentRotation = parentBody.rotation();
       if (!isFiniteQuat(parentRotation)) continue;
