@@ -60,6 +60,7 @@ export function useXRInputProvider({ enabled, onAction, getSession }: XRProvider
     const sourceIdMap = new WeakMap<object, number>();
     let nextSourceId = 1;
     const lastButtonValues = new Map<string, number>();
+    const lastButtonPressed = new Map<string, boolean>();
     const lastAxisValues = new Map<string, { x: number; y: number }>();
 
     function sourceId(inputSource: XRInputSourceLike): string {
@@ -208,6 +209,29 @@ export function useXRInputProvider({ enabled, onAction, getSession }: XRProvider
             kind: "axis2",
             x: axisX,
             y: axisY,
+          });
+        }
+
+        const thumbstickClick = gamepad.buttons?.[3];
+        const thumbstickClickValue = thumbstickClick?.value ?? 0;
+        const thumbstickClickPressed = thumbstickClick?.pressed ?? thumbstickClickValue > 0.5;
+        const lastThumbstickClickValue = lastButtonValues.get(`${id}:thumbstick.click`) ?? -1;
+        if (Math.abs(thumbstickClickValue - lastThumbstickClickValue) > 0.01) {
+          lastButtonValues.set(`${id}:thumbstick.click`, thumbstickClickValue);
+          emitFromSource(inputSource, "xr.thumbstick.click", "OnValue", {
+            kind: "button",
+            pressed: thumbstickClickPressed,
+            value: thumbstickClickValue,
+          });
+        }
+        const thumbstickClickPressedKey = `${id}:thumbstick.click.pressed`;
+        const lastThumbstickClickPressed = lastButtonPressed.get(thumbstickClickPressedKey) ?? false;
+        if (thumbstickClickPressed !== lastThumbstickClickPressed) {
+          lastButtonPressed.set(thumbstickClickPressedKey, thumbstickClickPressed);
+          emitFromSource(inputSource, "xr.thumbstick.click", thumbstickClickPressed ? "OnPress" : "OnRelease", {
+            kind: "button",
+            pressed: thumbstickClickPressed,
+            value: thumbstickClickPressed ? 1 : 0,
           });
         }
       }

@@ -8,6 +8,11 @@ import { buildFocusRequestFromActuators, type FocusRequest } from "./interaction
 import { useInputRouter } from "./interaction/input/router";
 import type { InputAction } from "./interaction/input/types";
 import {
+  createInitialXrHandInputState,
+  resolveXrToolState,
+  updateXrHandInputStateFromAction,
+} from "./interaction/xrTools";
+import {
   adjustDrawRadiusFromWheel,
   buildDrawCapsuleActuator,
   mirrorPlacementAcrossX,
@@ -186,6 +191,8 @@ export default function App() {
   const [drawCursorRadiusPx, setDrawCursorRadiusPx] = useState(18);
   const [drawCursorHasInRangeAnchor, setDrawCursorHasInRangeAnchor] = useState(false);
   const [drawHoverActuatorId, setDrawHoverActuatorId] = useState<string | null>(null);
+  const [xrHandInputs, setXrHandInputs] = useState(() => createInitialXrHandInputState());
+  const xrHandInputsRef = useRef(xrHandInputs);
 
   const [drawDraftActuators, setDrawDraftActuators] = useState<ActuatorEntity[]>([]);
   const drawDraftActuatorsRef = useRef<ActuatorEntity[]>([]);
@@ -243,6 +250,15 @@ export default function App() {
   const selectedActuatorId = editorState.selectedActuatorId;
   const selectedActuatorIds = editorState.selectedActuatorIds;
   const rigIds = useMemo(() => [...new Set(actuators.map((actuator) => actuator.rigId))].sort(), [actuators]);
+  const xrToolState = useMemo(
+    () =>
+      resolveXrToolState({
+        appMode,
+        physicsEnabled,
+        handInputs: xrHandInputs,
+      }),
+    [appMode, physicsEnabled, xrHandInputs],
+  );
 
   type OutlinerEntry =
     | { kind: "rig"; rigId: string; collapsed: boolean }
@@ -613,6 +629,17 @@ export default function App() {
   useEffect(() => {
     drawDraftActuatorsRef.current = drawDraftActuators;
   }, [drawDraftActuators]);
+
+  useEffect(() => {
+    xrHandInputsRef.current = xrHandInputs;
+  }, [xrHandInputs]);
+
+  useEffect(() => {
+    if (xrMode !== null) return;
+    const reset = createInitialXrHandInputState();
+    xrHandInputsRef.current = reset;
+    setXrHandInputs(reset);
+  }, [xrMode]);
 
   useEffect(() => {
     if (appMode !== "Rig") return;
@@ -2414,6 +2441,19 @@ export default function App() {
 
 
   const onInputAction = useCallback((action: InputAction) => {
+    if (action.source.provider === "xr") {
+      const nextXrHandInputs = updateXrHandInputStateFromAction(xrHandInputsRef.current, action);
+      if (nextXrHandInputs !== xrHandInputsRef.current) {
+        xrHandInputsRef.current = nextXrHandInputs;
+        setXrHandInputs(nextXrHandInputs);
+      }
+      return;
+    }
+
+    if (gizmoMode !== "draw" || appMode !== "Rig" || physicsEnabled) {
+      return;
+    }
+
     const pointer = action.pointer;
     const pointerInsideCanvas =
       pointer === null ? false : isPointerInsideCanvas(pointer.clientX, pointer.clientY);
@@ -2540,11 +2580,11 @@ export default function App() {
       drawSessionRef.current = null;
       setDrawDraftActuators([]);
     }
-  }, [actuators, appMode, drawMirrorEnabled, drawRadius, drawSnapEnabled, newActuatorPreset, selectedRigId]);
+  }, [actuators, appMode, drawMirrorEnabled, drawRadius, drawSnapEnabled, gizmoMode, newActuatorPreset, physicsEnabled, selectedRigId]);
 
   useInputRouter({
     targetRef: canvasWrapRef,
-    enabled: gizmoMode === "draw" && appMode === "Rig" && !physicsEnabled,
+    enabled: (gizmoMode === "draw" && appMode === "Rig" && !physicsEnabled) || xrMode !== null,
     getXRSession: () => {
       const storeAny = xrStore as any;
       const state = storeAny.getState?.();
@@ -2990,6 +3030,8 @@ export default function App() {
                 onPosePullDraggingChange={setIsPosePullDragging}
                 onDrawSurfaceRef={setDrawSurfaceRef}
                 drawHoverActuatorId={drawHoverActuatorId}
+                xrActiveToolsByHand={xrToolState.toolsByHand}
+                xrAltModeByHand={xrToolState.altModeByHand}
               />
             </XR>
           </Canvas>

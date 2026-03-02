@@ -31,6 +31,7 @@ import {
   getActuatorPresetSettings,
   getRuntimeDriveFromPreset,
 } from "../../runtime/physicsPresets";
+import type { XRHandedness, XRToolId } from "../../interaction/xrTools";
 import { smoothDampScalar } from "../smoothDamp";
 import type {
   ActiveMeshSource,
@@ -47,6 +48,7 @@ import type {
   Vec3,
 } from "../types";
 import { ActiveSkinnedMesh } from "./ActiveSkinnedMesh";
+import { XRToolVisuals } from "./XRToolVisuals";
 
 export type SceneContentProps = {
   meshSources: ActiveMeshSource[];
@@ -83,6 +85,8 @@ export type SceneContentProps = {
   onPosePullDraggingChange: (active: boolean) => void;
   onDrawSurfaceRef: (id: string, object: Object3D | null) => void;
   drawHoverActuatorId: string | null;
+  xrActiveToolsByHand: Record<XRHandedness, XRToolId>;
+  xrAltModeByHand: Record<XRHandedness, boolean>;
 };
 
 type ActuatorSphericalJointProps = {
@@ -596,6 +600,8 @@ export function SceneContent({
   onPosePullDraggingChange,
   onDrawSurfaceRef,
   drawHoverActuatorId,
+  xrActiveToolsByHand,
+  xrAltModeByHand,
 }: SceneContentProps) {
   const { scene } = useThree();
   const xrMode = useXR((state) => state.mode);
@@ -1010,6 +1016,7 @@ export function SceneContent({
       <ambientLight intensity={0.6} />
       <directionalLight position={[4, 6, 3]} intensity={1.1} />
       <primitive object={pivotObjectRef.current} visible={false} />
+      <XRToolVisuals visible={isInXR} activeToolByHand={xrActiveToolsByHand} altModeByHand={xrAltModeByHand} />
       {meshSources.map((meshSource) => (
         <ActiveSkinnedMesh
           key={meshSource.id}
