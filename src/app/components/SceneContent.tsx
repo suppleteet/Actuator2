@@ -245,11 +245,73 @@ function PosePhysicsBridge({
   targetPoseRef,
   simulationSamplesRef,
 }: PosePhysicsBridgeProps) {
+  const { rapier, world } = useRapier();
   const wasActiveRef = useRef(false);
+  const rootMoverAnchorBodyRef = useRef<RawRigidBody | null>(null);
+  const rootMoverJointRef = useRef<ImpulseJoint | null>(null);
+  const rootMoverActuatorIdRef = useRef<string | null>(null);
+
+  const clearRootMoverBridge = useCallback(() => {
+    if (rootMoverJointRef.current !== null) {
+      world.removeImpulseJoint(rootMoverJointRef.current, true);
+      rootMoverJointRef.current = null;
+    }
+    if (rootMoverAnchorBodyRef.current !== null) {
+      world.removeRigidBody(rootMoverAnchorBodyRef.current);
+      rootMoverAnchorBodyRef.current = null;
+    }
+    rootMoverActuatorIdRef.current = null;
+  }, [world]);
+
+  const updateRootMoverTarget = useCallback((position: Vec3) => {
+    const anchorBody = rootMoverAnchorBodyRef.current;
+    if (anchorBody === null) return;
+    anchorBody.setNextKinematicTranslation({ x: position.x, y: position.y, z: position.z });
+  }, []);
+
+  const ensureRootMoverBridge = useCallback(
+    (actuatorId: string, rootBody: RapierRigidBody, position: Vec3, stiffness: number, damping: number) => {
+      const hasValidBridge =
+        rootMoverActuatorIdRef.current === actuatorId &&
+        rootMoverAnchorBodyRef.current !== null &&
+        rootMoverJointRef.current !== null;
+      if (!hasValidBridge) {
+        clearRootMoverBridge();
+        const anchorDesc = rapier.RigidBodyDesc.kinematicPositionBased()
+          .setTranslation(position.x, position.y, position.z)
+          .setCanSleep(false);
+        const anchorBody = world.createRigidBody(anchorDesc);
+        anchorBody.setNextKinematicTranslation({ x: position.x, y: position.y, z: position.z });
+
+        const springJointData = rapier.JointData.spring(
+          0,
+          Math.max(1, stiffness),
+          Math.max(0, damping),
+          { x: 0, y: 0, z: 0 },
+          { x: 0, y: 0, z: 0 },
+        );
+        const springJoint = world.createImpulseJoint(springJointData, anchorBody, rootBody, true);
+        rootMoverAnchorBodyRef.current = anchorBody;
+        rootMoverJointRef.current = springJoint;
+        rootMoverActuatorIdRef.current = actuatorId;
+      }
+      updateRootMoverTarget(position);
+    },
+    [clearRootMoverBridge, rapier, updateRootMoverTarget, world],
+  );
+
+  useEffect(() => {
+    if (physicsEnabled && appMode === "Pose") return;
+    clearRootMoverBridge();
+    wasActiveRef.current = false;
+  }, [appMode, clearRootMoverBridge, physicsEnabled]);
+
+  useEffect(() => clearRootMoverBridge, [clearRootMoverBridge]);
 
   useBeforePhysicsStep(() => {
     const isActive = physicsEnabled && appMode === "Pose";
     if (!isActive) {
+      clearRootMoverBridge();
       wasActiveRef.current = false;
       return;
     }
@@ -262,6 +324,7 @@ function PosePhysicsBridge({
       targetPoseRef.current = buildTargetPoseFromActuators(targetActuators ?? actuators);
     }
 
+    let hasRoot = false;
     for (const actuator of actuators) {
       const body = bodyRefs[actuator.id]?.current;
       const target = targetPoseRef.current[actuator.id];
@@ -322,30 +385,12 @@ function PosePhysicsBridge({
         deadband: 0.0012,
       };
       if (actuator.parentId === null) {
+        hasRoot = true;
+        const moverStiffness = Math.max(80, Math.min(1200, positionSpring.stiffness * 1.6));
+        const moverDamping = Math.max(6, Math.min(240, positionSpring.damping * 1.8));
+        const moverTarget = actuator.id === grabbedActuatorId ? sampledPosition : target.position;
+        ensureRootMoverBridge(actuator.id, body, moverTarget, moverStiffness, moverDamping);
         if (actuator.id === grabbedActuatorId) continue;
-
-        const rootError = new Vector3(
-          target.position.x - sampledPosition.x,
-          target.position.y - sampledPosition.y,
-          target.position.z - sampledPosition.z,
-        );
-        const rootDistance = rootError.length();
-        const rootCurrentVelocity = new Vector3(safeLinearVelocity.x, safeLinearVelocity.y, safeLinearVelocity.z);
-        const rootPositionGain = Math.max(2.3, Math.min(20, positionSpring.stiffness * 0.078));
-        const rootVelocityDamping = Math.max(1.8, Math.min(10, positionSpring.damping * 0.13));
-        const rootCurrentSpeed = rootCurrentVelocity.length();
-        const desiredRootVelocity =
-          rootDistance <= positionSpring.deadband
-            ? rootCurrentVelocity.multiplyScalar(0.3)
-            : rootError.multiplyScalar(rootPositionGain).addScaledVector(rootCurrentVelocity, -rootVelocityDamping);
-        if (rootDistance <= Math.max(positionSpring.deadband * 2.5, 0.004) && rootCurrentSpeed <= 0.04) {
-          desiredRootVelocity.set(0, 0, 0);
-        }
-        const maxRootSpeed = Math.max(0.35, Math.min(4.2, positionSpring.maxLinearSpeed * 0.95));
-        const desiredRootSpeed = desiredRootVelocity.length();
-        if (desiredRootSpeed > maxRootSpeed) {
-          desiredRootVelocity.multiplyScalar(maxRootSpeed / desiredRootSpeed);
-        }
 
         const rootCurrentQ = new Quaternion(currentRotation.x, currentRotation.y, currentRotation.z, currentRotation.w);
         const rootTargetQ = new Quaternion(target.rotation.x, target.rotation.y, target.rotation.z, target.rotation.w);
@@ -387,7 +432,6 @@ function PosePhysicsBridge({
           desiredRootAngularVelocity.multiplyScalar(maxRootAngularSpeed / desiredRootAngularSpeed);
         }
 
-        body.setLinvel({ x: desiredRootVelocity.x, y: desiredRootVelocity.y, z: desiredRootVelocity.z }, true);
         body.setAngvel(
           { x: desiredRootAngularVelocity.x, y: desiredRootAngularVelocity.y, z: desiredRootAngularVelocity.z },
           true,
@@ -493,6 +537,9 @@ function PosePhysicsBridge({
           true,
         );
       }
+    }
+    if (!hasRoot) {
+      clearRootMoverBridge();
     }
 
   });
