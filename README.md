@@ -23,4 +23,4 @@ Browser-based WebXR migration of the legacy Unity Actuator tool.
 ## GitHub Pages Build
 
 - Build with base-path safety: set `VITE_BASE_PATH=/<repo-name>/` before `npm run build`.
-- CI workflow `/.github/workflows/sprint-pages.yml` builds on branch pushes and deploys on `main`.
+- CI workflow `/.github/workflows/sprint-pages.yml` builds on branch pushes and deploys on the repository default branch.
