@@ -1,252 +1,118 @@
-# Scene Schema v0
+# Scene Schema + IO Envelope v1
 
-Status: finalized for Sprint 01 persistence baseline (`A-003`).
+Status: finalized for Sprint 07 scene IO scaffolding (`A-011`, `R-011`).
 
 ## Goals
-- Provide a deterministic, serializable scene document.
-- Support stable IDs for save/load, selection, playback, and migration.
-- Keep engine-agnostic shape while mapping cleanly to Web runtime systems.
 
-## Root Document
+- Preserve deterministic save/load behavior across workflows.
+- Separate transport-level compatibility from scene-content schema.
+- Provide explicit migration hooks for future upgrades.
+
+## Persisted Root Envelope (new in Sprint 07)
+
+```ts
+type SceneEnvelope = {
+  format: "actuator2.scene";
+  envelopeVersion: "1.0.0";
+  compatibility: {
+    minReaderVersion: "1.0.0";
+    policy: "reject-unsupported";
+  };
+  savedAtUtc: string; // ISO-8601
+  workflowMode: "Rigging" | "Animation" | "Puppeteering";
+  importedMeshes: ImportedMeshDocument[];
+  scene: SceneDocument;
+};
+```
+
+`SceneDocument` remains the deterministic scene payload shape used since Sprint 01 and still carries:
+- rig topology
+- actuator transforms and primitive sizes
+- playback envelope fields
+- stable IDs
+
+## Scene Payload (unchanged schema lock)
 
 ```ts
 type SceneDocument = {
   version: "0.1.0";
   sceneId: string;
-  createdAtUtc: string;   // ISO-8601
-  updatedAtUtc: string;   // ISO-8601
+  createdAtUtc: string;
+  updatedAtUtc: string;
   characters: CharacterDocument[];
   playback: PlaybackDocument;
   metadata?: Record<string, string>;
 };
 ```
 
-## Required Fields (Save/Load Contract)
-
-Required root keys:
-- `version`
-- `sceneId`
-- `createdAtUtc`
-- `updatedAtUtc`
-- `characters`
-- `playback`
-
-Required character keys:
-- `id`
-- `name`
-- `mesh`
-- `rig`
-- `skinBinding`
-- `channels`
-
-Required actuator keys:
-- `id`
-- `parentId`
-- `type`
-- `shape`
-- `pivot`
-- `transform`
-- `size`
-- `joint`
-- `physics`
-- `influence`
-
-## Character Document
+## Imported Mesh Records
 
 ```ts
-type CharacterDocument = {
-  id: string;
-  name: string;
-  mesh: MeshRef;
-  rig: RigDocument;
-  skinBinding: SkinBindingDocument;
-  channels: ExpressionChannelsDocument;
+type ImportedMeshDocument = {
+  id: string; // deterministic scene-stable ID
+  format: "fbx" | "glb" | "obj" | "unknown";
+  displayName: string;
+  sourceUri: string; // blob URL, relative path, or absolute URL
+  importedAtUtc: string;
 };
 ```
 
-## Mesh Reference
+## Required Envelope Fields
+
+- `format`
+- `envelopeVersion`
+- `compatibility`
+- `savedAtUtc`
+- `workflowMode`
+- `importedMeshes`
+- `scene`
+
+If any required field is missing or invalid:
+- loader must fail fast with explicit error
+- runtime/editor state must remain unchanged
+
+## Deterministic Serialization Rules
+
+- Envelope keys are emitted in stable order.
+- `scene.characters` are sorted by `id`.
+- Each character `rig.actuators` list is sorted by `id`.
+- `importedMeshes` are sorted by `id`.
+- IDs are restored exactly as serialized (no remapping).
+
+## Round-Trip Contract
+
+`save(load(payload))` and `load(save(state))` must preserve:
+- `sceneId`, character IDs, actuator IDs, mesh IDs
+- parent graph topology
+- transform and primitive-size values
+- workflow mode and imported mesh metadata
+
+Allowed mutation on save:
+- `savedAtUtc`
+- `scene.updatedAtUtc`
+
+## Compatibility + Migration Policy
+
+- Supported envelope versions in Sprint 07: `1.0.0`
+- Default policy: `reject-unsupported`
+- Migration entrypoint must exist:
 
 ```ts
-type MeshRef = {
-  meshId: string;         // stable ID within scene
-  uri: string;            // relative path or URL
-  nodePath?: string;      // optional source node path in imported asset
-};
+type SceneEnvelopeMigrator = (raw: unknown) => SceneEnvelope;
 ```
 
-## Sprint 01 Mesh Import Constraints (`A-005`)
+Rules:
+- Migrators must be pure and deterministic.
+- Unknown versions must return explicit failure.
+- No in-place mutation of caller-owned objects.
 
-These constraints define the current migration boundary for mesh integration work:
+## Failure Surface Contract
 
-- Supported source baseline for Sprint 01:
-  - Unity baseline `30c6ea7` Chad asset set migrated to web assets path (`assets/chad/*`).
-  - Runtime import path currently targets `assets/chad/Chad.fbx`.
-- Runtime behavior boundary:
-  - Mesh-only rendering path is in scope.
-  - Embedded skeleton, animation clips, and playback coupling are out of scope for Sprint 01 runtime integration.
-- Material handling baseline:
-  - Runtime consumes texture maps from migrated Chad asset folder when available.
-  - Unity `.mat` files are treated as source references; runtime shading uses explicit web material setup.
-  - Missing maps must fall back to deterministic default material values (no random or device-specific variation).
-- Mesh identity and determinism:
-  - `mesh.meshId` must remain stable for the same imported source asset.
-  - `mesh.uri` must be a deterministic relative runtime path.
-  - `mesh.nodePath` is optional and may be omitted for single-mesh import usage.
-
-## Rig
-
-```ts
-type RigDocument = {
-  rootActuatorId: string;
-  actuators: ActuatorNodeDocument[];
-};
-```
-
-## Actuator Node
-
-```ts
-type ActuatorNodeDocument = {
-  id: string;
-  parentId: string | null;
-  type: "root" | "spine" | "limb" | "joint" | "secondary" | "custom";
-  shape: "capsule" | "sphere" | "box";
-  pivot: ActuatorPivotDocument;
-  transform: TransformDocument;
-  size: Vec3;
-  joint: JointDocument;
-  physics: PhysicsDocument;
-  influence: InfluenceDocument;
-};
-
-type ActuatorPivotDocument = {
-  mode: "capStart" | "center";
-  offsetLocal: Vec3;
-};
-```
-
-`size` is primitive-dimension data (not transform-scale authoring data):
-- `capsule`: `{ x,z = diameter axes, y = axis distance between cap centers }`
-- `sphere`: `{ x,y,z = diameter axes (uniform spheres should keep equal values) }`
-- `box`: `{ x,y,z = side lengths }`
-
-## Shared Value Types
-
-```ts
-type Vec3 = { x: number; y: number; z: number };
-type Quat = { x: number; y: number; z: number; w: number };
-
-type TransformDocument = {
-  position: Vec3;
-  rotation: Quat;
-  scale: Vec3;
-};
-```
-
-## Joint/Physics/Influence
-
-```ts
-type JointDocument = {
-  mode: "fixed" | "limited";
-  angularLimitDeg: Vec3;     // per-axis limit
-  swingLimitDeg: number;
-  twistLimitDeg: number;
-};
-
-type PhysicsDocument = {
-  mass: number;
-  linearDamping: number;
-  angularDamping: number;
-  gravityScale: number;
-  kinematicInRigMode: boolean;
-};
-
-type InfluenceDocument = {
-  radius: number;
-  falloff: number;
-  weight: number;
-  mirrorGroup?: string;
-};
-```
-
-## Skin Binding
-
-```ts
-type SkinBindingDocument = {
-  version: string;
-  solver: "closestVolume";
-  meshHash: string;
-  bindingHash: string;
-  generatedAtUtc: string;   // ISO-8601
-  influenceCount: number;
-};
-```
-
-## Channels + Playback
-
-```ts
-type ExpressionChannelsDocument = {
-  look: { yaw: number; pitch: number };
-  blink: { left: number; right: number };
-  custom: Record<string, number>;
-};
-
-type PlaybackDocument = {
-  fps: number;
-  durationSec: number;
-  activeClipId: string | null;
-};
-```
-
-## Invariants
-- `version` must be set and semver-like; this contract locks `0.1.0`.
-- `sceneId`, character IDs, and actuator IDs are immutable once created.
-- Each character must have exactly one `rootActuatorId`.
-- `rootActuatorId` must exist in `actuators`.
-- Actuator graph must be acyclic.
-- `parentId = null` only for the root actuator.
-- Quaternion values must be finite numbers.
-- For capsules, default pivot mode is `capStart` (first cap sphere center) unless explicitly set to `center`.
-- Serialization order must be stable:
-  - `characters` sorted by `id`
-  - each `actuators` list sorted by `id`
-
-## Multi-Rig Scene Rules (`A-006`)
-
-- A scene may contain multiple independent character rigs via `characters[]`.
-- Actuator IDs must be globally unique across the full scene (not only within a single character).
-- Parent-child relationships are constrained to the same character rig.
-- Cross-rig parenting is invalid and must be rejected during validation/load.
-- Selection and tool operations may target actuators across rigs, but serialization must preserve per-character rig ownership.
-- Deterministic ordering still applies scene-wide (`characters` then each character's `actuators`).
-
-## Load Defaults (Explicit Materialization)
-
-Loader must materialize explicit values so runtime behavior is deterministic:
-
-- Missing `metadata` -> `{}`.
-- Missing `mesh.nodePath` -> omitted (do not synthesize a placeholder path).
-- Missing `channels.custom` -> `{}`.
-- Missing `playback.activeClipId` -> `null`.
-
-No other required field can be omitted; documents missing required fields are invalid and must be rejected before runtime mutation.
-
-## Round-Trip Behavior
-
-`save(load(doc))` and `load(save(state))` must be deterministic:
-- Preserve immutable identifiers (`sceneId`, character IDs, actuator IDs).
-- Preserve actuator parent graph topology and transforms.
-- Preserve explicit value types (numbers remain numbers, booleans remain booleans).
-- Preserve sorted output order for `characters` and `actuators`.
-- `updatedAtUtc` may change on save; all other persisted fields must remain equivalent unless edited by user action.
-
-## Determinism Notes
-- Save then immediate load must yield equivalent document data (modulo `updatedAtUtc`).
-- Playback/runtime systems must consume only serialized values, not editor transient state.
-- Defaults must be explicit at serialization time (no hidden engine defaults).
+Load failures must include:
+- machine-readable code (`unsupported_version`, `invalid_payload`, `invalid_scene`)
+- human-readable message suitable for UI status reporting
 
 ## Migration Note Format
-
-When schema or load behavior changes, record a migration note entry in task/PR docs using this format:
 
 ```md
 Migration Note:
@@ -256,88 +122,4 @@ Migration Note:
 - backward_compat_strategy:
 - deterministic_impact:
 - required_rewrite: yes/no
-```
-
-Use `required_rewrite: yes` only if a saved document must be rewritten to remain valid.
-
-## Sample JSON Payload
-
-```json
-{
-  "version": "0.1.0",
-  "sceneId": "scene_main",
-  "createdAtUtc": "2026-02-26T00:00:00Z",
-  "updatedAtUtc": "2026-02-26T00:00:00Z",
-  "characters": [
-    {
-      "id": "char_001",
-      "name": "EndBoss",
-      "mesh": {
-        "meshId": "mesh_endboss",
-        "uri": "assets/characters/endboss.glb",
-        "nodePath": "/Armature/Body"
-      },
-      "rig": {
-        "rootActuatorId": "act_root",
-        "actuators": [
-          {
-            "id": "act_root",
-            "parentId": null,
-            "type": "root",
-            "shape": "capsule",
-            "pivot": {
-              "mode": "capStart",
-              "offsetLocal": { "x": 0, "y": 0, "z": 0 }
-            },
-            "transform": {
-              "position": { "x": 0, "y": 1, "z": 0 },
-              "rotation": { "x": 0, "y": 0, "z": 0, "w": 1 },
-              "scale": { "x": 1, "y": 1, "z": 1 }
-            },
-            "size": { "x": 0.3, "y": 0.8, "z": 0.3 },
-            "joint": {
-              "mode": "fixed",
-              "angularLimitDeg": { "x": 0, "y": 0, "z": 0 },
-              "swingLimitDeg": 0,
-              "twistLimitDeg": 0
-            },
-            "physics": {
-              "mass": 1,
-              "linearDamping": 2,
-              "angularDamping": 2,
-              "gravityScale": 1,
-              "kinematicInRigMode": true
-            },
-            "influence": {
-              "radius": 0.8,
-              "falloff": 1,
-              "weight": 1
-            }
-          }
-        ]
-      },
-      "skinBinding": {
-        "version": "0.1",
-        "solver": "closestVolume",
-        "meshHash": "meshhash_001",
-        "bindingHash": "bindhash_001",
-        "generatedAtUtc": "2026-02-26T00:00:00Z",
-        "influenceCount": 1
-      },
-      "channels": {
-        "look": { "yaw": 0, "pitch": 0 },
-        "blink": { "left": 0, "right": 0 },
-        "custom": {}
-      }
-    }
-  ],
-  "playback": {
-    "fps": 60,
-    "durationSec": 10,
-    "activeClipId": null
-  },
-  "metadata": {
-    "sourceBaseline": "30c6ea7"
-  }
-}
 ```

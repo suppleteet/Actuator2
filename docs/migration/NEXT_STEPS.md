@@ -1,10 +1,10 @@
 # Next Steps (Post-Baseline Lock)
 
-This file defines the immediate execution sequence after locking Unity source baseline `30c6ea7`.
+This file defines the immediate execution sequence after locking Unity source baseline `30c6ea7`. **Note:** Sprint and handoff details from the previous workflow are in `docs/archive/codex-era/`. Active workflow is Cursor + `docs/PROJECT.md` and `.cursor/rules/`.
 
 ## 1) Kickoff Task (Required)
 
-Start with Sprint task `R-001` (`RuntimeAgent`) from [SPRINT_00.md](/c:/Projects/Actuator2/docs/planning/SPRINT_00.md):
+Start with runtime bootstrap (previously tracked as R-001):
 
 - Goal: initialize TypeScript + Vite + React + R3F + Rapier app shell.
 - Acceptance: app boots and renders a basic 3D scene.
@@ -18,30 +18,23 @@ Kickoff checklist (Strict Continuity):
 
 ## 2) Parallel Prep Tasks
 
-Run these while `R-001` is in progress:
-
-- `A-001` ArchitectAgent: finalize schema examples in [SCENE_SCHEMA.md](/c:/Projects/Actuator2/docs/contracts/SCENE_SCHEMA.md).
-- `A-002` ArchitectAgent: finalize mode/tool event taxonomy in [MODE_TOOL_STATE.md](/c:/Projects/Actuator2/docs/contracts/MODE_TOOL_STATE.md).
-
-These reduce rework before runtime/interaction features start.
+- Finalize schema examples in `docs/contracts/SCENE_SCHEMA.md`.
+- Finalize mode/tool event taxonomy in `docs/contracts/MODE_TOOL_STATE.md`.
 
 ## 3) Then Execute Vertical Slice
 
-After `R-001` merges:
+- WebXR entry + desktop fallback controls.
+- In-memory actuator prototype with stable IDs.
+- Selection highlight + transform affordance.
+- Recorder stub + deterministic playback clock.
+- Test runner + baseline contract tests.
 
-- `I-001` WebXR entry + desktop fallback controls.
-- `R-002` in-memory actuator prototype with stable IDs.
-- `I-002` selection highlight + transform affordance.
-- `N-001` recorder stub + deterministic playback clock.
-- `Q-001` test runner + baseline contract tests.
+## 4) Required Close-Out
 
-## 4) Required Handoff + Close-Out
+For each task/PR:
 
-For each task:
-
-- Publish handoff note using [HANDOFF_TEMPLATE.md](/c:/Projects/Actuator2/docs/handoffs/HANDOFF_TEMPLATE.md).
-- Complete [PR_CHECKLIST.md](/c:/Projects/Actuator2/docs/checklists/PR_CHECKLIST.md).
-- Include explicit contract impact (`none` or file list).
+- Complete `docs/checklists/PR_CHECKLIST.md`.
+- Include explicit contract impact (`none` or file list). For larger work, add a short note (what changed, why, validation, follow-ups) in the PR or under `docs/`.
 
 ## 5) Out-of-Scope Guardrail
 

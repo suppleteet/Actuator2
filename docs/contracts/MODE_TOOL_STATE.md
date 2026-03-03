@@ -1,22 +1,27 @@
-# Mode + Tool State Contract v0
+# Mode + Tool State Contract v1
 
-Status: finalized for Sprint 01 playback transition baseline (`A-004`).
+Status: finalized for Sprint 07 workflow scaffolding (`A-011`).
 
-## Modes
+## State Layers
+
+Sprint 07 separates user workflow intent from low-level runtime pose state:
+
+- Workflow mode (authoring intent): `Rigging`, `Animation`, `Puppeteering`
+- Runtime mode (simulation lane): `Rig`, `Pose`
+
+## Workflow Modes
+
+- `Rigging`
+- `Animation`
+- `Puppeteering`
+
+## Runtime Modes
+
 - `Rig`
-- `Sim`
-- `RecordPlayback`
-
-## Playback States
-- `Stopped`
-- `Playing`
-- `Scrubbing`
-
-## Input Hands
-- `primary`
-- `secondary`
+- `Pose`
 
 ## Tool IDs
+
 - `none`
 - `drawActuator`
 - `grab`
@@ -24,173 +29,89 @@ Status: finalized for Sprint 01 playback transition baseline (`A-004`).
 - `select`
 - `tumble`
 
-## Sprint 04 Draw Tool Desktop Semantics (`A-009`)
-
-- Desktop-only draw placement is enabled only when:
-  - `mode = Rig`
-  - simulation is disabled
-  - active desktop tool lane is draw (`drawActuator` parity behavior)
-- XR draw placement semantics are unchanged in Sprint 04 (out of scope).
-- Deterministic input behavior:
-  - `Ctrl + mouse wheel` adjusts draw radius in fixed increments with clamped min/max bounds.
-  - Standard wheel zoom must be suppressed while `Ctrl + mouse wheel` draw-radius adjustment is active.
-  - Cursor hit + fixed radius + same mirror/snap toggles must produce the same authored primitive result.
-- Mirror/snap draw parity:
-  - Mirrored creation is evaluated after centerline snap.
-  - If snapped to centerline threshold, mirrored duplicate is suppressed.
-  - Parenting selection for draw creation remains deterministic (stable active-rig parent resolution).
-
 ## Core State Shape
 
 ```ts
-type AppModeState = {
-  mode: "Rig" | "Sim" | "RecordPlayback";
-  playbackState: "Stopped" | "Playing" | "Scrubbing";
+type WorkflowMode = "Rigging" | "Animation" | "Puppeteering";
+type RuntimeMode = "Rig" | "Pose";
+
+type WorkflowState = {
+  workflowMode: WorkflowMode;
+  runtimeMode: RuntimeMode;
   physicsEnabled: boolean;
   skinningBusy: boolean;
-  activeToolsByHand: {
-    primary: ToolId;
-    secondary: ToolId;
-  };
-  selection: {
-    actuatorIds: string[];
-    characterIds: string[];
-  };
-  pendingTransition: ModeEventType | null;
+  activeTool: "select" | "translate" | "rotate" | "scale" | "draw" | "grab";
+  pendingTransition: WorkflowMode | null;
 };
 ```
 
-## Events
+## Ownership Boundaries
 
-```ts
-type ModeEventType =
-  | "ModeRequested"
-  | "ModeEntered"
-  | "ModeRejected"
-  | "PhysicsRequested"
-  | "PhysicsChanged"
-  | "PlaybackRequested"
-  | "PlaybackChanged"
-  | "ToolRequested"
-  | "ToolChanged"
-  | "SelectionChanged";
-```
+- `Rigging`:
+  - owns rig topology edits (`create/delete/reparent actuator`, `create rig`)
+  - owns authoring transforms and draw authoring
+  - must run with `runtimeMode=Rig` and `physicsEnabled=false`
+- `Animation`:
+  - owns timeline, bake-cache, and export-job authoring
+  - rig topology is read-only
+  - direct transform authoring is gated off except deterministic scrub/sample evaluation
+  - must run with `runtimeMode=Rig` and `physicsEnabled=false`
+- `Puppeteering`:
+  - owns live physics-driven manipulation lane
+  - rig topology is read-only
+  - canonical authoring state must be restored on exit unless explicitly committed by future contract work
+  - runs with `runtimeMode=Pose` and `physicsEnabled=true`
 
-## Transition Rules
+## Workflow Transition Rules
 
-### 1) `Rig -> Sim`
-- Precondition: `skinningBusy = false`.
-- Action: request physics enable.
-- Completion: `mode = Sim`, `physicsEnabled = true`.
-- Default tools:
-  - `primary = grab`
-  - `secondary = grab`
+### `Rigging -> Animation`
+- Actions:
+  - remain in `runtimeMode=Rig`
+  - keep `physicsEnabled=false`
+  - force non-destructive tool fallback (`select`) when current tool is disallowed
 
-### 2) `Sim -> Rig`
-- Precondition: none.
-- Action: disable physics with deterministic reset/blend-off.
-- Completion: `mode = Rig`, `physicsEnabled = false`.
-- Default tools:
-  - `primary = drawActuator`
-  - `secondary = grab`
+### `Animation -> Rigging`
+- Actions:
+  - remain in `runtimeMode=Rig`
+  - keep `physicsEnabled=false`
+  - preserve selection deterministically
 
-### 3) `Rig -> RecordPlayback`
-- Precondition: scene contains >= 1 character and valid rig root.
-- Action: initialize playback clock to deterministic tick source.
-- Completion: `mode = RecordPlayback`, `playbackState = Stopped`, `physicsEnabled = false`.
-- Default tools:
-  - `primary = grab`
-  - `secondary = grab`
+### `Rigging/Animation -> Puppeteering`
+- Preconditions:
+  - `skinningBusy=false`
+- Actions:
+  - enter `runtimeMode=Pose`
+  - enable physics
+  - force tool lane to `grab`
 
-### 4) `RecordPlayback -> Rig`
-- Precondition: none.
-- Action: stop playback and flush runtime transient track state.
-- Completion: `mode = Rig`, `playbackState = Stopped`.
+### `Puppeteering -> Rigging/Animation`
+- Actions:
+  - disable physics
+  - restore deterministic authoring snapshot
+  - enter `runtimeMode=Rig`
+  - apply target workflow mode with its default tool gate
 
-### 5) Rejections
-- Any mode request that violates preconditions emits `ModeRejected` with reason and leaves state unchanged.
+### Rejections
+- Any transition that violates preconditions emits `WorkflowModeRejected` with explicit reason and leaves state unchanged.
 
 ## Tool Gating Matrix
 
-Allowed tools by mode:
+Allowed authoring tools by workflow:
 
-- `Rig`: `drawActuator`, `grab`, `adjust`, `select`, `tumble`
-- `Sim`: `grab`, `tumble`, `select`
-- `RecordPlayback`: `grab`, `select`, `tumble`
+- `Rigging`: `select`, `translate`, `rotate`, `scale`, `draw`, `grab`
+- `Animation`: `select`, `grab`
+- `Puppeteering`: `grab`
 
-If disallowed tool is requested:
-- reject via `ToolChanged` with previous tool state unchanged.
+If a disallowed tool is requested:
+- reject and keep previous tool unchanged
+- surface explicit status/reason in UI lane
 
 ## Determinism Rules
-- All mode/tool transitions are event-driven and serialized through a single reducer/dispatcher.
-- For equal prior state + equal event sequence, resulting state must be identical.
-- Selection updates are ordered and stable (IDs sorted before write).
-- No hidden per-frame mutation of mode/tool state outside event handlers.
 
-## Multi-Rig Selection Notes (`A-006`)
-- Selection payload IDs must be globally unique at scene scope (safe across multiple rigs/characters).
-- Multi-select may span more than one rig; ordering remains deterministic (`lexicographic id` sort before commit).
-- Active selection primary ID determines the active rig context for subsequent creation/tool default behavior unless explicitly overridden by UI.
-
-## Event Payload Contracts
-
-```ts
-type ModeRequestedPayload = {
-  toMode: "Rig" | "Sim" | "RecordPlayback";
-  source: "ui" | "shortcut" | "api";
-};
-
-type ToolRequestedPayload = {
-  hand: "primary" | "secondary";
-  tool: ToolId;
-  source: "ui" | "shortcut" | "api";
-};
-
-type ModeRejectedPayload = {
-  requestedMode: "Rig" | "Sim" | "RecordPlayback";
-  reason: "SkinningBusy" | "InvalidRigState" | "InvalidPlaybackState" | "Unknown";
-};
-
-type PlaybackRequestedPayload = {
-  action: "record" | "play" | "stop" | "scrub";
-  clipId: string | null;
-  timeSec?: number; // required for scrub
-  source: "ui" | "shortcut" | "api";
-};
-
-type PlaybackChangedPayload = {
-  playbackState: "Stopped" | "Playing" | "Scrubbing";
-  activeClipId: string | null;
-  timeSec: number;
-};
-```
-
-## Record/Play/Stop/Scrub Transition Table
-
-All playback transitions are serialized through the same event dispatcher used by mode/tool changes.
-
-| Current mode/state | Event | Preconditions | Result |
-|---|---|---|---|
-| `RecordPlayback` + `Stopped` | `PlaybackRequested(action=record)` | valid scene + rig root | begin capture session, remain `Stopped` until explicit stop/commit |
-| `RecordPlayback` + `Stopped` | `PlaybackRequested(action=play)` | `activeClipId != null` | `playbackState = Playing`, clock seeks to `0` |
-| `RecordPlayback` + `Playing` | `PlaybackRequested(action=stop)` | none | `playbackState = Stopped`, clock time `0` |
-| `RecordPlayback` + `Stopped` | `PlaybackRequested(action=scrub,timeSec=t)` | `activeClipId != null`, finite `t` | `playbackState = Scrubbing`, sampled pose at `t` |
-| `RecordPlayback` + `Scrubbing` | `PlaybackRequested(action=scrub,timeSec=t)` | same as above | remain `Scrubbing`, sampled pose updated at `t` |
-| `RecordPlayback` + `Scrubbing` | `PlaybackRequested(action=play)` | `activeClipId != null` | `playbackState = Playing`, play from scrubbed `t` |
-| `RecordPlayback` + `Playing` | `PlaybackRequested(action=scrub,timeSec=t)` | finite `t` | `playbackState = Scrubbing`, play halted, pose sampled at `t` |
-| any non-`RecordPlayback` mode | any playback request | n/a | reject via `ModeRejected(reason=InvalidPlaybackState)` |
-
-## Playback Determinism Notes
-
-- Playback clock is fixed-step and monotonic for a given `fps`.
-- Scrub sampling must be pure with respect to `(clip data, timeSec)` input.
-- `stop` always returns playback time to `0` and applies the `t=0` pose for active clip when present.
-- Equal starting state + equal playback event sequence must produce equal `PlaybackChanged` sequence.
-
-## Example Transition Trace
-
-1. `ModeRequested(Rig -> Sim)`  
-2. `PhysicsRequested(enable=true)`  
-3. `PhysicsChanged(enabled=true)`  
-4. `ToolChanged(primary=grab, secondary=grab)`  
-5. `ModeEntered(Sim)`
+- Workflow transitions are reducer-driven and serialized.
+- Equal starting state + equal workflow event sequence must yield equal resulting state.
+- Transition side effects are explicit:
+  - runtime mode target
+  - physics target
+  - tool fallback
+- No hidden frame-loop mutation may change workflow state outside transition handlers.

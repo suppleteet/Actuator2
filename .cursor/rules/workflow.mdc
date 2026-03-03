@@ -1,0 +1,11 @@
+---
+description: Task and PR discipline — scope, contract impact, tests, checklist
+alwaysApply: true
+---
+
+# Workflow
+
+- **Scope:** Keep PRs small (1–3 focused concerns). Before starting a task, confirm scope, non-goals, and which contract(s) apply.
+- **Contract impact:** Every PR states impact: `none` or list of files under `docs/contracts/`.
+- **Tests:** Add or update tests for behavior changes. `npm test` and `npm run build` must pass.
+- **Done:** Before merge, complete `docs/checklists/PR_CHECKLIST.md`. For larger or cross-cutting work, leave a short note in the PR or a doc under `docs/` (what changed, why, validation, follow-ups).

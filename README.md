@@ -4,23 +4,16 @@ Browser-based WebXR migration of the legacy Unity Actuator tool.
 
 ## Quick Start
 
-1. Review workflow docs in `docs/TEAM_WORKFLOW.md`.
-2. Start from Sprint 0 in `docs/planning/SPRINT_00.md`.
-3. Follow role contracts in `AGENTS.md` and `docs/contracts/README.md`.
-4. Apply strict continuity protocol in `docs/STRICT_CONTINUITY.md`.
+1. Read **`docs/PROJECT.md`** for project context, Unity baseline, contracts, and codebase shape.
+2. Use **`AGENTS.md`** for roles and where the Cursor agent gets its instructions.
+3. See **`docs/CURSOR_SETUP.md`** for how Cursor is configured (rules, checklist).
 
 ## Current Status
 
-- Repository initialized
-- Agent-team workflow scaffolded
-- Runtime bootstrap complete (`R-001`)
-- XR entry + desktop fallback controls complete (`I-001`)
-- Runtime actuator prototype complete (`R-002`)
-- Animation recorder/playback stub complete (`N-001`)
-- QA test runner + baseline contract tests complete (`Q-001`)
-- QA manual XR/desktop checklist complete (`Q-002`)
+- Runtime bootstrap, XR + desktop controls, actuator prototype, animation recorder/playback stub, QA test runner and checklist are in place.
+- Workflow modes (Rigging / Animation / Puppeteering), scene save/load, mesh import, and bake/export scaffolding are in place. See `docs/PROJECT.md` and the contracts in `docs/contracts/`.
 
 ## GitHub Pages Build
 
 - Build with base-path safety: set `VITE_BASE_PATH=/<repo-name>/` before `npm run build`.
-- CI workflow `/.github/workflows/sprint-pages.yml` builds on branch pushes and deploys on the repository default branch.
+- CI: `/.github/workflows/sprint-pages.yml` builds on branch pushes and deploys on the default branch.

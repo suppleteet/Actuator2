@@ -1,0 +1,12 @@
+---
+description: Respect contracts when changing behavior or schema
+globs: src/**/*.ts, src/**/*.tsx, docs/contracts/**/*
+alwaysApply: false
+---
+
+# Contracts
+
+- **Contracts** in `docs/contracts/` are the source of truth for scene schema, mode/tool state, rig runtime, and timeline/recording. See `docs/contracts/README.md`.
+- Before changing behavior or persistence: read the relevant contract. Do not bypass or contradict it.
+- If the product requirement conflicts with a contract, update the contract first (in a dedicated change with examples), then implement.
+- Backward-incompatible contract changes require migration notes.

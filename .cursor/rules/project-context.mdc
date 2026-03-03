@@ -1,0 +1,11 @@
+---
+description: Actuator2 project identity, baseline, and invariants
+alwaysApply: true
+---
+
+# Project Context
+
+- This repo is **Actuator2**: a browser/WebXR reimplementation of the Unity Actuator tool (rig/puppet authoring, animation, XR). Stack: TypeScript, Vite, React, R3F, Rapier.
+- **Unity baseline:** Reference only at `c:\Projects\Actuator` commit `30c6ea7`. We reimplement behavior; we do not copy Unity code. Scope is `Assets/Actuator`. See `docs/migration/SOURCE_BASELINE.md`.
+- **Single source of truth:** `docs/PROJECT.md` — read it for goals, contracts, codebase shape, and invariants.
+- **Invariants:** Deterministic save/load, playback, and mode transitions. Browser + desktop fallback. Small PRs. Every change states contract impact.

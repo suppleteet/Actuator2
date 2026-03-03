@@ -156,3 +156,28 @@ Known limits:
 - GitHub Pages deploy cannot be fully confirmed locally without repository Actions execution.
 
 Result: partial-pass (automation complete, hardware/deploy environment checks pending)
+
+## Sprint 07 Workflow + Scene IO + Import/Export Evidence (Q-017)
+- Tester: Codex (ArchitectAgent + RuntimeAgent + InteractionAgent + AnimationAgent + QAAgent simulation run)
+- Date: 2026-03-03
+- Scope: workflow mode scaffolding, scene save/load envelope, mesh import lane, bake/export scaffolding
+
+Desktop evidence:
+- Pass: Workflow switcher (`Rigging`, `Animation`, `Puppeteering`) is visible and deterministic.
+- Pass: Disallowed workflow actions are explicitly gated in UI and runtime handlers (create/delete/reparent/draw in non-rigging lanes).
+- Pass: Scene save writes a versioned envelope payload with deterministic ordering.
+- Pass: Scene load restores scene identity, actuator IDs, and workflow mode deterministically.
+- Pass: Mesh import supports baseline `FBX` lane via file picker and drag/drop.
+- Pass: Unsupported mesh formats surface explicit failure messages.
+- Pass: Bake capture generates deterministic cache IDs/frames for equal input.
+- Pass: Export pipeline supports baseline BVH file output and explicit unsupported statuses for non-implemented formats.
+
+Automated evidence:
+- Pass: `npm test` (includes Sprint 07 suites: workflow, scene persistence, mesh import, bake/export).
+- Pass: `npm run build`.
+
+Known limits:
+- XR hardware-specific workflow/input checks remain pending on target headset/browser.
+- Export formats beyond BVH are intentionally scaffolded as unsupported in Sprint 07.
+
+Result: pass (desktop + automated; XR hardware follow-up still required)
