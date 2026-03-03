@@ -2413,7 +2413,11 @@ export default function App() {
 
       if (event.code === "Space") {
         event.preventDefault();
-        requestWorkflowMode(workflowMode === "Puppeteering" ? "Rigging" : "Puppeteering");
+        if (physicsEnabled) {
+          requestAppMode("Rig");
+        } else {
+          requestAppMode("Pose");
+        }
         return;
       }
 
@@ -2459,6 +2463,7 @@ export default function App() {
     appMode,
     pendingPoseRevision,
     physicsEnabled,
+    requestAppMode,
     selectedActuatorId,
     selectedActuatorIds,
     selectedRigId,
