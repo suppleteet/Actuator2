@@ -1,6 +1,6 @@
 # Mode + Tool State Contract v0
 
-Status: finalized for Sprint 00 baseline (`A-002`).
+Status: finalized for Sprint 01 playback transition baseline (`A-004`).
 
 ## Modes
 - `Rig`
@@ -23,6 +23,22 @@ Status: finalized for Sprint 00 baseline (`A-002`).
 - `adjust`
 - `select`
 - `tumble`
+
+## Sprint 04 Draw Tool Desktop Semantics (`A-009`)
+
+- Desktop-only draw placement is enabled only when:
+  - `mode = Rig`
+  - simulation is disabled
+  - active desktop tool lane is draw (`drawActuator` parity behavior)
+- XR draw placement semantics are unchanged in Sprint 04 (out of scope).
+- Deterministic input behavior:
+  - `Ctrl + mouse wheel` adjusts draw radius in fixed increments with clamped min/max bounds.
+  - Standard wheel zoom must be suppressed while `Ctrl + mouse wheel` draw-radius adjustment is active.
+  - Cursor hit + fixed radius + same mirror/snap toggles must produce the same authored primitive result.
+- Mirror/snap draw parity:
+  - Mirrored creation is evaluated after centerline snap.
+  - If snapped to centerline threshold, mirrored duplicate is suppressed.
+  - Parenting selection for draw creation remains deterministic (stable active-rig parent resolution).
 
 ## Core State Shape
 
@@ -111,6 +127,11 @@ If disallowed tool is requested:
 - Selection updates are ordered and stable (IDs sorted before write).
 - No hidden per-frame mutation of mode/tool state outside event handlers.
 
+## Multi-Rig Selection Notes (`A-006`)
+- Selection payload IDs must be globally unique at scene scope (safe across multiple rigs/characters).
+- Multi-select may span more than one rig; ordering remains deterministic (`lexicographic id` sort before commit).
+- Active selection primary ID determines the active rig context for subsequent creation/tool default behavior unless explicitly overridden by UI.
+
 ## Event Payload Contracts
 
 ```ts
@@ -129,7 +150,42 @@ type ModeRejectedPayload = {
   requestedMode: "Rig" | "Sim" | "RecordPlayback";
   reason: "SkinningBusy" | "InvalidRigState" | "InvalidPlaybackState" | "Unknown";
 };
+
+type PlaybackRequestedPayload = {
+  action: "record" | "play" | "stop" | "scrub";
+  clipId: string | null;
+  timeSec?: number; // required for scrub
+  source: "ui" | "shortcut" | "api";
+};
+
+type PlaybackChangedPayload = {
+  playbackState: "Stopped" | "Playing" | "Scrubbing";
+  activeClipId: string | null;
+  timeSec: number;
+};
 ```
+
+## Record/Play/Stop/Scrub Transition Table
+
+All playback transitions are serialized through the same event dispatcher used by mode/tool changes.
+
+| Current mode/state | Event | Preconditions | Result |
+|---|---|---|---|
+| `RecordPlayback` + `Stopped` | `PlaybackRequested(action=record)` | valid scene + rig root | begin capture session, remain `Stopped` until explicit stop/commit |
+| `RecordPlayback` + `Stopped` | `PlaybackRequested(action=play)` | `activeClipId != null` | `playbackState = Playing`, clock seeks to `0` |
+| `RecordPlayback` + `Playing` | `PlaybackRequested(action=stop)` | none | `playbackState = Stopped`, clock time `0` |
+| `RecordPlayback` + `Stopped` | `PlaybackRequested(action=scrub,timeSec=t)` | `activeClipId != null`, finite `t` | `playbackState = Scrubbing`, sampled pose at `t` |
+| `RecordPlayback` + `Scrubbing` | `PlaybackRequested(action=scrub,timeSec=t)` | same as above | remain `Scrubbing`, sampled pose updated at `t` |
+| `RecordPlayback` + `Scrubbing` | `PlaybackRequested(action=play)` | `activeClipId != null` | `playbackState = Playing`, play from scrubbed `t` |
+| `RecordPlayback` + `Playing` | `PlaybackRequested(action=scrub,timeSec=t)` | finite `t` | `playbackState = Scrubbing`, play halted, pose sampled at `t` |
+| any non-`RecordPlayback` mode | any playback request | n/a | reject via `ModeRejected(reason=InvalidPlaybackState)` |
+
+## Playback Determinism Notes
+
+- Playback clock is fixed-step and monotonic for a given `fps`.
+- Scrub sampling must be pure with respect to `(clip data, timeSec)` input.
+- `stop` always returns playback time to `0` and applies the `t=0` pose for active clip when present.
+- Equal starting state + equal playback event sequence must produce equal `PlaybackChanged` sequence.
 
 ## Example Transition Trace
 

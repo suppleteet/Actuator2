@@ -1,6 +1,6 @@
 # Scene Schema v0
 
-Status: finalized for Sprint 00 baseline (`A-001`).
+Status: finalized for Sprint 01 persistence baseline (`A-003`).
 
 ## Goals
 - Provide a deterministic, serializable scene document.
@@ -20,6 +20,36 @@ type SceneDocument = {
   metadata?: Record<string, string>;
 };
 ```
+
+## Required Fields (Save/Load Contract)
+
+Required root keys:
+- `version`
+- `sceneId`
+- `createdAtUtc`
+- `updatedAtUtc`
+- `characters`
+- `playback`
+
+Required character keys:
+- `id`
+- `name`
+- `mesh`
+- `rig`
+- `skinBinding`
+- `channels`
+
+Required actuator keys:
+- `id`
+- `parentId`
+- `type`
+- `shape`
+- `pivot`
+- `transform`
+- `size`
+- `joint`
+- `physics`
+- `influence`
 
 ## Character Document
 
@@ -44,6 +74,25 @@ type MeshRef = {
 };
 ```
 
+## Sprint 01 Mesh Import Constraints (`A-005`)
+
+These constraints define the current migration boundary for mesh integration work:
+
+- Supported source baseline for Sprint 01:
+  - Unity baseline `30c6ea7` Chad asset set migrated to web assets path (`assets/chad/*`).
+  - Runtime import path currently targets `assets/chad/Chad.fbx`.
+- Runtime behavior boundary:
+  - Mesh-only rendering path is in scope.
+  - Embedded skeleton, animation clips, and playback coupling are out of scope for Sprint 01 runtime integration.
+- Material handling baseline:
+  - Runtime consumes texture maps from migrated Chad asset folder when available.
+  - Unity `.mat` files are treated as source references; runtime shading uses explicit web material setup.
+  - Missing maps must fall back to deterministic default material values (no random or device-specific variation).
+- Mesh identity and determinism:
+  - `mesh.meshId` must remain stable for the same imported source asset.
+  - `mesh.uri` must be a deterministic relative runtime path.
+  - `mesh.nodePath` is optional and may be omitted for single-mesh import usage.
+
 ## Rig
 
 ```ts
@@ -61,13 +110,24 @@ type ActuatorNodeDocument = {
   parentId: string | null;
   type: "root" | "spine" | "limb" | "joint" | "secondary" | "custom";
   shape: "capsule" | "sphere" | "box";
+  pivot: ActuatorPivotDocument;
   transform: TransformDocument;
   size: Vec3;
   joint: JointDocument;
   physics: PhysicsDocument;
   influence: InfluenceDocument;
 };
+
+type ActuatorPivotDocument = {
+  mode: "capStart" | "center";
+  offsetLocal: Vec3;
+};
 ```
+
+`size` is primitive-dimension data (not transform-scale authoring data):
+- `capsule`: `{ x,z = diameter axes, y = axis distance between cap centers }`
+- `sphere`: `{ x,y,z = diameter axes (uniform spheres should keep equal values) }`
+- `box`: `{ x,y,z = side lengths }`
 
 ## Shared Value Types
 
@@ -145,14 +205,60 @@ type PlaybackDocument = {
 - Actuator graph must be acyclic.
 - `parentId = null` only for the root actuator.
 - Quaternion values must be finite numbers.
+- For capsules, default pivot mode is `capStart` (first cap sphere center) unless explicitly set to `center`.
 - Serialization order must be stable:
   - `characters` sorted by `id`
   - each `actuators` list sorted by `id`
+
+## Multi-Rig Scene Rules (`A-006`)
+
+- A scene may contain multiple independent character rigs via `characters[]`.
+- Actuator IDs must be globally unique across the full scene (not only within a single character).
+- Parent-child relationships are constrained to the same character rig.
+- Cross-rig parenting is invalid and must be rejected during validation/load.
+- Selection and tool operations may target actuators across rigs, but serialization must preserve per-character rig ownership.
+- Deterministic ordering still applies scene-wide (`characters` then each character's `actuators`).
+
+## Load Defaults (Explicit Materialization)
+
+Loader must materialize explicit values so runtime behavior is deterministic:
+
+- Missing `metadata` -> `{}`.
+- Missing `mesh.nodePath` -> omitted (do not synthesize a placeholder path).
+- Missing `channels.custom` -> `{}`.
+- Missing `playback.activeClipId` -> `null`.
+
+No other required field can be omitted; documents missing required fields are invalid and must be rejected before runtime mutation.
+
+## Round-Trip Behavior
+
+`save(load(doc))` and `load(save(state))` must be deterministic:
+- Preserve immutable identifiers (`sceneId`, character IDs, actuator IDs).
+- Preserve actuator parent graph topology and transforms.
+- Preserve explicit value types (numbers remain numbers, booleans remain booleans).
+- Preserve sorted output order for `characters` and `actuators`.
+- `updatedAtUtc` may change on save; all other persisted fields must remain equivalent unless edited by user action.
 
 ## Determinism Notes
 - Save then immediate load must yield equivalent document data (modulo `updatedAtUtc`).
 - Playback/runtime systems must consume only serialized values, not editor transient state.
 - Defaults must be explicit at serialization time (no hidden engine defaults).
+
+## Migration Note Format
+
+When schema or load behavior changes, record a migration note entry in task/PR docs using this format:
+
+```md
+Migration Note:
+- schema_version_from:
+- schema_version_to:
+- change_summary:
+- backward_compat_strategy:
+- deterministic_impact:
+- required_rewrite: yes/no
+```
+
+Use `required_rewrite: yes` only if a saved document must be rewritten to remain valid.
 
 ## Sample JSON Payload
 
@@ -179,6 +285,10 @@ type PlaybackDocument = {
             "parentId": null,
             "type": "root",
             "shape": "capsule",
+            "pivot": {
+              "mode": "capStart",
+              "offsetLocal": { "x": 0, "y": 0, "z": 0 }
+            },
             "transform": {
               "position": { "x": 0, "y": 1, "z": 0 },
               "rotation": { "x": 0, "y": 0, "z": 0, "w": 1 },
