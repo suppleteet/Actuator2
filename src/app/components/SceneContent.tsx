@@ -250,6 +250,8 @@ function PosePhysicsBridge({
   const rootMoverAnchorBodyRef = useRef<RawRigidBody | null>(null);
   const rootMoverJointRef = useRef<ImpulseJoint | null>(null);
   const rootMoverActuatorIdRef = useRef<string | null>(null);
+  const rootMoverStiffnessRef = useRef<number>(0);
+  const rootMoverDampingRef = useRef<number>(0);
 
   const clearRootMoverBridge = useCallback(() => {
     if (rootMoverJointRef.current !== null) {
@@ -274,7 +276,9 @@ function PosePhysicsBridge({
       const hasValidBridge =
         rootMoverActuatorIdRef.current === actuatorId &&
         rootMoverAnchorBodyRef.current !== null &&
-        rootMoverJointRef.current !== null;
+        rootMoverJointRef.current !== null &&
+        Math.abs(rootMoverStiffnessRef.current - stiffness) < 1 &&
+        Math.abs(rootMoverDampingRef.current - damping) < 1;
       if (!hasValidBridge) {
         clearRootMoverBridge();
         const anchorDesc = rapier.RigidBodyDesc.kinematicPositionBased()
@@ -294,6 +298,8 @@ function PosePhysicsBridge({
         rootMoverAnchorBodyRef.current = anchorBody;
         rootMoverJointRef.current = springJoint;
         rootMoverActuatorIdRef.current = actuatorId;
+        rootMoverStiffnessRef.current = stiffness;
+        rootMoverDampingRef.current = damping;
       }
       updateRootMoverTarget(position);
     },
@@ -375,7 +381,7 @@ function PosePhysicsBridge({
         deadband: 0.0012,
       };
       const rotationSpring = {
-        stiffness: Math.max(0.45, drive.rotationStiffness * Math.max(0, physicsTuning.rotationStiffness)),
+        stiffness: Math.max(0.01, drive.rotationStiffness * Math.max(0, physicsTuning.rotationStiffness)),
         velocityBlend: Math.max(
           0.08,
           Math.min(1, drive.rotationVelocityBlend * Math.max(0, physicsTuning.rotationVelocityBlend)),
@@ -411,7 +417,10 @@ function PosePhysicsBridge({
           rootDeltaQ.y * rootDeltaQ.y +
           rootDeltaQ.z * rootDeltaQ.z,
         );
-        let desiredRootAngularVelocity = rootAngularVelocity.clone().multiplyScalar(0.6);
+        // Plain PD matching child drive: desired = stiffness * errorAxis, blend from current.
+        // The previous formula subtracted damping*velocity from the error then lerped 20% back,
+        // which caused oscillation: near zero error with nonzero velocity it would overshoot every frame.
+        let desiredRootAngularVelocity = new Vector3(0, 0, 0);
         let rootAngle = 0;
         if (rootSinHalfAngle >= 1e-6) {
           const rootAxisScale = 1 / rootSinHalfAngle;
@@ -421,16 +430,33 @@ function PosePhysicsBridge({
             rootDeltaQ.y * rootAxisScale,
             rootDeltaQ.z * rootAxisScale,
           ).multiplyScalar(rootAngle);
-          const rootRotationGain = Math.max(0.45, Math.min(3.2, rotationSpring.stiffness * 0.21));
-          const rootAngularDamping = Math.max(2.6, Math.min(8, 2.2 + rotationSpring.velocityBlend * 5.8));
-          desiredRootAngularVelocity = rootErrorAxis.addScaledVector(rootAngularVelocity, -rootAngularDamping);
-          desiredRootAngularVelocity.multiplyScalar(rootRotationGain);
-          desiredRootAngularVelocity.lerp(rootAngularVelocity, 0.2);
+          const rootDesiredVel = rootErrorAxis.clone().multiplyScalar(rotationSpring.stiffness);
+          desiredRootAngularVelocity = rootAngularVelocity.clone().lerp(rootDesiredVel, rotationSpring.velocityBlend);
         }
+
+        // Gravity compensation: each direct child's weight torques the root through the spherical joint.
+        // Pre-apply counter-velocity so the rotation spring doesn't have to fight gravity continuously.
+        {
+          const rootWorldPos = body.translation();
+          const rootInertiaApprox = Math.max(1, rootMass) * 0.25;
+          for (const childAct of actuators) {
+            if (childAct.parentId !== actuator.id) continue;
+            const childBody = bodyRefs[childAct.id]?.current;
+            if (!childBody) continue;
+            const cp = childBody.translation();
+            const r = new Vector3(cp.x - rootWorldPos.x, cp.y - rootWorldPos.y, cp.z - rootWorldPos.z);
+            if (r.lengthSq() < 1e-4) continue;
+            // Joint reaction on root = upward force at anchor position → torque = r × (0, +m*g, 0)
+            const reactionTorque = r.clone().cross(new Vector3(0, 9.81 * childBody.mass(), 0));
+            desiredRootAngularVelocity.sub(reactionTorque.multiplyScalar(1 / (rootInertiaApprox * 60)));
+          }
+        }
+
         if (rootAngle <= Math.max(rotationSpring.deadband * 3, 0.004) && rootAngularVelocity.length() <= 0.05) {
           desiredRootAngularVelocity.set(0, 0, 0);
         }
-        const maxRootAngularSpeed = Math.max(0.3, Math.min(2.6, rotationSpring.maxAngularSpeed * 0.33));
+        // Raised from 0.33× (≈2.6 rad/s cap) — root needs headroom to overcome child gravity loading.
+        const maxRootAngularSpeed = Math.max(0.8, rotationSpring.maxAngularSpeed * 0.7);
         const desiredRootAngularSpeed = desiredRootAngularVelocity.length();
         if (desiredRootAngularSpeed > maxRootAngularSpeed) {
           desiredRootAngularVelocity.multiplyScalar(maxRootAngularSpeed / desiredRootAngularSpeed);
@@ -490,16 +516,53 @@ function PosePhysicsBridge({
         angle,
       );
       const worldErrorAxis = localErrorAxis.applyQuaternion(currentParentQ);
+
+      // Soft angular limit: when the joint has deviated past its preset's maximum allowed angle,
+      // boost corrective stiffness proportionally to the excess so it can't exceed the range.
+      const presetSettings = getActuatorPresetSettings(actuator);
+      const maxLimitRad =
+        Math.max(
+          Math.abs(presetSettings.angularXLowLimit),
+          presetSettings.angularXHighLimit,
+          presetSettings.angularYLimit,
+          presetSettings.angularZLimit,
+        ) * (Math.PI / 180);
+      const limitExcess = Math.max(0, angle - maxLimitRad);
+      const limitBoostFactor = limitExcess > 0 ? 1 + limitExcess * 4.0 : 1;
+
+      // Hinge joint: presets with Locked Y/Z (e.g. ElbowKnee) should only drive around the
+      // joint's local X axis and damp any swing velocity relative to the parent.
+      const isHinge = presetSettings.angularYMotion === "Locked" && presetSettings.angularZMotion === "Locked";
+      const hingeAxisWorld = isHinge
+        ? new Vector3(1, 0, 0).applyQuaternion(currentParentQ.clone().multiply(targetLocalQ))
+        : null;
+      // For hinges, project the error correction onto the hinge axis so only twist is driven.
+      const correctionAxis =
+        hingeAxisWorld !== null
+          ? hingeAxisWorld.clone().multiplyScalar(worldErrorAxis.dot(hingeAxisWorld))
+          : worldErrorAxis;
+
       const rotationErrorMagnitude = worldErrorAxis.length();
       const relativeAngularSpeed = Math.hypot(relativeAngularVelocity.x, relativeAngularVelocity.y, relativeAngularVelocity.z);
-      if (rotationErrorMagnitude >= rotationSpring.deadband || relativeAngularSpeed >= 0.03) {
+      if (rotationErrorMagnitude >= rotationSpring.deadband || relativeAngularSpeed >= 0.03 || limitExcess > 0) {
         const currentAngularVelocity = new Vector3(angularVelocity.x, angularVelocity.y, angularVelocity.z);
         const desiredAngularVelocity = new Vector3(
           parentAngularVelocitySafe.x,
           parentAngularVelocitySafe.y,
           parentAngularVelocitySafe.z,
-        ).addScaledVector(worldErrorAxis, rotationSpring.stiffness);
+        ).addScaledVector(correctionAxis, rotationSpring.stiffness * limitBoostFactor);
         const blendedAngularVelocity = currentAngularVelocity.lerp(desiredAngularVelocity, rotationSpring.velocityBlend);
+        // For hinge joints: damp the swing component of relative angular velocity (Y/Z relative to parent)
+        // so the joint doesn't flop sideways while still following the parent's world rotation.
+        if (hingeAxisWorld !== null) {
+          const relVelHingeProj =
+            relativeAngularVelocity.x * hingeAxisWorld.x +
+            relativeAngularVelocity.y * hingeAxisWorld.y +
+            relativeAngularVelocity.z * hingeAxisWorld.z;
+          blendedAngularVelocity.x -= (relativeAngularVelocity.x - relVelHingeProj * hingeAxisWorld.x) * 0.95;
+          blendedAngularVelocity.y -= (relativeAngularVelocity.y - relVelHingeProj * hingeAxisWorld.y) * 0.95;
+          blendedAngularVelocity.z -= (relativeAngularVelocity.z - relVelHingeProj * hingeAxisWorld.z) * 0.95;
+        }
         const angularSpeed = blendedAngularVelocity.length();
         if (angularSpeed > rotationSpring.maxAngularSpeed) {
           blendedAngularVelocity.multiplyScalar(rotationSpring.maxAngularSpeed / angularSpeed);
@@ -509,14 +572,57 @@ function PosePhysicsBridge({
           true,
         );
       } else {
-        body.setAngvel(
-          {
-            x: parentAngularVelocitySafe.x * 0.98,
-            y: parentAngularVelocitySafe.y * 0.98,
-            z: parentAngularVelocitySafe.z * 0.98,
-          },
-          true,
+        let settledX = parentAngularVelocitySafe.x * 0.98;
+        let settledY = parentAngularVelocitySafe.y * 0.98;
+        let settledZ = parentAngularVelocitySafe.z * 0.98;
+        // Damp swing in settled state for hinge joints too.
+        if (hingeAxisWorld !== null) {
+          const relVelHingeProj =
+            relativeAngularVelocity.x * hingeAxisWorld.x +
+            relativeAngularVelocity.y * hingeAxisWorld.y +
+            relativeAngularVelocity.z * hingeAxisWorld.z;
+          settledX -= (relativeAngularVelocity.x - relVelHingeProj * hingeAxisWorld.x) * 0.95;
+          settledY -= (relativeAngularVelocity.y - relVelHingeProj * hingeAxisWorld.y) * 0.95;
+          settledZ -= (relativeAngularVelocity.z - relVelHingeProj * hingeAxisWorld.z) * 0.95;
+        }
+        body.setAngvel({ x: settledX, y: settledY, z: settledZ }, true);
+      }
+
+      // Position spring for presets with authored translational drive (MuscleJiggle, FatJiggle, etc.).
+      // Target is computed relative to the parent body's current world position and rotation so the
+      // jiggle follows the parent as it moves, rather than pulling toward the static bind-pose origin.
+      if (drive.positionStiffness > 0) {
+        const parentCurrentPos = parentBody.translation();
+        // Rest offset in parent-local space (from bind pose world positions).
+        const bindWorldOffset = new Vector3(
+          target.position.x - parentTarget.position.x,
+          target.position.y - parentTarget.position.y,
+          target.position.z - parentTarget.position.z,
         );
+        const parentLocalRestOffset = bindWorldOffset.clone().applyQuaternion(targetParentQ.clone().invert());
+        const dynamicJiggleTarget = new Vector3(
+          parentCurrentPos.x,
+          parentCurrentPos.y,
+          parentCurrentPos.z,
+        ).add(parentLocalRestOffset.clone().applyQuaternion(currentParentQ));
+        const posError = dynamicJiggleTarget.clone().sub(
+          new Vector3(sampledPosition.x, sampledPosition.y, sampledPosition.z),
+        );
+        if (posError.length() > positionSpring.deadband) {
+          const linearVelVec = body.linvel();
+          const dt = 1 / 60;
+          const springImpulse = posError.clone().multiplyScalar(drive.positionStiffness * dt);
+          const dampImpulse = isFiniteVec3(linearVelVec)
+            ? new Vector3(linearVelVec.x, linearVelVec.y, linearVelVec.z).multiplyScalar(-drive.positionDamping * dt)
+            : new Vector3();
+          const totalImpulse = springImpulse.add(dampImpulse);
+          const maxImpulse = body.mass() * positionSpring.maxLinearSpeed;
+          const impulseMag = totalImpulse.length();
+          if (impulseMag > maxImpulse) {
+            totalImpulse.multiplyScalar(maxImpulse / impulseMag);
+          }
+          body.applyImpulse({ x: totalImpulse.x, y: totalImpulse.y, z: totalImpulse.z }, true);
+        }
       }
     }
     if (!hasRoot) {
