@@ -1,3 +1,4 @@
+/* --- Globals & CSS variables --- */
 :root {
   font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
   color-scheme: dark;
@@ -33,6 +34,7 @@ body,
   height: 100%;
 }
 
+/* --- App layout --- */
 .app {
   width: 100%;
   height: 100%;
@@ -40,6 +42,7 @@ body,
   grid-template-rows: auto 1fr;
 }
 
+/* --- Header --- */
 .app__header {
   padding: 8px 14px;
   border-bottom: 1px solid var(--border);
@@ -93,6 +96,7 @@ body,
   color: var(--text-muted);
 }
 
+/* --- Viewport & panel --- */
 .app__viewport {
   min-height: 0;
   display: grid;

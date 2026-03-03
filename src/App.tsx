@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type DragEvent as ReactDragEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { flushSync } from "react-dom";
 import { Canvas } from "@react-three/fiber";
 import { XR, createXRStore } from "@react-three/xr";
@@ -35,6 +44,7 @@ import {
   defaultPresetForActuatorType,
 } from "./runtime/physicsPresets";
 import { resolvePublicAssetUrl } from "./runtime/assetPaths";
+import { integrateImportedMesh, normalizeMeshImport } from "./runtime/meshImport";
 import { createRootActuator, composeMatrix } from "./app/actuatorModel";
 import { smoothDampQuat, smoothDampVec3, type SmoothDampQuatVelocity, type SmoothDampVec3Velocity } from "./app/smoothDamp";
 import {
@@ -53,10 +63,49 @@ import {
   type SkinningStats,
   type Vec3,
 } from "./app/types";
+import {
+  SceneLoadError,
+  createSceneEnvelope,
+  parseSceneEnvelope,
+  sceneSnapshotFromEnvelope,
+  stableSerializeSceneEnvelope,
+  type ImportedMeshDocument,
+  type SceneSnapshot,
+} from "./runtime/scenePersistence";
+import {
+  clampToolToWorkflow,
+  isToolAllowedForWorkflow,
+  transitionWorkflowState,
+  type WorkflowMode,
+} from "./runtime/workflow";
+import { captureBakeCache, type BakeCache } from "./animation/bakeCache";
+import { createDefaultBakeExportRegistry, type ExportFormatId } from "./animation/exportPipeline";
+import {
+  DEFAULT_DELTA_MUSH_SETTINGS,
+  DEFAULT_PHYSICS_TUNING,
+  DEFAULT_WORKFLOW_MODE,
+  MIXED_PRESET_VALUE,
+  POSE_TOOL_MODE,
+  SCENE_PLAYBACK_FPS,
+} from "./app/constants";
+import {
+  downloadTextFile,
+  extractActuatorIndex,
+  extractNumericSuffix,
+  gizmoModeFromWorkflowTool,
+  workflowToolFromGizmoMode,
+} from "./app/utils";
 import { DesktopInertialCameraControls } from "./app/components/DesktopInertialCameraControls";
 import { PlaybackDriver } from "./app/components/PlaybackDriver";
 import { SceneContent } from "./app/components/SceneContent";
 import { ViewCube } from "./app/components/ViewCube";
+import { ActionsPanel } from "./app/components/panels/ActionsPanel";
+import { AppHeader } from "./app/components/panels/AppHeader";
+import { OutlinerPanel } from "./app/components/panels/OutlinerPanel";
+import { SceneIOPanel } from "./app/components/panels/SceneIOPanel";
+import { EditorProvider } from "./app/EditorContext";
+import { StatusPanel } from "./app/components/panels/StatusPanel";
+import { ToolsPanel } from "./app/components/panels/ToolsPanel";
 
 const xrStore = createXRStore({
   offerSession: false,
@@ -64,59 +113,44 @@ const xrStore = createXRStore({
   emulate: false,
 });
 
-const DEFAULT_PHYSICS_TUNING: PhysicsTuning = {
-  solverIterations: 10,
-  internalPgsIterations: 3,
-  additionalSolverIterations: 6,
-  bodyLinearDamping: 1.1,
-  bodyAngularDamping: 1.2,
-  rotationStiffness: 1,
-  rotationVelocityBlend: 0.92,
-  maxAngularSpeed: 0.9,
-  pullStiffness: 240,
-  pullDamping: 42,
-  pullMaxForce: 4200,
-};
-
-const DEFAULT_DELTA_MUSH_SETTINGS: DeltaMushSettings = {
-  iterations: 8,
-  strength: 0.75,
-};
-
-const ACTUATOR_PRESET_OPTIONS: ActuatorPreset[] = [
-  "Default",
-  "Root",
-  "SpinePelvis",
-  "NeckHead",
-  "ArmLeg",
-  "ElbowKnee",
-  "Finger",
-  "MuscleJiggle",
-  "FatJiggle",
-  "Dangly",
-  "Floppy",
-];
-const MIXED_PRESET_VALUE = "__mixed__";
-
-const POSE_TOOL_MODE: GizmoMode = "translate";
-
 export default function App() {
-  const sceneMeshSources = useMemo<ActiveMeshSource[]>(
-    () => [
-      {
-        id: "mesh_chad",
-        meshUri: resolvePublicAssetUrl("assets/chad/Chad.fbx"),
-        colorMapUri: resolvePublicAssetUrl("assets/chad/Textures/chad_Col.png"),
-        normalMapUri: resolvePublicAssetUrl("assets/chad/Textures/chad_Norm.png"),
-        roughnessMapUri: resolvePublicAssetUrl("assets/chad/Textures/chad_Pbr.png"),
-        worldScale: 0.01,
-        worldYOffset: 0.02,
-      },
-    ],
+  const textureUris = useMemo(
+    () => ({
+      colorMapUri: resolvePublicAssetUrl("assets/chad/Textures/chad_Col.png"),
+      normalMapUri: resolvePublicAssetUrl("assets/chad/Textures/chad_Norm.png"),
+      roughnessMapUri: resolvePublicAssetUrl("assets/chad/Textures/chad_Pbr.png"),
+    }),
     [],
   );
+  const [importedMeshes, setImportedMeshes] = useState<ImportedMeshDocument[]>(() => [
+    {
+      id: "mesh_chad",
+      format: "fbx",
+      displayName: "Chad.fbx",
+      sourceUri: resolvePublicAssetUrl("assets/chad/Chad.fbx"),
+      importedAtUtc: new Date().toISOString(),
+    },
+  ]);
+  const sceneMeshSources = useMemo<ActiveMeshSource[]>(
+    () =>
+      importedMeshes.map((mesh) => ({
+        id: mesh.id,
+        meshUri: mesh.sourceUri,
+        colorMapUri: textureUris.colorMapUri,
+        normalMapUri: textureUris.normalMapUri,
+        roughnessMapUri: textureUris.roughnessMapUri,
+        worldScale: 0.01,
+        worldYOffset: 0.02,
+      })),
+    [importedMeshes, textureUris.colorMapUri, textureUris.normalMapUri, textureUris.roughnessMapUri],
+  );
+  const [sceneId, setSceneId] = useState("scene_main");
+  const [sceneCreatedAtUtc, setSceneCreatedAtUtc] = useState(() => new Date().toISOString());
   const nextActuatorIndexRef = useRef(1);
   const nextRigIndexRef = useRef(2);
+  const sceneLoadInputRef = useRef<HTMLInputElement | null>(null);
+  const meshImportInputRef = useRef<HTMLInputElement | null>(null);
+  const exportRegistryRef = useRef(createDefaultBakeExportRegistry());
   const actuatorObjectRefs = useRef<Record<string, Object3D | null>>({});
   const drawSurfaceObjectRefs = useRef<Record<string, Object3D | null>>({});
   const canvasWrapRef = useRef<HTMLDivElement | null>(null);
@@ -155,6 +189,7 @@ export default function App() {
   const [gizmoSpace, setGizmoSpace] = useState<"world" | "local">("local");
   const [pivotMode, setPivotMode] = useState<PivotMode>("object");
   const [appMode, setAppMode] = useState<AppMode>("Rig");
+  const [workflowMode, setWorkflowMode] = useState<WorkflowMode>(DEFAULT_WORKFLOW_MODE);
   const [viewProjection, setViewProjection] = useState<"perspective" | "orthographic">("perspective");
   const [viewDirectionRequest, setViewDirectionRequest] = useState<{ direction: Vec3; up: Vec3 } | null>(null);
   const [viewDirectionNonce, setViewDirectionNonce] = useState(0);
@@ -186,6 +221,13 @@ export default function App() {
   const [drawRadius, setDrawRadius] = useState(0.2);
   const [drawMirrorEnabled, setDrawMirrorEnabled] = useState(true);
   const [drawSnapEnabled, setDrawSnapEnabled] = useState(true);
+  const [ioStatus, setIoStatus] = useState("Ready");
+  const [meshImportStatus, setMeshImportStatus] = useState("No mesh imports yet.");
+  const [exportStatus, setExportStatus] = useState("No bake cache captured.");
+  const [bakeStartFrame, setBakeStartFrame] = useState(0);
+  const [bakeEndFrame, setBakeEndFrame] = useState(60);
+  const [lastBakeCache, setLastBakeCache] = useState<BakeCache | null>(null);
+  const [exportFormat, setExportFormat] = useState<ExportFormatId>("bvh");
   const [drawCursor, setDrawCursor] = useState<{ x: number; y: number; visible: boolean }>({
     x: 0,
     y: 0,
@@ -246,7 +288,11 @@ export default function App() {
   const suppressClearSelectionUntilRef = useRef(0);
 
   const actuators = editorState.actuators;
-  const showDrawDraftActuators = gizmoMode === "draw" && appMode === "Rig" && !physicsEnabled;
+  const workflowTool = clampToolToWorkflow(workflowMode, workflowToolFromGizmoMode(gizmoMode, appMode));
+  const workflowAllowsRigAuthoring = workflowMode === "Rigging";
+  const workflowAllowsAnimationLane = workflowMode === "Animation";
+  const workflowAllowsDraw = workflowMode === "Rigging";
+  const showDrawDraftActuators = gizmoMode === "draw" && appMode === "Rig" && workflowAllowsDraw && !physicsEnabled;
   const sceneActuators = useMemo(
     () =>
       showDrawDraftActuators && drawDraftActuators.length > 0
@@ -258,6 +304,7 @@ export default function App() {
   const selectedActuatorId = editorState.selectedActuatorId;
   const selectedActuatorIds = editorState.selectedActuatorIds;
   const rigIds = useMemo(() => [...new Set(actuators.map((actuator) => actuator.rigId))].sort(), [actuators]);
+  const exportCapabilities = useMemo(() => exportRegistryRef.current.getCapabilities(), []);
   const xrToolState = useMemo(
     () =>
       resolveXrToolState({
@@ -316,7 +363,7 @@ export default function App() {
 
   function beginOutlinerParentDrag(event: ReactPointerEvent<HTMLLIElement>, sourceId: string) {
     if (event.button !== 1) return;
-    if (physicsEnabled || appMode !== "Rig") return;
+    if (!workflowAllowsRigAuthoring || physicsEnabled || appMode !== "Rig") return;
     event.preventDefault();
     event.stopPropagation();
     setOutlinerParentDragSourceId(sourceId);
@@ -1112,6 +1159,203 @@ export default function App() {
     return snapshots;
   }
 
+  function syncCreationIndicesFromState(state: EditorState) {
+    const maxRigSuffix = state.actuators.reduce((maxValue, actuator) => Math.max(maxValue, extractNumericSuffix(actuator.rigId)), 1);
+    nextRigIndexRef.current = Math.max(2, maxRigSuffix + 1);
+    const maxActuatorSuffix = state.actuators.reduce((maxValue, actuator) => Math.max(maxValue, extractActuatorIndex(actuator.id)), 0);
+    nextActuatorIndexRef.current = Math.max(1, maxActuatorSuffix + 1);
+  }
+
+  function buildSceneSnapshot(): SceneSnapshot {
+    const frameSpan = Math.max(1, Math.max(bakeStartFrame, bakeEndFrame) - Math.min(bakeStartFrame, bakeEndFrame) + 1);
+    return {
+      sceneId,
+      createdAtUtc: sceneCreatedAtUtc,
+      workflowMode,
+      editorState: cloneEditorState(editorStateRef.current),
+      importedMeshes: importedMeshes.map((mesh) => ({ ...mesh })),
+      playback: {
+        fps: SCENE_PLAYBACK_FPS,
+        durationSec: frameSpan / SCENE_PLAYBACK_FPS,
+        activeClipId: null,
+      },
+      metadata: {
+        sourceBaseline: "30c6ea7",
+      },
+    };
+  }
+
+  function requestWorkflowMode(nextMode: WorkflowMode) {
+    const transition = transitionWorkflowState(
+      {
+        workflowMode,
+        runtimeMode: appMode === "Pose" ? "Pose" : "Rig",
+        physicsEnabled,
+        activeTool: workflowToolFromGizmoMode(gizmoMode, appMode),
+      },
+      nextMode,
+      {
+        skinningBusy,
+      },
+    );
+
+    if (!transition.accepted) {
+      setIoStatus(`Workflow transition rejected: ${transition.reason}.`);
+      return;
+    }
+
+    const nextState = transition.state;
+    setWorkflowMode(nextState.workflowMode);
+    setGizmoMode(gizmoModeFromWorkflowTool(nextState.activeTool));
+    if (nextState.runtimeMode === "Pose") {
+      requestAppMode("Pose");
+    } else {
+      requestAppMode("Rig");
+    }
+    setIoStatus(`Workflow mode set to ${nextState.workflowMode}.`);
+  }
+
+  function saveSceneToFile() {
+    try {
+      const envelope = createSceneEnvelope(buildSceneSnapshot());
+      const serialized = stableSerializeSceneEnvelope(envelope);
+      downloadTextFile(`${sceneId}.a2scene.json`, serialized, "application/json");
+      setIoStatus(`Saved scene ${sceneId} (${envelope.envelopeVersion}).`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown save error.";
+      setIoStatus(`Save failed: ${message}`);
+    }
+  }
+
+  async function loadSceneFromFile(file: File) {
+    try {
+      const payload = await file.text();
+      const envelope = parseSceneEnvelope(payload);
+      const snapshot = sceneSnapshotFromEnvelope(envelope);
+      const nextState = cloneEditorState(snapshot.editorState);
+      editorStateRef.current = nextState;
+      setEditorState(nextState);
+      setSceneId(snapshot.sceneId);
+      setSceneCreatedAtUtc(snapshot.createdAtUtc);
+      setImportedMeshes(snapshot.importedMeshes);
+      setLastBakeCache(null);
+      setWorkflowMode(snapshot.workflowMode);
+      syncCreationIndicesFromState(nextState);
+      undoStackRef.current = [];
+      redoStackRef.current = [];
+
+      const nextRuntimeMode: AppMode = snapshot.workflowMode === "Puppeteering" ? "Pose" : "Rig";
+      requestAppMode(nextRuntimeMode);
+      const clampedTool = clampToolToWorkflow(snapshot.workflowMode, workflowToolFromGizmoMode(gizmoMode, nextRuntimeMode));
+      setGizmoMode(gizmoModeFromWorkflowTool(clampedTool));
+      setIoStatus(`Loaded scene ${snapshot.sceneId} from ${file.name}.`);
+    } catch (error) {
+      if (error instanceof SceneLoadError) {
+        setIoStatus(`Load failed (${error.code}): ${error.message}`);
+        return;
+      }
+      const message = error instanceof Error ? error.message : "Unknown load error.";
+      setIoStatus(`Load failed: ${message}`);
+    }
+  }
+
+  function handleSceneFileInputChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (file === undefined) return;
+    void loadSceneFromFile(file);
+  }
+
+  function importMeshFiles(files: readonly File[]) {
+    if (files.length === 0) return;
+    const nextMessages: string[] = [];
+    let nextMeshes = importedMeshes.slice();
+    const existingIds = new Set(nextMeshes.map((mesh) => mesh.id));
+
+    for (const file of files) {
+      const sourceUri = URL.createObjectURL(file);
+      const normalized = normalizeMeshImport(
+        {
+          name: file.name,
+          size: file.size,
+          type: file.type,
+        },
+        sourceUri,
+        {
+          existingIds,
+        },
+      );
+      if (!normalized.ok) {
+        URL.revokeObjectURL(sourceUri);
+        nextMessages.push(normalized.message);
+        continue;
+      }
+      existingIds.add(normalized.mesh.id);
+      nextMeshes = integrateImportedMesh(nextMeshes, normalized.mesh);
+      nextMessages.push(`Imported ${file.name} as ${normalized.mesh.id}.`);
+    }
+
+    setImportedMeshes(nextMeshes);
+    if (nextMessages.length > 0) {
+      setMeshImportStatus(nextMessages.join(" "));
+    }
+  }
+
+  function handleMeshFileInputChange(event: ChangeEvent<HTMLInputElement>) {
+    const files = event.target.files;
+    event.target.value = "";
+    if (files === null || files.length === 0) return;
+    importMeshFiles(Array.from(files));
+  }
+
+  function captureBakeFromCurrentState() {
+    const start = Math.min(bakeStartFrame, bakeEndFrame);
+    const end = Math.max(bakeStartFrame, bakeEndFrame);
+    try {
+      const cache = captureBakeCache({
+        fps: SCENE_PLAYBACK_FPS,
+        startFrame: start,
+        endFrame: end,
+        actuators: editorStateRef.current.actuators.map((actuator) => ({
+          id: actuator.id,
+          parentId: actuator.parentId,
+          transform: {
+            position: { ...actuator.transform.position },
+            rotation: { ...actuator.transform.rotation },
+            scale: { ...actuator.transform.scale },
+          },
+        })),
+      });
+      setLastBakeCache(cache);
+      setExportStatus(`Bake cache ${cache.cacheId} captured (${cache.frames.length} frames, ${cache.actuatorIds.length} actuators).`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown bake capture error.";
+      setExportStatus(`Bake capture failed: ${message}`);
+    }
+  }
+
+  function exportCapturedBake() {
+    if (lastBakeCache === null) {
+      setExportStatus("Export failed: capture a bake cache first.");
+      return;
+    }
+    const result = exportRegistryRef.current.runExportJob({
+      format: exportFormat,
+      cache: lastBakeCache,
+      sceneId,
+    });
+    if (result.status === "success") {
+      downloadTextFile(result.fileName, result.content, result.mimeType);
+      setExportStatus(`Exported ${result.fileName} (${result.format}).`);
+      return;
+    }
+    if (result.status === "unsupported") {
+      setExportStatus(`Export unsupported (${result.format}): ${result.reason}`);
+      return;
+    }
+    setExportStatus(`Export failed (${result.format}): ${result.reason}`);
+  }
+
   function requestAppMode(nextMode: AppMode) {
     if (nextMode === "Pose") {
       if (appMode === "Pose" && pendingPoseRevision === null) return;
@@ -1384,6 +1628,10 @@ export default function App() {
   }
 
   function createActuator() {
+    if (!workflowAllowsRigAuthoring || appMode !== "Rig" || physicsEnabled) {
+      setIoStatus(`Create actuator is disabled in ${workflowMode} workflow.`);
+      return;
+    }
     commitEditorChange((previous) => {
       const activeRigId = previous.selectedRigId;
       const rigActuators = previous.actuators.filter((actuator) => actuator.rigId === activeRigId);
@@ -1653,6 +1901,10 @@ export default function App() {
   }
 
   function createRig() {
+    if (!workflowAllowsRigAuthoring || appMode !== "Rig" || physicsEnabled) {
+      setIoStatus(`Create rig is disabled in ${workflowMode} workflow.`);
+      return;
+    }
     const rigIndex = nextRigIndexRef.current;
     nextRigIndexRef.current += 1;
     const rigId = `rig_${rigIndex.toString().padStart(3, "0")}`;
@@ -1667,6 +1919,10 @@ export default function App() {
   }
 
   function deleteSelectedActuator() {
+    if (!workflowAllowsRigAuthoring || appMode !== "Rig" || physicsEnabled) {
+      setIoStatus(`Delete is disabled in ${workflowMode} workflow.`);
+      return;
+    }
     commitEditorChange((previous) => {
       const explicitSelectionIds = previous.selectedActuatorIds.filter((id) => {
         const actuator = previous.actuators.find((item) => item.id === id);
@@ -1732,7 +1988,7 @@ export default function App() {
   }
 
   function canReparentSourcesToTarget(sourceIds: string[], targetParentId: string): boolean {
-    if (physicsEnabled || appMode !== "Rig") return false;
+    if (!workflowAllowsRigAuthoring || physicsEnabled || appMode !== "Rig") return false;
     const byId = new Map(actuators.map((actuator) => [actuator.id, actuator]));
     if (!byId.has(targetParentId)) return false;
     const selected = [...new Set(sourceIds)].filter((id) => byId.has(id));
@@ -1802,6 +2058,7 @@ export default function App() {
   }
 
   function parentCurrentSelectionToActiveActuator() {
+    if (!workflowAllowsRigAuthoring || appMode !== "Rig" || physicsEnabled) return;
     if (selectedActuatorId === null) return;
     const sourceIds = selectedActuatorIds.filter((id) => id !== selectedActuatorId);
     if (sourceIds.length === 0) return;
@@ -2156,7 +2413,7 @@ export default function App() {
 
       if (event.code === "Space") {
         event.preventDefault();
-        requestAppMode(appMode === "Rig" ? "Pose" : "Rig");
+        requestWorkflowMode(workflowMode === "Puppeteering" ? "Rigging" : "Puppeteering");
         return;
       }
 
@@ -2166,7 +2423,7 @@ export default function App() {
         return;
       }
 
-      if (key === "p" && appMode === "Rig" && !physicsEnabled) {
+      if (key === "p" && workflowAllowsRigAuthoring && appMode === "Rig" && !physicsEnabled) {
         event.preventDefault();
         parentCurrentSelectionToActiveActuator();
         return;
@@ -2177,11 +2434,11 @@ export default function App() {
           setGizmoMode(POSE_TOOL_MODE);
         }
       } else {
-        if (key === "q") setGizmoMode("select");
-        if (key === "w") setGizmoMode("translate");
-        if (key === "e") setGizmoMode("rotate");
-        if (key === "r") setGizmoMode("scale");
-        if (key === "d") setGizmoMode("draw");
+        if (key === "q" && isToolAllowedForWorkflow(workflowMode, "select")) setGizmoMode("select");
+        if (key === "w" && isToolAllowedForWorkflow(workflowMode, "translate")) setGizmoMode("translate");
+        if (key === "e" && isToolAllowedForWorkflow(workflowMode, "rotate")) setGizmoMode("rotate");
+        if (key === "r" && isToolAllowedForWorkflow(workflowMode, "scale")) setGizmoMode("scale");
+        if (key === "d" && isToolAllowedForWorkflow(workflowMode, "draw")) setGizmoMode("draw");
       }
       if (key === "f") {
         const idsToFrame =
@@ -2197,7 +2454,18 @@ export default function App() {
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [actuators, appMode, pendingPoseRevision, physicsEnabled, selectedActuatorId, selectedActuatorIds, selectedRigId, skinningRevision]);
+  }, [
+    actuators,
+    appMode,
+    pendingPoseRevision,
+    physicsEnabled,
+    selectedActuatorId,
+    selectedActuatorIds,
+    selectedRigId,
+    skinningRevision,
+    workflowAllowsRigAuthoring,
+    workflowMode,
+  ]);
 
   useEffect(() => {
     if (outlinerParentDragSourceId === null) return;
@@ -2216,7 +2484,7 @@ export default function App() {
   }, [outlinerParentDragSourceId]);
 
   useEffect(() => {
-    if (gizmoMode === "draw" && appMode === "Rig" && !physicsEnabled) {
+    if (gizmoMode === "draw" && appMode === "Rig" && workflowAllowsDraw && !physicsEnabled) {
       if (isTransformDragging || transformStartSnapshotRef.current !== null) {
         endTransformChange();
       }
@@ -2228,7 +2496,7 @@ export default function App() {
     setDrawCursor((previous) => ({ ...previous, visible: false }));
     setDrawCursorHasInRangeAnchor(false);
     setDrawHoverActuatorId(null);
-  }, [appMode, gizmoMode, isTransformDragging, physicsEnabled]);
+  }, [appMode, gizmoMode, isTransformDragging, physicsEnabled, workflowAllowsDraw]);
 
   function onCanvasPointerMissed() {
     if (gizmoMode === "draw") return;
@@ -2515,10 +2783,21 @@ export default function App() {
     setSelection(hits, primary);
   }
 
+  function onCanvasWrapDragOver(event: ReactDragEvent<HTMLDivElement>) {
+    event.preventDefault();
+  }
+
+  function onCanvasWrapDrop(event: ReactDragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    const files = Array.from(event.dataTransfer.files ?? []);
+    if (files.length === 0) return;
+    importMeshFiles(files);
+  }
+
   useEffect(() => {
     let frame = 0;
     const updateDrawCursorPerFrame = () => {
-      if (gizmoMode === "draw" && appMode === "Rig" && !physicsEnabled && drawCursor.visible) {
+      if (gizmoMode === "draw" && appMode === "Rig" && workflowAllowsDraw && !physicsEnabled && drawCursor.visible) {
         const pointer = drawPointerClientRef.current;
         if (pointer !== null) {
           const local = clientToCanvasLocal(pointer.x, pointer.y);
@@ -2549,7 +2828,7 @@ export default function App() {
     };
     frame = requestAnimationFrame(updateDrawCursorPerFrame);
     return () => cancelAnimationFrame(frame);
-  }, [actuators, appMode, drawCursor.visible, drawRadius, gizmoMode, physicsEnabled, selectedRigId]);
+  }, [actuators, appMode, drawCursor.visible, drawRadius, gizmoMode, physicsEnabled, selectedRigId, workflowAllowsDraw]);
 
   useEffect(() => {
     if (gizmoMode !== "draw") {
@@ -2565,6 +2844,7 @@ export default function App() {
 
 
   function createActuatorFromXrDraw(handedness: XRHandedness): boolean {
+    if (!workflowAllowsRigAuthoring || appMode !== "Rig" || physicsEnabled) return false;
     const pose = getXrControllerTipPose(handedness);
     if (pose === null) return false;
 
@@ -2651,7 +2931,7 @@ export default function App() {
       return;
     }
 
-    if (gizmoMode !== "draw" || appMode !== "Rig" || physicsEnabled) {
+    if (gizmoMode !== "draw" || appMode !== "Rig" || !workflowAllowsDraw || physicsEnabled) {
       return;
     }
 
@@ -2813,12 +3093,13 @@ export default function App() {
     physicsEnabled,
     selectedRigId,
     selectNearestActuatorFromXr,
+    workflowAllowsDraw,
     xrMode,
   ]);
 
   useInputRouter({
     targetRef: canvasWrapRef,
-    enabled: (gizmoMode === "draw" && appMode === "Rig" && !physicsEnabled) || xrMode !== null,
+    enabled: (gizmoMode === "draw" && appMode === "Rig" && workflowAllowsDraw && !physicsEnabled) || xrMode !== null,
     getXRSession: () => {
       const storeAny = xrStore as any;
       const state = storeAny.getState?.();
@@ -2832,371 +3113,128 @@ export default function App() {
     onAction: onInputAction,
   });
 
+  const editorContextValue = useMemo(
+    () => ({
+      state: {
+        editorState,
+        workflowMode,
+        selectedActuatorIds,
+      },
+    }),
+    [editorState, workflowMode, selectedActuatorIds],
+  );
+
   return (
+    <EditorProvider value={editorContextValue}>
     <main className="app">
-      <header className="app__header">
-        <div className="app__header-top">
-          <h1>Actuator2</h1>
-          <span className="app__header-status">
-            {appMode} mode{physicsEnabled ? " · sim on" : ""} · skin {skinningBusy ? "rebuilding…" : `ready (rev ${completedSkinningRevision})`}
-          </span>
-        </div>
-        <div className="app__actions">
-          <button
-            type="button"
-            onClick={() => requestAppMode("Rig")}
-            disabled={appMode === "Rig" && pendingPoseRevision === null}
-          >
-            Rig Mode
-          </button>
-          <button
-            type="button"
-            onClick={() => requestAppMode("Pose")}
-            disabled={appMode === "Pose" || pendingPoseRevision !== null}
-          >
-            Pose Mode
-          </button>
-          <button
-            type="button"
-            onClick={xrMode === null ? requestEnterVr : requestExitVr}
-            disabled={xrBusy || (xrMode === null && !vrSupported)}
-            title={xrMode === null && !vrSupported ? "WebXR immersive VR is not available on this device/browser." : undefined}
-          >
-            {xrMode === null ? "Enter VR" : "Exit VR"}
-          </button>
-          <span className="app__header-hint">Alt+LMB orbit · MMB pan · RMB zoom · Shift+wheel draw radius</span>
-        </div>
-      </header>
+      <AppHeader
+        workflowMode={workflowMode}
+        appMode={appMode}
+        physicsEnabled={physicsEnabled}
+        workflowTool={workflowTool}
+        skinningBusy={skinningBusy}
+        completedSkinningRevision={completedSkinningRevision}
+        xrMode={xrMode}
+        vrSupported={vrSupported}
+        xrBusy={xrBusy}
+        onRequestWorkflowMode={requestWorkflowMode}
+        onEnterVr={requestEnterVr}
+        onExitVr={requestExitVr}
+      />
       <section className="app__viewport">
         <aside className="app__panel">
-          <details className="app__panel-section" open>
-            <summary className="app__panel-section-header">Actions</summary>
-            <div className="app__panel-section-body">
-              <div className="app__panel-actions">
-                <button type="button" onClick={createRig} disabled={physicsEnabled}>
-                  Create Rig
-                </button>
-                <button type="button" onClick={createActuator} disabled={physicsEnabled}>
-                  Create Actuator
-                </button>
-                <button
-                  type="button"
-                  onClick={deleteSelectedActuator}
-                  disabled={
-                    physicsEnabled ||
-                    selectedActuatorIds.length === 0 ||
-                    selectedActuatorIds.every((id) => {
-                      const actuator = actuators.find((item) => item.id === id);
-                      return actuator?.parentId === null;
-                    })
-                  }
-                >
-                  Delete Selected
-                </button>
-                <button
-                  type="button"
-                  onClick={undo}
-                  disabled={(appMode === "Rig" && physicsEnabled) || (appMode === "Rig" && undoStackRef.current.length === 0)}
-                >
-                  Undo
-                </button>
-                <button
-                  type="button"
-                  onClick={redo}
-                  disabled={physicsEnabled || redoStackRef.current.length === 0}
-                >
-                  Redo
-                </button>
-              </div>
-            </div>
-          </details>
+          <ActionsPanel
+            workflowAllowsRigAuthoring={workflowAllowsRigAuthoring}
+            physicsEnabled={physicsEnabled}
+            appMode={appMode}
+            actuators={actuators}
+            selectedActuatorIds={selectedActuatorIds}
+            undoStackLength={undoStackRef.current.length}
+            redoStackLength={redoStackRef.current.length}
+            ioStatus={ioStatus}
+            meshImportStatus={meshImportStatus}
+            sceneLoadInputRef={sceneLoadInputRef}
+            meshImportInputRef={meshImportInputRef}
+            onCreateRig={createRig}
+            onCreateActuator={createActuator}
+            onDeleteSelected={deleteSelectedActuator}
+            onUndo={undo}
+            onRedo={redo}
+            onSaveScene={saveSceneToFile}
+            onRequestLoadScene={() => sceneLoadInputRef.current?.click()}
+            onRequestImportMesh={() => meshImportInputRef.current?.click()}
+            onSceneFileChange={handleSceneFileInputChange}
+            onMeshFileChange={handleMeshFileInputChange}
+          />
 
-          <details className="app__panel-section" open>
-            <summary className="app__panel-section-header">Tools</summary>
-            <div className="app__panel-section-body">
-              <div className="app__panel-tools">
-                <div className="app__tool-buttons">
-                  {appMode === "Pose" ? (
-                    <button type="button" className={gizmoMode === "translate" ? "is-selected" : ""} onClick={() => setGizmoMode("translate")}>
-                      Grab (W)
-                    </button>
-                  ) : (
-                    <>
-                      <button type="button" className={gizmoMode === "select" ? "is-selected" : ""} onClick={() => setGizmoMode("select")}>
-                        Select (Q)
-                      </button>
-                      <button type="button" className={gizmoMode === "translate" ? "is-selected" : ""} onClick={() => setGizmoMode("translate")}>
-                        Move (W)
-                      </button>
-                      <button type="button" className={gizmoMode === "rotate" ? "is-selected" : ""} onClick={() => setGizmoMode("rotate")}>
-                        Rotate (E)
-                      </button>
-                      <button type="button" className={gizmoMode === "scale" ? "is-selected" : ""} onClick={() => setGizmoMode("scale")}>
-                        Scale (R)
-                      </button>
-                      <button type="button" className={gizmoMode === "draw" ? "is-selected" : ""} onClick={() => setGizmoMode("draw")}>
-                        Draw (D)
-                      </button>
-                    </>
-                  )}
-                </div>
-                {appMode === "Rig" ? (
-                  <>
-                    <div className="app__tool-row app__tool-row--dual">
-                      <label htmlFor="space-select">Orientation</label>
-                      <select id="space-select" value={gizmoSpace} onChange={(event) => setGizmoSpace(event.target.value as "world" | "local") }>
-                        <option value="world">World</option>
-                        <option value="local">Local</option>
-                      </select>
-                      <label htmlFor="pivot-select">Pivot</label>
-                      <select id="pivot-select" value={pivotMode} onChange={(event) => setPivotMode(event.target.value as PivotMode)}>
-                        <option value="object">Object Center</option>
-                        <option value="world">World Origin</option>
-                      </select>
-                    </div>
-                    <div className="app__tool-separator" />
-                  </>
-                ) : null}
-                {appMode === "Rig" ? (
-                  <div className="app__tool-row">
-                    <label htmlFor="new-actuator-shape">New Actuator</label>
-                    <select
-                      id="new-actuator-shape"
-                      value={newActuatorShape}
-                      onChange={(event) => setNewActuatorShape(event.target.value as ActuatorShape)}
-                    >
-                      <option value="capsule">Capsule (Default)</option>
-                      <option value="sphere">Sphere</option>
-                      <option value="box">Box</option>
-                    </select>
-                  </div>
-                ) : null}
-                <div className="app__tool-row">
-                  <label htmlFor="new-actuator-preset">Preset</label>
-                  <select
-                    id="new-actuator-preset"
-                    value={presetSelectValue}
-                    onChange={(event) => {
-                      if (event.target.value === MIXED_PRESET_VALUE) return;
-                      const nextPreset = event.target.value as ActuatorPreset;
-                      setNewActuatorPreset(nextPreset);
-                      applyPresetToSelection(nextPreset);
-                    }}
-                  >
-                    {presetSelectValue === MIXED_PRESET_VALUE ? (
-                      <option value={MIXED_PRESET_VALUE}>Mixed (multi-select)</option>
-                    ) : null}
-                    {ACTUATOR_PRESET_OPTIONS.map((preset) => (
-                      <option key={preset} value={preset}>
-                        {preset}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="app__tool-separator" />
-                {appMode === "Rig" && gizmoMode === "draw" ? (
-                  <>
-                    <div className="app__tool-row">
-                      <label htmlFor="draw-radius">Draw Radius</label>
-                      <input
-                        id="draw-radius"
-                        type="number"
-                        min={0.01}
-                        max={1}
-                        step={0.01}
-                        value={drawRadius}
-                        onChange={(event) => {
-                          const parsed = Number(event.target.value);
-                          if (!Number.isFinite(parsed)) return;
-                          setDrawRadius(Math.max(0.01, Math.min(1, parsed)));
-                        }}
-                      />
-                    </div>
-                    <div className="app__tool-row">
-                      <label htmlFor="draw-mirror-toggle">Draw Mirror</label>
-                      <select
-                        id="draw-mirror-toggle"
-                        value={drawMirrorEnabled ? "on" : "off"}
-                        onChange={(event) => setDrawMirrorEnabled(event.target.value === "on")}
-                      >
-                        <option value="on">On</option>
-                        <option value="off">Off</option>
-                      </select>
-                    </div>
-                    <div className="app__tool-row">
-                      <label htmlFor="draw-snap-toggle">Draw Center Snap</label>
-                      <select
-                        id="draw-snap-toggle"
-                        value={drawSnapEnabled ? "on" : "off"}
-                        onChange={(event) => setDrawSnapEnabled(event.target.value === "on")}
-                      >
-                        <option value="on">On</option>
-                        <option value="off">Off</option>
-                      </select>
-                    </div>
-                  </>
-                ) : null}
-                <details className="app__nested-settings">
-                  <summary className="app__nested-settings-header">Delta Mush Settings</summary>
-                  <div className="app__nested-settings-body">
-                    <div className="app__tool-row">
-                      <label htmlFor="delta-mush-toggle">Delta Mush</label>
-                      <select
-                        id="delta-mush-toggle"
-                        value={deltaMushEnabled ? "on" : "off"}
-                        onChange={(event) => setDeltaMushEnabled(event.target.value === "on")}
-                      >
-                        <option value="on">On</option>
-                        <option value="off">Off</option>
-                      </select>
-                    </div>
-                    <div className="app__tool-row">
-                      <label htmlFor="delta-mush-iterations">Mush Iterations</label>
-                      <input
-                        id="delta-mush-iterations"
-                        type="number"
-                        min={0}
-                        max={12}
-                        step={1}
-                        value={deltaMushSettings.iterations}
-                        onChange={(event) => {
-                          const parsed = Number(event.target.value);
-                          const nextIterations = Number.isFinite(parsed)
-                            ? Math.max(0, Math.min(12, Math.round(parsed)))
-                            : DEFAULT_DELTA_MUSH_SETTINGS.iterations;
-                          setDeltaMushSettings((previous) => ({
-                            ...previous,
-                            iterations: nextIterations,
-                          }));
-                        }}
-                      />
-                    </div>
-                    <div className="app__tool-row">
-                      <label htmlFor="delta-mush-strength">Mush Strength</label>
-                      <input
-                        id="delta-mush-strength"
-                        type="number"
-                        min={0}
-                        max={1}
-                        step={0.05}
-                        value={deltaMushSettings.strength}
-                        onChange={(event) => {
-                          const parsed = Number(event.target.value);
-                          const nextStrength = Number.isFinite(parsed)
-                            ? Math.max(0, Math.min(1, parsed))
-                            : DEFAULT_DELTA_MUSH_SETTINGS.strength;
-                          setDeltaMushSettings((previous) => ({
-                            ...previous,
-                            strength: nextStrength,
-                          }));
-                        }}
-                      />
-                    </div>
-                  </div>
-                </details>
-              </div>
-            </div>
-          </details>
-          <details className="app__panel-section app__panel-section--fill" open>
-            <summary className="app__panel-section-header">Outliner</summary>
-            <div className="app__panel-section-body app__panel-section-body--fill">
-              <ul className="app__outliner">
-                {outlinerEntries.map((entry) => {
-                  if (entry.kind === "rig") {
-                    return (
-                      <li key={`rig:${entry.rigId}`} className="app__outliner-rig">
-                        <button
-                          type="button"
-                          className="app__outliner-toggle"
-                          onClick={() => toggleOutlinerNode(`rig:${entry.rigId}`)}
-                          aria-label={entry.collapsed ? "Expand rig" : "Collapse rig"}
-                        >
-                          {entry.collapsed ? ">" : "v"}
-                        </button>
-                        <span className="app__outliner-icon app__outliner-icon--rig" />
-                        <span className="app__outliner-rig-label">{entry.rigId}</span>
-                      </li>
-                    );
-                  }
-                  if (entry.kind === "mesh") {
-                    const { meshSource, depth, rigId } = entry;
-                    return (
-                      <li key={`mesh:${rigId}:${meshSource.id}`} className="app__outliner-item app__outliner-item--mesh">
-                        <span className="app__outliner-indent" style={{ width: depth * 16 + 4 }} />
-                        <button type="button" className="app__outliner-toggle" disabled tabIndex={-1} aria-hidden>
-                          {" "}
-                        </button>
-                        <span className="app__outliner-icon app__outliner-icon--mesh" />
-                        <span className="app__outliner-label app__outliner-label--readonly">{meshSource.id}</span>
-                      </li>
-                    );
-                  }
-                  const { actuator, depth, hasChildren } = entry;
-                  const isSelected = selectedActuatorIds.includes(actuator.id);
-                  const isParentDragSource = outlinerParentDragSourceId === actuator.id;
-                  const isParentDropTarget = outlinerParentDropTargetId === actuator.id;
-                  return (
-                    <li
-                      key={actuator.id}
-                      className={
-                        `app__outliner-item${isSelected ? " is-selected" : ""}` +
-                        `${isParentDragSource ? " is-parent-drag-source" : ""}` +
-                        `${isParentDropTarget ? " is-parent-drop-target" : ""}`
-                      }
-                      onPointerDown={(event) => beginOutlinerParentDrag(event, actuator.id)}
-                      onPointerEnter={() => updateOutlinerParentDropTarget(actuator.id)}
-                      onPointerLeave={() => {
-                        if (outlinerParentDropTargetId === actuator.id) {
-                          setOutlinerParentDropTargetId(null);
-                        }
-                      }}
-                      onPointerUp={(event) => completeOutlinerParentDrag(event, actuator.id)}
-                    >
-                      <span className="app__outliner-indent" style={{ width: depth * 16 + 4 }} />
-                      <button
-                        type="button"
-                        className="app__outliner-toggle"
-                        onClick={() => toggleOutlinerNode(actuator.id)}
-                        disabled={!hasChildren}
-                        tabIndex={-1}
-                        aria-label={collapsedNodeIds.has(actuator.id) ? "Expand" : "Collapse"}
-                      >
-                        {hasChildren ? (collapsedNodeIds.has(actuator.id) ? ">" : "v") : ""}
-                      </button>
-                      <span
-                        className={`app__outliner-icon app__outliner-icon--${actuator.type === "root" ? "root" : actuator.shape}`}
-                      />
-                      <button
-                        type="button"
-                        className="app__outliner-label"
-                        onClick={(event) =>
-                          selectActuator(actuator.id, {
-                            additive: event.shiftKey,
-                            toggle: event.ctrlKey || event.metaKey,
-                          })
-                        }
-                        >
-                          {actuator.id}
-                        </button>
-                    </li>
-                  );
-                })}
-              </ul>
-            </div>
-          </details>
-
-          <details className="app__panel-section app__panel-section--status" open>
-            <summary className="app__panel-section-header">Status</summary>
-            <div className="app__panel-section-body">
-              <div className="app__panel-status">
-                <strong>Rig:</strong> {selectedRigId} | <strong>Selected:</strong>{" "}
-                {selectedActuatorIds.length === 0 ? "none" : `${selectedActuatorIds.length} (active: ${selectedActuatorId})`}
-                <br />
-                <strong>Skin:</strong> {skinningStats.vertexCount} verts · {skinningStats.capsuleCount} capsules · avg w{" "}
-                {skinningStats.averageWeight.toFixed(3)}
-              </div>
-            </div>
-          </details>
+          <ToolsPanel
+            appMode={appMode}
+            workflowMode={workflowMode}
+            workflowAllowsRigAuthoring={workflowAllowsRigAuthoring}
+            workflowAllowsDraw={workflowAllowsDraw}
+            gizmoMode={gizmoMode}
+            gizmoSpace={gizmoSpace}
+            pivotMode={pivotMode}
+            newActuatorShape={newActuatorShape}
+            presetSelectValue={presetSelectValue}
+            drawRadius={drawRadius}
+            drawMirrorEnabled={drawMirrorEnabled}
+            drawSnapEnabled={drawSnapEnabled}
+            deltaMushEnabled={deltaMushEnabled}
+            deltaMushSettings={deltaMushSettings}
+            onSetGizmoMode={setGizmoMode}
+            onSetGizmoSpace={setGizmoSpace}
+            onSetPivotMode={setPivotMode}
+            onSetNewActuatorShape={setNewActuatorShape}
+            onPresetChange={(preset) => {
+              setNewActuatorPreset(preset);
+              applyPresetToSelection(preset);
+            }}
+            onSetDrawRadius={setDrawRadius}
+            onSetDrawMirrorEnabled={setDrawMirrorEnabled}
+            onSetDrawSnapEnabled={setDrawSnapEnabled}
+            onSetDeltaMushEnabled={setDeltaMushEnabled}
+            onSetDeltaMushSettings={setDeltaMushSettings}
+          />
+          <SceneIOPanel
+            workflowMode={workflowMode}
+            workflowAllowsAnimationLane={workflowAllowsAnimationLane}
+            bakeStartFrame={bakeStartFrame}
+            bakeEndFrame={bakeEndFrame}
+            exportFormat={exportFormat}
+            exportCapabilities={exportCapabilities}
+            lastBakeCache={lastBakeCache}
+            exportStatus={exportStatus}
+            onBakeStartFrameChange={setBakeStartFrame}
+            onBakeEndFrameChange={setBakeEndFrame}
+            onCaptureBake={captureBakeFromCurrentState}
+            onExportFormatChange={setExportFormat}
+            onExportBake={exportCapturedBake}
+          />
+          <OutlinerPanel
+            entries={outlinerEntries}
+            selectedActuatorIds={selectedActuatorIds}
+            collapsedNodeIds={collapsedNodeIds}
+            outlinerParentDragSourceId={outlinerParentDragSourceId}
+            outlinerParentDropTargetId={outlinerParentDropTargetId}
+            onToggleNode={toggleOutlinerNode}
+            onBeginParentDrag={beginOutlinerParentDrag}
+            onUpdateParentDropTarget={updateOutlinerParentDropTarget}
+            onClearParentDropTarget={(targetId) => {
+              if (outlinerParentDropTargetId === targetId) setOutlinerParentDropTargetId(null);
+            }}
+            onCompleteParentDrag={completeOutlinerParentDrag}
+            onSelectActuator={selectActuator}
+          />
+          <StatusPanel
+            sceneId={sceneId}
+            workflowMode={workflowMode}
+            selectedRigId={selectedRigId}
+            selectedActuatorId={selectedActuatorId}
+            selectedActuatorIds={selectedActuatorIds}
+            skinningStats={skinningStats}
+            lastBakeCache={lastBakeCache}
+          />
         </aside>
         <div
           ref={canvasWrapRef}
@@ -3205,8 +3243,10 @@ export default function App() {
           onPointerMove={onCanvasWrapPointerMove}
           onPointerUp={onCanvasWrapPointerUp}
           onPointerCancel={onCanvasWrapPointerUp}
+          onDragOver={onCanvasWrapDragOver}
+          onDrop={onCanvasWrapDrop}
           onPointerLeave={() => {
-            if (gizmoMode === "draw") {
+            if (gizmoMode === "draw" && workflowAllowsDraw) {
               setDrawCursor((previous) => ({ ...previous, visible: false }));
             }
           }}
@@ -3230,7 +3270,7 @@ export default function App() {
                 blocked={isTransformDragging || isPosePullDragging}
                 focusRequest={focusRequest}
                 focusNonce={focusNonce}
-                suppressShiftWheelZoom={gizmoMode === "draw" && appMode === "Rig" && !physicsEnabled}
+                suppressShiftWheelZoom={gizmoMode === "draw" && appMode === "Rig" && workflowAllowsDraw && !physicsEnabled}
                 viewDirectionRequest={viewDirectionRequest}
                 viewDirectionNonce={viewDirectionNonce}
                 onActiveCameraChange={onActiveCameraChange}
@@ -3274,7 +3314,7 @@ export default function App() {
             onToggleProjection={toggleProjectionKeepView}
             onRequestViewDirection={requestViewDirection}
           />
-          {gizmoMode === "draw" && appMode === "Rig" && !physicsEnabled && drawCursor.visible ? (
+          {gizmoMode === "draw" && appMode === "Rig" && workflowAllowsDraw && !physicsEnabled && drawCursor.visible ? (
             <div
               className={`app__draw-cursor${drawCursorHasInRangeAnchor ? "" : " app__draw-cursor--inactive"}`}
               style={{
@@ -3299,6 +3339,8 @@ export default function App() {
         </div>
       </section>
     </main>
+    </EditorProvider>
   );
 }
+
 

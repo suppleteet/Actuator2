@@ -178,13 +178,13 @@ Optional extra splits under `app/components/`:
 
 ## Phased Approach
 
-| Phase | Scope | Risk |
-|------|--------|------|
-| **1** | Extract constants + defaults to `app/constants.ts`. Move nothing else. | Low |
-| **2** | Extract panels (Header, Actions, Tools, RigPose, Draw, SceneIO, Outliner, Status) into components; App passes state and callbacks. Keep all state in App. | Medium (many props initially) |
-| **3** | Introduce `useEditorState` (and optionally Context); move state and refs into the hook; App and panels consume it. | Medium |
-| **4** | Split SceneContent: physics wrapper, actuator list, draw surfaces, skinning hook. | Medium–high |
-| **5** | Optional: Zustand or Context for global editor store; types audit; CSS split. | Low–medium |
+| Phase | Scope | Risk | Status |
+|------|--------|------|--------|
+| **1** | Extract constants + defaults to `app/constants.ts`. Move nothing else. | Low | Done |
+| **2** | Extract panels (Header, Actions, Tools, SceneIO, Outliner, Status) into components; App passes state and callbacks. Keep all state in App. | Medium (many props initially) | Done |
+| **3** | Introduce EditorContext + EditorProvider; optional useEditorContext() for deep components. State remains in App. | Medium | Done (minimal) |
+| **4** | Split SceneContent: extract sceneHelpers (isFiniteVec3/Quat); add section comment. Full physics/actuator/draw split can follow incrementally. | Medium–high | Done (helpers + comment) |
+| **5** | CSS section comments; types unchanged; push branch. | Low | Done |
 
 Recommended order: **1 → 2 → 3**. Then 4 once the app shell is stable. Phase 5 as needed.
 

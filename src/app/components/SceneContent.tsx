@@ -49,6 +49,9 @@ import type {
 } from "../types";
 import { ActiveSkinnedMesh } from "./ActiveSkinnedMesh";
 import { XRToolVisuals } from "./XRToolVisuals";
+import { isFiniteQuat, isFiniteVec3 } from "./sceneHelpers";
+
+// --- SceneContent: physics world, actuator bodies, draw surfaces, skinning, XR tools ---
 
 export type SceneContentProps = {
   meshSources: ActiveMeshSource[];
@@ -124,14 +127,6 @@ type PosePullState = {
   dragPlaneNormal: Vec3;
   dragPlaneConstant: number;
 };
-
-function isFiniteVec3(value: { x: number; y: number; z: number }): boolean {
-  return Number.isFinite(value.x) && Number.isFinite(value.y) && Number.isFinite(value.z);
-}
-
-function isFiniteQuat(value: { x: number; y: number; z: number; w: number }): boolean {
-  return Number.isFinite(value.x) && Number.isFinite(value.y) && Number.isFinite(value.z) && Number.isFinite(value.w);
-}
 
 function makeColliderPairKey(handleA: number, handleB: number): string {
   const low = Math.min(handleA, handleB);
