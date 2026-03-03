@@ -4,6 +4,7 @@ import { useXRInputSourceState } from "@react-three/xr";
 import { Color, Group, Mesh, MeshStandardMaterial, Object3D, Quaternion, Vector3 } from "three";
 import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
 import type { XRHandedness, XRToolId } from "../../interaction/xrTools";
+import { resolvePublicAssetUrl } from "../../runtime/assetPaths";
 
 export type XRToolVisualsProps = {
   visible: boolean;
@@ -70,10 +71,10 @@ export function XRToolVisuals({ visible, activeToolByHand, altModeByHand }: XRTo
   const leftController = useXRInputSourceState("controller", "left");
   const rightController = useXRInputSourceState("controller", "right");
 
-  const drawToolAsset = useLoader(FBXLoader, "/assets/tools/DrawActuatorTool.fbx");
-  const grabToolAsset = useLoader(FBXLoader, "/assets/tools/GrabTool.fbx");
-  const adjustToolAsset = useLoader(FBXLoader, "/assets/tools/AdjustTool.fbx");
-  const selectToolAsset = useLoader(FBXLoader, "/assets/tools/SelectTool.fbx");
+  const drawToolAsset = useLoader(FBXLoader, resolvePublicAssetUrl("assets/tools/DrawActuatorTool.fbx"));
+  const grabToolAsset = useLoader(FBXLoader, resolvePublicAssetUrl("assets/tools/GrabTool.fbx"));
+  const adjustToolAsset = useLoader(FBXLoader, resolvePublicAssetUrl("assets/tools/AdjustTool.fbx"));
+  const selectToolAsset = useLoader(FBXLoader, resolvePublicAssetUrl("assets/tools/SelectTool.fbx"));
 
   const leftVariants = useMemo(
     () =>

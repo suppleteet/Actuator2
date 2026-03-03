@@ -34,6 +34,7 @@ import {
 import {
   defaultPresetForActuatorType,
 } from "./runtime/physicsPresets";
+import { resolvePublicAssetUrl } from "./runtime/assetPaths";
 import { createRootActuator, composeMatrix } from "./app/actuatorModel";
 import { smoothDampQuat, smoothDampVec3, type SmoothDampQuatVelocity, type SmoothDampVec3Velocity } from "./app/smoothDamp";
 import {
@@ -104,10 +105,10 @@ export default function App() {
     () => [
       {
         id: "mesh_chad",
-        meshUri: "/assets/chad/Chad.fbx",
-        colorMapUri: "/assets/chad/Textures/chad_Col.png",
-        normalMapUri: "/assets/chad/Textures/chad_Norm.png",
-        roughnessMapUri: "/assets/chad/Textures/chad_Pbr.png",
+        meshUri: resolvePublicAssetUrl("assets/chad/Chad.fbx"),
+        colorMapUri: resolvePublicAssetUrl("assets/chad/Textures/chad_Col.png"),
+        normalMapUri: resolvePublicAssetUrl("assets/chad/Textures/chad_Norm.png"),
+        roughnessMapUri: resolvePublicAssetUrl("assets/chad/Textures/chad_Pbr.png"),
         worldScale: 0.01,
         worldYOffset: 0.02,
       },
