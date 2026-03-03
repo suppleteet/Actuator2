@@ -47,3 +47,13 @@ No PR merges unless:
 - CI checks pass.
 - Contract compliance is confirmed.
 - Checklist in `docs/checklists/PR_CHECKLIST.md` is complete.
+
+## Cursor Cloud specific instructions
+
+- **Single service**: This is a 100% client-side SPA with no backend, database, or external services. The only service is the Vite dev server.
+- **Dev server**: `npm run dev` starts Vite on `http://localhost:5173`. Hot module replacement is enabled.
+- **Tests**: `npm test` runs all Vitest tests (10 files, 38 tests). Tests are pure logic with no external dependencies.
+- **Build**: `npm run build` runs `tsc -b && vite build`. TypeScript type-checking runs first, then Vite bundles.
+- **No linter configured**: There is no ESLint/Prettier setup in this repo. Skip lint checks.
+- **No environment variables needed** for local dev. Only `VITE_BASE_PATH` matters for GitHub Pages builds.
+- **Camera controls**: Alt+LMB orbit, MMB pan, RMB zoom, Shift+wheel for draw radius. These are displayed in the app header bar.
