@@ -16,7 +16,7 @@ export function rootIdForRig(rigId: string): string {
 }
 
 export function createRootActuator(rigId: string, xOffset = 0): ActuatorEntity {
-  const rootSize = { x: 0.6, y: 0.25, z: 0.6 };
+  const rootSize = { x: 0.6, y: 0, z: 0.6 };
   const rootHalfAxis = rootSize.y * 0.5;
   return {
     id: rootIdForRig(rigId),

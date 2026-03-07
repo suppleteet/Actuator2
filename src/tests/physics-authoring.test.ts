@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   defaultPivotForShape,
+  getActuatorColliderVolume,
   getActuatorPrimitiveCenter,
   getCapsuleHalfAxis,
   normalizePrimitiveSize,
@@ -60,5 +61,20 @@ describe("Physics primitive authoring semantics", () => {
     expect(scaledFromX.z).toBeCloseTo(0.56, 6);
     expect(scaledFromZ.x).toBeCloseTo(0.245, 6);
     expect(scaledFromZ.z).toBeCloseTo(0.245, 6);
+  });
+
+  it("computes collider volume for capsule, sphere, and box", () => {
+    const capsule = { shape: "capsule" as const, size: { x: 0.35, y: 0.8, z: 0.35 } };
+    const r = 0.175;
+    const halfAxis = 0.4;
+    const expectedCapsule = Math.PI * r * r * (2 * halfAxis) + (4 / 3) * Math.PI * r * r * r;
+    expect(getActuatorColliderVolume(capsule)).toBeCloseTo(expectedCapsule, 6);
+
+    const sphere = { shape: "sphere" as const, size: { x: 0.5, y: 0.5, z: 0.5 } };
+    const rSphere = 0.25;
+    expect(getActuatorColliderVolume(sphere)).toBeCloseTo((4 / 3) * Math.PI * rSphere * rSphere * rSphere, 6);
+
+    const box = { shape: "box" as const, size: { x: 1, y: 0.5, z: 0.3 } };
+    expect(getActuatorColliderVolume(box)).toBe(1 * 0.5 * 0.3);
   });
 });

@@ -1,4 +1,4 @@
-import { createRef, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MutableRefObject, type RefObject } from "react";
+import { createRef, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MutableRefObject, type RefObject } from "react";
 import { useFrame, useThree } from "@react-three/fiber";
 import { TransformControls } from "@react-three/drei";
 import {
@@ -20,6 +20,7 @@ import { useXR } from "@react-three/xr";
 import { Color, Matrix4, MeshStandardMaterial, NormalBlending, Object3D, Plane, Quaternion, Vector3 } from "three";
 import {
   getActuatorPivotWorldPosition,
+  getActuatorColliderVolume,
   getActuatorPrimitiveCenter,
   getActuatorRadius,
   getCapsuleHalfAxis,
@@ -27,7 +28,7 @@ import {
 } from "../../runtime/physicsAuthoring";
 import {
   defaultPresetForActuatorType,
-  getActuatorMassFromPreset,
+  getActuatorMass,
   getActuatorPresetSettings,
   getRuntimeDriveFromPreset,
 } from "../../runtime/physicsPresets";
@@ -67,6 +68,7 @@ export type SceneContentProps = {
   deltaMushEnabled: boolean;
   deltaMushSettings: DeltaMushSettings;
   physicsTuning: PhysicsTuning;
+  worldGravityY?: number;
   onSkinningStats: (stats: SkinningStats) => void;
   onSkinningComputationStatus: (status: SkinningComputationStatus) => void;
   gizmoMode: GizmoMode;
@@ -87,6 +89,7 @@ export type SceneContentProps = {
   onTransformEnd: () => void;
   onPosePullDraggingChange: (active: boolean) => void;
   onDrawSurfaceRef: (id: string, object: Object3D | null) => void;
+  onUpAxisDetected?: (meshId: string, upAxis: "Z") => void;
   drawHoverActuatorId: string | null;
   xrActiveToolsByHand: Record<XRHandedness, XRToolId>;
   xrAltModeByHand: Record<XRHandedness, boolean>;
@@ -194,6 +197,8 @@ function SimulationOverlapFilter({ physicsEnabled, actuators, colliderRefs }: Si
     pendingBootstrapRef.current = false;
     bootstrapAttemptRef.current = 0;
 
+    // Only disable collision for: (1) direct parent–child pairs, (2) pairs overlapping when sim was off.
+    // Everything else collides (including same-rig non-parent pairs and different rigs).
     const nextDisabledPairs = new Set<string>();
     for (const actuator of actuators) {
       if (actuator.parentId === null) continue;
@@ -207,13 +212,11 @@ function SimulationOverlapFilter({ physicsEnabled, actuators, colliderRefs }: Si
       for (let j = i + 1; j < colliderEntries.length; j += 1) {
         const entryA = colliderEntries[i];
         const entryB = colliderEntries[j];
-        if (entryA.actuator.rigId === entryB.actuator.rigId) {
-          nextDisabledPairs.add(makeColliderPairKey(entryA.collider.handle, entryB.collider.handle));
-          continue;
-        }
+        const pairKey = makeColliderPairKey(entryA.collider.handle, entryB.collider.handle);
+        if (nextDisabledPairs.has(pairKey)) continue; // already disabled (e.g. parent–child)
         const contact = entryA.collider.contactCollider(entryB.collider, 0);
         if (contact !== null && contact.distance < 0) {
-          nextDisabledPairs.add(makeColliderPairKey(entryA.collider.handle, entryB.collider.handle));
+          nextDisabledPairs.add(pairKey);
         }
       }
     }
@@ -272,8 +275,8 @@ function PosePhysicsBridge({
         rootMoverActuatorIdRef.current === actuatorId &&
         rootMoverAnchorBodyRef.current !== null &&
         rootMoverJointRef.current !== null &&
-        Math.abs(rootMoverStiffnessRef.current - stiffness) < 1 &&
-        Math.abs(rootMoverDampingRef.current - damping) < 1;
+        Math.abs(rootMoverStiffnessRef.current - stiffness) < 0.5 &&
+        Math.abs(rootMoverDampingRef.current - damping) < 0.5;
       if (!hasValidBridge) {
         clearRootMoverBridge();
         const anchorDesc = rapier.RigidBodyDesc.kinematicPositionBased()
@@ -387,11 +390,11 @@ function PosePhysicsBridge({
       if (actuator.parentId === null) {
         hasRoot = true;
         const rootMass = Math.max(1, body.mass());
-        const moverStiffness = Math.max(900, Math.min(18000, positionSpring.stiffness * 32));
+        const moverStiffness = Math.max(280, Math.min(18000, positionSpring.stiffness * 32));
         const criticalDamping = 2 * Math.sqrt(rootMass * moverStiffness);
         const moverDamping = Math.max(
-          80,
-          Math.min(3200, Math.max(positionSpring.damping * 10, criticalDamping * 0.9)),
+          60,
+          Math.min(3200, Math.max(positionSpring.damping * 10, criticalDamping * 0.92)),
         );
         const moverTarget = actuator.id === grabbedActuatorId ? sampledPosition : target.position;
         ensureRootMoverBridge(actuator.id, body, moverTarget, moverStiffness, moverDamping);
@@ -735,6 +738,7 @@ export function SceneContent({
   deltaMushEnabled,
   deltaMushSettings,
   physicsTuning,
+  worldGravityY = -9.81,
   onSkinningStats,
   onSkinningComputationStatus,
   gizmoMode,
@@ -749,6 +753,7 @@ export function SceneContent({
   onTransformEnd,
   onPosePullDraggingChange,
   onDrawSurfaceRef,
+  onUpAxisDetected,
   drawHoverActuatorId,
   xrActiveToolsByHand,
   xrAltModeByHand,
@@ -1168,27 +1173,29 @@ export function SceneContent({
       <primitive object={pivotObjectRef.current} visible={false} />
       <XRToolVisuals visible={isInXR} activeToolByHand={xrActiveToolsByHand} altModeByHand={xrAltModeByHand} />
       {meshSources.map((meshSource) => (
-        <ActiveSkinnedMesh
-          key={meshSource.id}
-          meshSource={meshSource}
-          actuators={actuators}
-          appMode={appMode}
-          gizmoMode={gizmoMode}
-          pendingPoseRevision={pendingPoseRevision}
-          simulationSamplesRef={simulationSamplesRef}
-          isTransformDragging={isTransformDragging}
-          skinningEnabled={skinningEnabled}
-          skinningRevision={skinningRevision}
-          deltaMushEnabled={deltaMushEnabled}
-          deltaMushSettings={deltaMushSettings}
-          onSkinningStats={(stats) => onMeshSkinningStats(meshSource.id, stats)}
-          onSkinningComputationStatus={(status) => onMeshSkinningComputationStatus(meshSource.id, status)}
-          onDrawSurfaceRef={onDrawSurfaceRef}
-        />
+        <Suspense key={meshSource.id} fallback={null}>
+          <ActiveSkinnedMesh
+            meshSource={meshSource}
+            actuators={actuators}
+            appMode={appMode}
+            gizmoMode={gizmoMode}
+            pendingPoseRevision={pendingPoseRevision}
+            simulationSamplesRef={simulationSamplesRef}
+            isTransformDragging={isTransformDragging}
+            skinningEnabled={skinningEnabled}
+            skinningRevision={skinningRevision}
+            deltaMushEnabled={deltaMushEnabled}
+            deltaMushSettings={deltaMushSettings}
+            onSkinningStats={(stats) => onMeshSkinningStats(meshSource.id, stats)}
+            onSkinningComputationStatus={(status) => onMeshSkinningComputationStatus(meshSource.id, status)}
+            onDrawSurfaceRef={onDrawSurfaceRef}
+            onUpAxisDetected={onUpAxisDetected}
+          />
+        </Suspense>
       ))}
 
       <Physics
-        gravity={[0, -9.81, 0]}
+        gravity={[0, worldGravityY, 0]}
         timeStep={1 / 60}
         interpolate
         numSolverIterations={Math.max(1, Math.round(physicsTuning.solverIterations))}
@@ -1225,7 +1232,7 @@ export function SceneContent({
           const capsuleHalfAxis = getCapsuleHalfAxis(actuator.size);
           const radius = getActuatorRadius(actuator);
           const presetSettings = getActuatorPresetSettings(actuator);
-          const bodyMass = getActuatorMassFromPreset(actuator);
+          const bodyMass = getActuatorMass(actuator, getActuatorColliderVolume);
           const isPoseRoot = physicsEnabled && appMode === "Pose" && isRoot;
           const poseRootMass = isPoseRoot ? Math.max(bodyMass, 12) : bodyMass;
           const bodyType =
@@ -1235,6 +1242,23 @@ export function SceneContent({
                 ? (isRoot ? "kinematicPosition" : "dynamic")
                 : "kinematicPosition";
           const bodyRef = bodyRefById[actuator.id];
+          // In Pose mode use simulation samples when available so re-renders don't overwrite
+          // the physics state (react-three-rapier syncs props -> body in an effect).
+          const simSample =
+            physicsEnabled && appMode === "Pose" ? simulationSamplesRef.current?.[actuator.id] : null;
+          const displayPosition = simSample ? simSample.position : center;
+          const displayPositionArr: [number, number, number] = [
+            displayPosition.x,
+            displayPosition.y,
+            displayPosition.z,
+          ];
+          const displayRotation = simSample ? simSample.rotation : actuator.transform.rotation;
+          const displayQuat: [number, number, number, number] = [
+            displayRotation.x,
+            displayRotation.y,
+            displayRotation.z,
+            displayRotation.w,
+          ];
 
           return (
             <RigidBody
@@ -1270,13 +1294,8 @@ export function SceneContent({
               gravityScale={physicsEnabled && isRoot ? 0 : 1}
               enabledRotations={[true, true, true]}
               mass={poseRootMass}
-              position={[center.x, center.y, center.z]}
-              quaternion={[
-                actuator.transform.rotation.x,
-                actuator.transform.rotation.y,
-                actuator.transform.rotation.z,
-                actuator.transform.rotation.w,
-              ]}
+              position={displayPositionArr}
+              quaternion={displayQuat}
             >
               <mesh
                 ref={(object) => onActuatorRef(actuator.id, object)}
@@ -1572,6 +1591,10 @@ export function SceneContent({
               if (gizmoMode === "draw") {
                 event.stopPropagation();
                 return;
+              }
+              if (appMode === "Pose") {
+                event.stopPropagation();
+                return; // keep selection when releasing grab on floor
               }
               if (Date.now() < suppressSelectionClickUntilRef.current) {
                 event.stopPropagation();

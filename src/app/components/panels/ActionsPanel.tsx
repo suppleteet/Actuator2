@@ -12,7 +12,6 @@ export type ActionsPanelProps = {
   ioStatus: string;
   meshImportStatus: string;
   sceneLoadInputRef: RefObject<HTMLInputElement | null>;
-  meshImportInputRef: RefObject<HTMLInputElement | null>;
   onCreateRig: () => void;
   onCreateActuator: () => void;
   onDeleteSelected: () => void;
@@ -20,9 +19,7 @@ export type ActionsPanelProps = {
   onRedo: () => void;
   onSaveScene: () => void;
   onRequestLoadScene: () => void;
-  onRequestImportMesh: () => void;
   onSceneFileChange: (event: React.ChangeEvent<HTMLInputElement>) => void;
-  onMeshFileChange: (event: React.ChangeEvent<HTMLInputElement>) => void;
 };
 
 export function ActionsPanel({
@@ -36,7 +33,6 @@ export function ActionsPanel({
   ioStatus,
   meshImportStatus,
   sceneLoadInputRef,
-  meshImportInputRef,
   onCreateRig,
   onCreateActuator,
   onDeleteSelected,
@@ -44,9 +40,7 @@ export function ActionsPanel({
   onRedo,
   onSaveScene,
   onRequestLoadScene,
-  onRequestImportMesh,
   onSceneFileChange,
-  onMeshFileChange,
 }: ActionsPanelProps) {
   const canDelete =
     workflowAllowsRigAuthoring &&
@@ -84,22 +78,15 @@ export function ActionsPanel({
           <button type="button" onClick={onRequestLoadScene}>
             Load Scene
           </button>
-          <button type="button" onClick={onRequestImportMesh}>
+          <label htmlFor="app-mesh-import-input" className="app__panel-actions-label">
             Import Mesh
-          </button>
+          </label>
           <input
             ref={sceneLoadInputRef}
             type="file"
             accept=".json,.a2scene"
             style={{ display: "none" }}
             onChange={onSceneFileChange}
-          />
-          <input
-            ref={meshImportInputRef}
-            type="file"
-            accept=".fbx,.glb,.gltf,.obj"
-            style={{ display: "none" }}
-            onChange={onMeshFileChange}
           />
         </div>
         <div className="app__tool-separator" />

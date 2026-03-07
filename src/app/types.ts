@@ -21,6 +21,24 @@ export type Vec3 = { x: number; y: number; z: number };
 export type Quat = { x: number; y: number; z: number; w: number };
 export type ActuatorPivot = { mode: ActuatorPivotMode; offset: Vec3 };
 
+/** Optional per-actuator overrides for physics (merged with preset). Persisted in scene. */
+export type ActuatorPhysicsOverrides = Partial<{
+  mass: number;
+  drag: number;
+  angularDrag: number;
+  driveRotationSpring: number;
+  driveRotationDamper: number;
+  angularXLowLimit: number;
+  angularXHighLimit: number;
+  angularYLimit: number;
+  angularZLimit: number;
+  linearLimit: number;
+  linearLimitSpring: number;
+  linearLimitDamper: number;
+  drivePositionSpring: number;
+  drivePositionDamper: number;
+}>;
+
 export type ActuatorEntity = {
   id: string;
   rigId: string;
@@ -35,6 +53,8 @@ export type ActuatorEntity = {
     scale: Vec3;
   };
   size: Vec3;
+  /** Optional physics overrides (merged with preset). */
+  physicsOverrides?: ActuatorPhysicsOverrides;
 };
 
 export type EditorState = {
@@ -83,12 +103,28 @@ export type ActuatorTransformSnapshot = {
   scale: Vec3;
 };
 
+/** Supported mesh formats for rendering (matches ImportedMeshDocument.format for fbx/glb). */
+export type ActiveMeshSourceFormat = "fbx" | "glb";
+
+/** Source asset up axis; when Z, mesh is rotated so Z-up becomes Y-up. */
+export type ActiveMeshUpAxis = "Y" | "Z";
+
 export type ActiveMeshSource = {
   id: string;
+  format: ActiveMeshSourceFormat;
   meshUri: string;
+  /** Used when format === "fbx". Empty when format === "glb" (uses embedded materials). */
   colorMapUri: string;
   normalMapUri: string;
   roughnessMapUri: string;
-  worldScale: number;
-  worldYOffset: number;
+  /** Scale applied at import (default 1). Replaces legacy worldScale. */
+  importScale: number;
+  /** Position offset at import (default 0,0,0). Replaces legacy worldYOffset. */
+  positionOffset: Vec3;
+  /** Rotation offset at import, euler degrees (default 0,0,0). */
+  rotationOffset: Vec3;
+  /** Source asset up axis (default Y). */
+  upAxis: ActiveMeshUpAxis;
+  /** When true, flip normals (fixes inside-out meshes). */
+  flipNormals: boolean;
 };

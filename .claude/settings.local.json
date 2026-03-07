@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /c/Projects/Actuator2 show --stat HEAD~5..HEAD)",
+      "Bash(npx tsc --noEmit)"
+    ]
+  }
+}

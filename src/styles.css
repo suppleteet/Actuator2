@@ -1,3 +1,5 @@
+@import "dockview/dist/styles/dockview.css";
+
 /* --- Globals & CSS variables --- */
 :root {
   font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
@@ -100,11 +102,10 @@ body,
 .app__viewport {
   min-height: 0;
   display: grid;
-  grid-template-columns: 360px 1fr;
+  grid-template-columns: 360px 6px 1fr 280px;
 }
 
 .app__panel {
-  border-right: 1px solid var(--border);
   background: var(--panel-bg);
   padding: 10px;
   display: flex;
@@ -112,6 +113,127 @@ body,
   gap: 10px;
   min-height: 0;
   overflow: hidden;
+}
+
+.app__panel--left {
+  border-right: 1px solid var(--border);
+}
+
+.app__panel--right {
+  border-left: 1px solid var(--border);
+  min-width: 280px;
+}
+
+.app__panel-resize {
+  cursor: col-resize;
+  background: var(--border);
+  min-width: 6px;
+  flex-shrink: 0;
+}
+.app__panel-resize:hover {
+  background: var(--border-strong);
+}
+
+/* --- Dock layout (Unity-style) --- */
+.app__viewport--dock {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  height: 100%;
+}
+
+.app__dockview-wrap {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.app__dockview-wrap > div {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.app__dockview {
+  flex: 1;
+  min-height: 0;
+  height: 100%;
+}
+
+.app__dock-panel-content {
+  height: 100%;
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel-bg);
+  padding: 10px;
+}
+
+/* Dockview: react part is positioned so outliner panel can fill it */
+.dv-groupview .dv-content-container {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.dv-groupview .dv-content-container .dv-react-part {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  position: relative;
+}
+
+/* Outliner (Hierarchy) panel: fill panel via absolute positioning; scroll height set by ResizeObserver */
+.app__dock-panel-content--outliner {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 10px;
+  overflow: hidden;
+}
+.app__dock-panel-content--outliner .app__outliner-fill {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.app__dock-panel-content--outliner .app__outliner-fill > .app__panel-section--fill {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.app__dock-panel-content--outliner .app__outliner-fill .app__panel-section-header {
+  flex-shrink: 0;
+}
+.app__dock-panel-content--outliner .app__panel-section-body--fill {
+  flex-shrink: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: block;
+}
+.app__dock-panel-content--outliner .app__outliner {
+  display: block;
+}
+
+.app__dock-panel-scene {
+  padding: 0;
+  overflow: hidden;
+}
+
+.app__dock-panel-scene .app__canvas-wrap {
+  width: 100%;
+  height: 100%;
 }
 
 .app__panel-section {
@@ -172,11 +294,116 @@ body,
 .app__panel-section--fill[open] > .app__panel-section-body--fill {
   flex: 1;
   min-height: 0;
+  min-width: 0;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 .app__panel-section--status {
   margin-top: auto;
+}
+
+/* --- Properties panel (right) --- */
+.app__properties-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.app__properties-empty {
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 8px 0;
+}
+
+.app__properties-header {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  padding: 4px 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.app__properties-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.app__properties-row--vec3 {
+  align-items: flex-start;
+}
+
+.app__properties-label {
+  flex: 0 1 90px;
+  min-width: 44px;
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app__properties-input {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 4px 6px;
+  font-size: 11px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface-bg);
+  color: var(--text);
+  box-sizing: border-box;
+}
+
+.app__properties-slider-wrap {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.app__properties-slider {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.app__properties-vec3 {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  gap: 4px;
+}
+
+.app__properties-vec3 .app__properties-input {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.app__properties-checkbox {
+  margin: 0;
+  width: 1rem;
+  height: 1rem;
+  cursor: pointer;
+}
+
+.app__properties-readonly {
+  font-size: 11px;
+  color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .app__panel-actions {
@@ -197,6 +424,21 @@ body,
 .app__panel-actions button:disabled {
   cursor: not-allowed;
   opacity: 0.5;
+}
+
+.app__panel-actions-label {
+  display: inline-block;
+  padding: 6px 10px;
+  border: 1px solid var(--button-border);
+  background: var(--button-bg);
+  color: var(--button-text);
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.app__panel-actions-label:hover {
+  background: var(--button-hover-bg, color-mix(in srgb, var(--button-bg) 90%, white));
 }
 
 .app__panel-tools {
@@ -325,15 +567,14 @@ body,
 /* ── Outliner ──────────────────────────────────────────── */
 
 .app__outliner {
-  flex: 1;
-  height: 100%;
-  max-height: 100%;
+  flex: 1 1 0;
   list-style: none;
   margin: 0;
   padding: 2px 0;
   overflow-y: auto;
   overflow-x: hidden;
   min-height: 0;
+  min-width: 0;
   border: 1px solid var(--border-strong);
   border-radius: 6px;
   background: var(--surface-bg);
@@ -356,11 +597,16 @@ body,
 }
 
 .app__outliner-rig-label {
+  flex: 1 1 0;
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.03em;
   color: #b8cbe0;
   text-transform: uppercase;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Actuator node row */
@@ -368,9 +614,11 @@ body,
   display: flex;
   align-items: center;
   height: 22px;
+  min-height: 22px;
   padding-right: 6px;
   cursor: default;
   user-select: none;
+  min-width: 0;
 }
 
 .app__outliner-item:hover {
@@ -672,4 +920,68 @@ body,
 .app__viewcube-hotspot:hover {
   background: #f6ce4c;
   border-color: #c78f06;
+}
+
+/* --- Clear scene / import modal --- */
+.app__modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.app__modal {
+  background: var(--panel-bg, #2b2d31);
+  border: 1px solid var(--button-border, #4a4d54);
+  border-radius: 8px;
+  padding: 20px;
+  min-width: 320px;
+  max-width: 90vw;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+
+.app__modal-title {
+  margin: 0 0 12px;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.app__modal-text {
+  margin: 0 0 20px;
+  font-size: 0.9rem;
+  line-height: 1.4;
+  color: var(--text-secondary, #b0b4bb);
+}
+
+.app__modal-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.app__modal-btn {
+  padding: 8px 16px;
+  border: 1px solid var(--button-border);
+  background: var(--button-bg);
+  color: var(--button-text);
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.app__modal-btn:hover {
+  background: var(--button-hover-bg, color-mix(in srgb, var(--button-bg) 90%, white));
+}
+
+.app__modal-btn--primary {
+  background: var(--accent-bg, #4a7cbf);
+  border-color: var(--accent-border, #5a8ccf);
+  color: var(--accent-text, #fff);
+}
+
+.app__modal-btn--primary:hover {
+  background: var(--accent-hover-bg, #5a8ccf);
 }

@@ -65,6 +65,24 @@ export function getActuatorRadius(actuator: Pick<ActuatorPrimitiveLike, "shape" 
   return 0;
 }
 
+/**
+ * Volume of the collider for the given shape/size. Used to scale rigidbody mass
+ * so that smaller colliders have less mass (Unity-style mass scaling).
+ */
+export function getActuatorColliderVolume(actuator: Pick<ActuatorPrimitiveLike, "shape" | "size">): number {
+  if (actuator.shape === "sphere") {
+    const r = getActuatorRadius(actuator);
+    return (4 / 3) * Math.PI * r * r * r;
+  }
+  if (actuator.shape === "capsule") {
+    const r = getActuatorRadius(actuator);
+    const halfAxis = getCapsuleHalfAxis(actuator.size);
+    const cylinderHeight = 2 * halfAxis;
+    return Math.PI * r * r * cylinderHeight + (4 / 3) * Math.PI * r * r * r;
+  }
+  return actuator.size.x * actuator.size.y * actuator.size.z;
+}
+
 export function getActuatorPivotWorldPosition(actuator: Pick<ActuatorPrimitiveLike, "pivot" | "transform">): Vector3 {
   const offset = new Vector3(actuator.pivot.offset.x, actuator.pivot.offset.y, actuator.pivot.offset.z).applyQuaternion(
     new Quaternion(

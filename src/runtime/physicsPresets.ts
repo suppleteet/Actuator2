@@ -43,6 +43,7 @@ export type ActuatorPresetSettings = {
 type MinimalActuatorLike = {
   type: "root" | "custom";
   preset?: ActuatorPreset;
+  physicsOverrides?: Partial<ActuatorPresetSettings>;
 };
 
 export type RuntimeDriveSettings = {
@@ -65,7 +66,7 @@ function clamp01(value: number): number {
 
 export const UNITY_ACTUATOR_PRESET_SETTINGS: Record<ActuatorPreset, ActuatorPresetSettings> = {
   Default: {
-    mass: 2.5,
+    mass: 1.9,
     drag: 0.25,
     angularDrag: 0.05,
     xMotion: "Locked",
@@ -87,8 +88,8 @@ export const UNITY_ACTUATOR_PRESET_SETTINGS: Record<ActuatorPreset, ActuatorPres
     angularYZLimitDamper: 50,
     drivePositionSpring: 0,
     drivePositionDamper: 0,
-    driveRotationSpring: 8000,
-    driveRotationDamper: 50,
+    driveRotationSpring: 14000,
+    driveRotationDamper: 62,
   },
   Root: {
     mass: 2.5,
@@ -111,13 +112,13 @@ export const UNITY_ACTUATOR_PRESET_SETTINGS: Record<ActuatorPreset, ActuatorPres
     angularZLimit: 60,
     angularYZLimitSpring: 500,
     angularYZLimitDamper: 50,
-    drivePositionSpring: 3500,
-    drivePositionDamper: 30,
-    driveRotationSpring: 10000,
-    driveRotationDamper: 50,
+    drivePositionSpring: 350,
+    drivePositionDamper: 62,
+    driveRotationSpring: 16000,
+    driveRotationDamper: 65,
   },
   SpinePelvis: {
-    mass: 2.5,
+    mass: 1.9,
     drag: 0.25,
     angularDrag: 0.05,
     xMotion: "Locked",
@@ -139,11 +140,11 @@ export const UNITY_ACTUATOR_PRESET_SETTINGS: Record<ActuatorPreset, ActuatorPres
     angularYZLimitDamper: 50,
     drivePositionSpring: 0,
     drivePositionDamper: 0,
-    driveRotationSpring: 8000,
-    driveRotationDamper: 50,
+    driveRotationSpring: 14000,
+    driveRotationDamper: 62,
   },
   NeckHead: {
-    mass: 2.5,
+    mass: 1.9,
     drag: 0.25,
     angularDrag: 0.05,
     xMotion: "Locked",
@@ -165,11 +166,11 @@ export const UNITY_ACTUATOR_PRESET_SETTINGS: Record<ActuatorPreset, ActuatorPres
     angularYZLimitDamper: 50,
     drivePositionSpring: 0,
     drivePositionDamper: 0,
-    driveRotationSpring: 2000,
-    driveRotationDamper: 10,
+    driveRotationSpring: 6200,
+    driveRotationDamper: 30,
   },
   ArmLeg: {
-    mass: 2.5,
+    mass: 1.2,
     drag: 0.25,
     angularDrag: 0.05,
     xMotion: "Locked",
@@ -191,11 +192,11 @@ export const UNITY_ACTUATOR_PRESET_SETTINGS: Record<ActuatorPreset, ActuatorPres
     angularYZLimitDamper: 50,
     drivePositionSpring: 0,
     drivePositionDamper: 0,
-    driveRotationSpring: 2000,
-    driveRotationDamper: 10,
+    driveRotationSpring: 6200,
+    driveRotationDamper: 30,
   },
   ElbowKnee: {
-    mass: 2.5,
+    mass: 1.2,
     drag: 0.25,
     angularDrag: 0.05,
     xMotion: "Locked",
@@ -217,11 +218,11 @@ export const UNITY_ACTUATOR_PRESET_SETTINGS: Record<ActuatorPreset, ActuatorPres
     angularYZLimitDamper: 0,
     drivePositionSpring: 0,
     drivePositionDamper: 0,
-    driveRotationSpring: 2000,
-    driveRotationDamper: 10,
+    driveRotationSpring: 6200,
+    driveRotationDamper: 30,
   },
   Finger: {
-    mass: 0.25,
+    mass: 0.18,
     drag: 0.1,
     angularDrag: 0.05,
     xMotion: "Locked",
@@ -243,11 +244,11 @@ export const UNITY_ACTUATOR_PRESET_SETTINGS: Record<ActuatorPreset, ActuatorPres
     angularYZLimitDamper: 50,
     drivePositionSpring: 0,
     drivePositionDamper: 0,
-    driveRotationSpring: 2000,
-    driveRotationDamper: 10,
+    driveRotationSpring: 4000,
+    driveRotationDamper: 20,
   },
   MuscleJiggle: {
-    mass: 0.5,
+    mass: 0.38,
     drag: 0.025,
     angularDrag: 0.025,
     xMotion: "Limited",
@@ -273,7 +274,7 @@ export const UNITY_ACTUATOR_PRESET_SETTINGS: Record<ActuatorPreset, ActuatorPres
     driveRotationDamper: 5,
   },
   FatJiggle: {
-    mass: 0.5,
+    mass: 0.38,
     drag: 0.025,
     angularDrag: 0.025,
     xMotion: "Limited",
@@ -299,7 +300,7 @@ export const UNITY_ACTUATOR_PRESET_SETTINGS: Record<ActuatorPreset, ActuatorPres
     driveRotationDamper: 3,
   },
   Dangly: {
-    mass: 0.25,
+    mass: 0.18,
     drag: 0,
     angularDrag: 0.001,
     xMotion: "Limited",
@@ -325,7 +326,7 @@ export const UNITY_ACTUATOR_PRESET_SETTINGS: Record<ActuatorPreset, ActuatorPres
     driveRotationDamper: 0.1,
   },
   Floppy: {
-    mass: 0.5,
+    mass: 0.38,
     drag: 0,
     angularDrag: 0.025,
     xMotion: "Limited",
@@ -358,11 +359,41 @@ export function defaultPresetForActuatorType(type: "root" | "custom"): ActuatorP
 
 export function getActuatorPresetSettings(actuator: MinimalActuatorLike): ActuatorPresetSettings {
   const preset = actuator.preset ?? defaultPresetForActuatorType(actuator.type);
-  return UNITY_ACTUATOR_PRESET_SETTINGS[preset];
+  const base = UNITY_ACTUATOR_PRESET_SETTINGS[preset];
+  const overrides = actuator.physicsOverrides;
+  if (!overrides || Object.keys(overrides).length === 0) return base;
+  return { ...base, ...overrides };
 }
 
 export function getActuatorMassFromPreset(actuator: MinimalActuatorLike): number {
   return getActuatorPresetSettings(actuator).mass;
+}
+
+/** Reference collider volume (capsule r≈0.175, h=0.8) so preset mass applies at that size. */
+const REFERENCE_VOLUME = 0.099;
+const MIN_MASS = 0.01;
+const MAX_MASS = 500;
+
+type ActuatorWithShape = MinimalActuatorLike & { shape: "capsule" | "sphere" | "box"; size: { x: number; y: number; z: number } };
+
+/**
+ * Mass scaled by collider volume so that smaller segments weigh less and the root
+ * isn't overpowered by many small limbs. Uses preset mass as the base for a
+ * "reference"-sized collider. If physicsOverrides.mass is set, that value is
+ * used directly (clamped) as the body mass.
+ */
+export function getActuatorMass(
+  actuator: ActuatorWithShape,
+  getVolume: (a: Pick<ActuatorWithShape, "shape" | "size">) => number,
+): number {
+  const overrides = (actuator as MinimalActuatorLike).physicsOverrides;
+  if (overrides?.mass != null && Number.isFinite(overrides.mass)) {
+    return Math.max(MIN_MASS, Math.min(MAX_MASS, overrides.mass));
+  }
+  const baseMass = getActuatorPresetSettings(actuator).mass;
+  const volume = getVolume(actuator);
+  const scale = volume / REFERENCE_VOLUME;
+  return Math.max(MIN_MASS, Math.min(MAX_MASS, baseMass * scale));
 }
 
 export function getRuntimeDriveFromPreset(actuator: MinimalActuatorLike): RuntimeDriveSettings {

@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import type { ActuatorEntity } from "../../types";
 import type { ActiveMeshSource } from "../../types";
 
@@ -9,6 +10,7 @@ export type OutlinerEntry =
 export type OutlinerPanelProps = {
   entries: OutlinerEntry[];
   selectedActuatorIds: string[];
+  selectedMeshSourceId: string | null;
   collapsedNodeIds: ReadonlySet<string>;
   outlinerParentDragSourceId: string | null;
   outlinerParentDropTargetId: string | null;
@@ -18,11 +20,13 @@ export type OutlinerPanelProps = {
   onClearParentDropTarget: (targetId: string) => void;
   onCompleteParentDrag: (event: React.PointerEvent<HTMLLIElement>, targetId: string) => void;
   onSelectActuator: (id: string, options?: { additive?: boolean; toggle?: boolean }) => void;
+  onSelectMesh: (meshId: string) => void;
 };
 
 export function OutlinerPanel({
   entries,
   selectedActuatorIds,
+  selectedMeshSourceId,
   collapsedNodeIds,
   outlinerParentDragSourceId,
   outlinerParentDropTargetId,
@@ -32,12 +36,38 @@ export function OutlinerPanel({
   onClearParentDropTarget,
   onCompleteParentDrag,
   onSelectActuator,
+  onSelectMesh,
 }: OutlinerPanelProps) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const headerRef = useRef<HTMLElement>(null);
+  const [scrollHeight, setScrollHeight] = useState<number | null>(null);
+
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    const header = headerRef.current;
+    if (!wrap || !header) return;
+    const measure = () => {
+      const wrapRect = wrap.getBoundingClientRect();
+      const headerRect = header.getBoundingClientRect();
+      const available = Math.max(0, wrapRect.height - headerRect.height);
+      setScrollHeight(available);
+    };
+    const ro = new ResizeObserver(measure);
+    ro.observe(wrap);
+    ro.observe(header);
+    measure();
+    return () => ro.disconnect();
+  }, []);
+
   return (
-    <details className="app__panel-section app__panel-section--fill" open>
-      <summary className="app__panel-section-header">Outliner</summary>
-      <div className="app__panel-section-body app__panel-section-body--fill">
-        <ul className="app__outliner">
+    <div ref={wrapRef} className="app__outliner-fill">
+      <details className="app__panel-section app__panel-section--fill" open>
+        <summary ref={headerRef} className="app__panel-section-header">Outliner</summary>
+        <div
+          className="app__panel-section-body app__panel-section-body--fill"
+          style={scrollHeight !== null ? { height: scrollHeight, minHeight: scrollHeight } : undefined}
+        >
+          <ul className="app__outliner">
           {entries.map((entry) => {
             if (entry.kind === "rig") {
               return (
@@ -57,14 +87,24 @@ export function OutlinerPanel({
             }
             if (entry.kind === "mesh") {
               const { meshSource, depth, rigId } = entry;
+              const isMeshSelected = selectedMeshSourceId === meshSource.id;
               return (
-                <li key={`mesh:${rigId}:${meshSource.id}`} className="app__outliner-item app__outliner-item--mesh">
+                <li
+                  key={`mesh:${rigId}:${meshSource.id}`}
+                  className={`app__outliner-item app__outliner-item--mesh${isMeshSelected ? " is-selected" : ""}`}
+                >
                   <span className="app__outliner-indent" style={{ width: depth * 16 + 4 }} />
                   <button type="button" className="app__outliner-toggle" disabled tabIndex={-1} aria-hidden>
                     {" "}
                   </button>
                   <span className="app__outliner-icon app__outliner-icon--mesh" />
-                  <span className="app__outliner-label app__outliner-label--readonly">{meshSource.id}</span>
+                  <button
+                    type="button"
+                    className="app__outliner-label"
+                    onClick={() => onSelectMesh(meshSource.id)}
+                  >
+                    {meshSource.id}
+                  </button>
                 </li>
               );
             }
@@ -114,8 +154,9 @@ export function OutlinerPanel({
               </li>
             );
           })}
-        </ul>
-      </div>
-    </details>
+          </ul>
+        </div>
+      </details>
+    </div>
   );
 }

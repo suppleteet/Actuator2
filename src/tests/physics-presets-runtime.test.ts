@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { getRuntimeDriveFromPreset } from "../runtime/physicsPresets";
+import { getActuatorColliderVolume } from "../runtime/physicsAuthoring";
+import { getActuatorMass, getActuatorMassFromPreset, getRuntimeDriveFromPreset } from "../runtime/physicsPresets";
 
 describe("Runtime drive tuning", () => {
   it("returns deterministic runtime drive values for identical preset inputs", () => {
@@ -23,5 +24,24 @@ describe("Runtime drive tuning", () => {
 
     expect(root.positionStiffness).toBeGreaterThan(custom.positionStiffness);
     expect(root.positionDamping).toBeGreaterThan(custom.positionDamping);
+  });
+
+  it("scales mass by collider volume so smaller segments weigh less", () => {
+    const big = { type: "custom" as const, preset: "ArmLeg" as const, shape: "capsule" as const, size: { x: 0.35, y: 0.8, z: 0.35 } };
+    const small = { type: "custom" as const, preset: "ArmLeg" as const, shape: "capsule" as const, size: { x: 0.15, y: 0.3, z: 0.15 } };
+
+    const massBig = getActuatorMass(big, getActuatorColliderVolume);
+    const massSmall = getActuatorMass(small, getActuatorColliderVolume);
+
+    expect(massSmall).toBeLessThan(massBig);
+    expect(massBig).toBeGreaterThan(0);
+    expect(massSmall).toBeGreaterThanOrEqual(0.01);
+  });
+
+  it("getActuatorMass matches preset base when volume equals reference", () => {
+    const actuator = { type: "custom" as const, preset: "Default" as const, shape: "capsule" as const, size: { x: 0.35, y: 0.8, z: 0.35 } };
+    const baseMass = getActuatorMassFromPreset(actuator);
+    const scaledMass = getActuatorMass(actuator, getActuatorColliderVolume);
+    expect(scaledMass).toBeCloseTo(baseMass, 0);
   });
 });

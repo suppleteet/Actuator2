@@ -44,12 +44,19 @@ import {
   defaultPresetForActuatorType,
 } from "./runtime/physicsPresets";
 import { resolvePublicAssetUrl } from "./runtime/assetPaths";
-import { integrateImportedMesh, normalizeMeshImport } from "./runtime/meshImport";
+import {
+  integrateImportedMesh,
+  loadMeshGeometryForInspection,
+  normalizeMeshImport,
+  suggestImportDefaults,
+} from "./runtime/meshImport";
+import { PLACEHOLDER_WHITE_TEX_URL } from "./app/components/ActiveSkinnedMesh";
 import { createRootActuator, composeMatrix } from "./app/actuatorModel";
 import { smoothDampQuat, smoothDampVec3, type SmoothDampQuatVelocity, type SmoothDampVec3Velocity } from "./app/smoothDamp";
 import {
   type ActiveMeshSource,
   type ActuatorEntity,
+  type ActuatorPhysicsOverrides,
   type ActuatorShape,
   type ActuatorPreset,
   type ActuatorTransformSnapshot,
@@ -59,6 +66,7 @@ import {
   type GizmoMode,
   type PhysicsTuning,
   type PivotMode,
+  type Quat,
   type SkinningComputationStatus,
   type SkinningStats,
   type Vec3,
@@ -86,6 +94,7 @@ import {
   DEFAULT_WORKFLOW_MODE,
   MIXED_PRESET_VALUE,
   POSE_TOOL_MODE,
+  SCENE_AUTOSAVE_STORAGE_KEY,
   SCENE_PLAYBACK_FPS,
 } from "./app/constants";
 import {
@@ -99,13 +108,9 @@ import { DesktopInertialCameraControls } from "./app/components/DesktopInertialC
 import { PlaybackDriver } from "./app/components/PlaybackDriver";
 import { SceneContent } from "./app/components/SceneContent";
 import { ViewCube } from "./app/components/ViewCube";
-import { ActionsPanel } from "./app/components/panels/ActionsPanel";
 import { AppHeader } from "./app/components/panels/AppHeader";
-import { OutlinerPanel } from "./app/components/panels/OutlinerPanel";
-import { SceneIOPanel } from "./app/components/panels/SceneIOPanel";
 import { EditorProvider } from "./app/EditorContext";
-import { StatusPanel } from "./app/components/panels/StatusPanel";
-import { ToolsPanel } from "./app/components/panels/ToolsPanel";
+import { DockLayout } from "./app/components/DockLayout";
 
 const xrStore = createXRStore({
   offerSession: false,
@@ -124,24 +129,55 @@ export default function App() {
   );
   const [importedMeshes, setImportedMeshes] = useState<ImportedMeshDocument[]>(() => [
     {
-      id: "mesh_chad",
+      id: "mesh_steve",
       format: "fbx",
-      displayName: "Chad.fbx",
-      sourceUri: resolvePublicAssetUrl("assets/chad/Chad.fbx"),
+      displayName: "Steve.fbx",
+      sourceUri: resolvePublicAssetUrl("Steve.fbx"),
       importedAtUtc: new Date().toISOString(),
+      upAxis: "Y",
+      importScale: 1,
+      positionOffset: { x: 0, y: 0, z: 0 },
+      rotationOffset: { x: 0, y: 0, z: 0 },
     },
   ]);
   const sceneMeshSources = useMemo<ActiveMeshSource[]>(
     () =>
-      importedMeshes.map((mesh) => ({
-        id: mesh.id,
-        meshUri: mesh.sourceUri,
-        colorMapUri: textureUris.colorMapUri,
-        normalMapUri: textureUris.normalMapUri,
-        roughnessMapUri: textureUris.roughnessMapUri,
-        worldScale: 0.01,
-        worldYOffset: 0.02,
-      })),
+      importedMeshes
+        .filter((mesh): mesh is ImportedMeshDocument & { format: "fbx" | "glb" } => mesh.format === "fbx" || mesh.format === "glb")
+        .map((mesh) => ({
+          id: mesh.id,
+          format: mesh.format,
+          meshUri: mesh.sourceUri,
+          colorMapUri:
+            mesh.format === "fbx"
+              ? (mesh.colorMapUri ?? textureUris.colorMapUri)
+              : (mesh.colorMapUri ?? PLACEHOLDER_WHITE_TEX_URL),
+          normalMapUri:
+            mesh.format === "fbx"
+              ? (mesh.normalMapUri ?? textureUris.normalMapUri)
+              : (mesh.normalMapUri ?? PLACEHOLDER_WHITE_TEX_URL),
+          roughnessMapUri:
+            mesh.format === "fbx"
+              ? (mesh.roughnessMapUri ?? textureUris.roughnessMapUri)
+              : (mesh.roughnessMapUri ?? PLACEHOLDER_WHITE_TEX_URL),
+          importScale: Number.isFinite(mesh.importScale) ? mesh.importScale! : 1,
+          positionOffset:
+            mesh.positionOffset &&
+            Number.isFinite(mesh.positionOffset.x) &&
+            Number.isFinite(mesh.positionOffset.y) &&
+            Number.isFinite(mesh.positionOffset.z)
+              ? mesh.positionOffset
+              : { x: 0, y: 0, z: 0 },
+          rotationOffset:
+            mesh.rotationOffset &&
+            Number.isFinite(mesh.rotationOffset.x) &&
+            Number.isFinite(mesh.rotationOffset.y) &&
+            Number.isFinite(mesh.rotationOffset.z)
+              ? mesh.rotationOffset
+              : { x: 0, y: 0, z: 0 },
+          upAxis: mesh.upAxis === "Z" ? "Z" : "Y",
+          flipNormals: mesh.flipNormals === true,
+        })),
     [importedMeshes, textureUris.colorMapUri, textureUris.normalMapUri, textureUris.roughnessMapUri],
   );
   const [sceneId, setSceneId] = useState("scene_main");
@@ -174,8 +210,9 @@ export default function App() {
     additive: boolean;
     toggle: boolean;
   } | null>(null);
-  const undoStackRef = useRef<EditorState[]>([]);
-  const redoStackRef = useRef<EditorState[]>([]);
+  type UndoSnapshot = { editorState: EditorState; importedMeshes: ImportedMeshDocument[] };
+  const undoStackRef = useRef<UndoSnapshot[]>([]);
+  const redoStackRef = useRef<UndoSnapshot[]>([]);
   const initialRigId = "rig_001";
   const initialRoot = createRootActuator(initialRigId);
   const [editorState, setEditorState] = useState<EditorState>({
@@ -203,6 +240,8 @@ export default function App() {
   const [newActuatorShape, setNewActuatorShape] = useState<ActuatorShape>("capsule");
   const [newActuatorPreset, setNewActuatorPreset] = useState<ActuatorPreset>("SpinePelvis");
   const [collapsedNodeIds, setCollapsedNodeIds] = useState<ReadonlySet<string>>(new Set());
+  const [selectedMeshSourceId, setSelectedMeshSourceId] = useState<string | null>(null);
+  const [pendingImportFiles, setPendingImportFiles] = useState<File[] | null>(null);
   const [outlinerParentDragSourceId, setOutlinerParentDragSourceId] = useState<string | null>(null);
   const [outlinerParentDropTargetId, setOutlinerParentDropTargetId] = useState<string | null>(null);
   const [deltaMushEnabled, setDeltaMushEnabled] = useState(true);
@@ -241,6 +280,21 @@ export default function App() {
   const xrHandInputsRef = useRef(xrHandInputs);
 
   const [drawDraftActuators, setDrawDraftActuators] = useState<ActuatorEntity[]>([]);
+  const [worldGravityY, setWorldGravityY] = useState(-9.81);
+  /** True once we've pushed an undo entry for the current properties tweak batch. */
+  const propertiesBatchHasPushedRef = useRef(false);
+  const propertiesBatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const PROPERTIES_UNDO_BATCH_MS = 400;
+
+  useEffect(() => {
+    return () => {
+      if (propertiesBatchTimerRef.current !== null) {
+        clearTimeout(propertiesBatchTimerRef.current);
+        propertiesBatchTimerRef.current = null;
+      }
+    };
+  }, []);
+
   const drawPointerClientRef = useRef<{ x: number; y: number } | null>(null);
   const drawPointerButtonsRef = useRef(0);
   const drawCursorAnchorPointRef = useRef<Vec3 | null>(null);
@@ -262,6 +316,12 @@ export default function App() {
   const playbackClockRef = useRef<PlaybackClock | null>(null);
   const transformStartSnapshotRef = useRef<EditorState | null>(null);
   const editorStateRef = useRef<EditorState>(editorState);
+  const sceneIdRef = useRef(sceneId);
+  const sceneCreatedAtUtcRef = useRef(sceneCreatedAtUtc);
+  const workflowModeRef = useRef(workflowMode);
+  const importedMeshesRef = useRef(importedMeshes);
+  const bakeStartFrameRef = useRef(bakeStartFrame);
+  const bakeEndFrameRef = useRef(bakeEndFrame);
   const [skinningRevision, setSkinningRevision] = useState(1);
   const [skinningBusy, setSkinningBusy] = useState(false);
   const [completedSkinningRevision, setCompletedSkinningRevision] = useState(0);
@@ -680,6 +740,84 @@ export default function App() {
   useEffect(() => {
     editorStateRef.current = editorState;
   }, [editorState]);
+
+  useEffect(() => {
+    sceneIdRef.current = sceneId;
+    sceneCreatedAtUtcRef.current = sceneCreatedAtUtc;
+    workflowModeRef.current = workflowMode;
+    importedMeshesRef.current = importedMeshes;
+    bakeStartFrameRef.current = bakeStartFrame;
+    bakeEndFrameRef.current = bakeEndFrame;
+  }, [sceneId, sceneCreatedAtUtc, workflowMode, importedMeshes, bakeStartFrame, bakeEndFrame]);
+
+  // Debug: restore drawn actuators from last session so we don't have to redraw on reload
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(SCENE_AUTOSAVE_STORAGE_KEY);
+      if (raw === null || raw === "") return;
+      const envelope = parseSceneEnvelope(raw);
+      const snapshot = sceneSnapshotFromEnvelope(envelope);
+      const nextState = cloneEditorState(snapshot.editorState);
+      editorStateRef.current = nextState;
+      setEditorState(nextState);
+      setSceneId(snapshot.sceneId);
+      setSceneCreatedAtUtc(snapshot.createdAtUtc);
+      setImportedMeshes(snapshot.importedMeshes);
+      setWorkflowMode(snapshot.workflowMode);
+      syncCreationIndicesFromState(nextState);
+      undoStackRef.current = [];
+      redoStackRef.current = [];
+      const nextRuntimeMode: AppMode = snapshot.workflowMode === "Puppeteering" ? "Pose" : "Rig";
+      requestAppMode(nextRuntimeMode);
+      const clampedTool = clampToolToWorkflow(snapshot.workflowMode, workflowToolFromGizmoMode(gizmoMode, nextRuntimeMode));
+      setGizmoMode(gizmoModeFromWorkflowTool(clampedTool));
+      setIoStatus("Restored previous session.");
+    } catch {
+      // Ignore invalid or missing autosave; use default state
+    }
+  }, []);
+
+  // Debug: persist scene to localStorage so reload restores drawn actuators
+  const AUTOSAVE_DEBOUNCE_MS = 800;
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      try {
+        const frameSpan = Math.max(
+          1,
+          Math.max(bakeStartFrameRef.current, bakeEndFrameRef.current) -
+            Math.min(bakeStartFrameRef.current, bakeEndFrameRef.current) +
+            1,
+        );
+        const snapshot: SceneSnapshot = {
+          sceneId: sceneIdRef.current,
+          createdAtUtc: sceneCreatedAtUtcRef.current,
+          workflowMode: workflowModeRef.current,
+          editorState: cloneEditorState(editorStateRef.current),
+          importedMeshes: importedMeshesRef.current.map((m) => ({ ...m })),
+          playback: {
+            fps: SCENE_PLAYBACK_FPS,
+            durationSec: frameSpan / SCENE_PLAYBACK_FPS,
+            activeClipId: null,
+          },
+          metadata: { sourceBaseline: "30c6ea7" },
+        };
+        const envelope = createSceneEnvelope(snapshot);
+        const serialized = stableSerializeSceneEnvelope(envelope);
+        localStorage.setItem(SCENE_AUTOSAVE_STORAGE_KEY, serialized);
+      } catch {
+        // Ignore (e.g. invalid snapshot or quota)
+      }
+    }, AUTOSAVE_DEBOUNCE_MS);
+    return () => window.clearTimeout(t);
+  }, [
+    editorState,
+    sceneId,
+    sceneCreatedAtUtc,
+    workflowMode,
+    importedMeshes,
+    bakeStartFrame,
+    bakeEndFrame,
+  ]);
 
   useEffect(() => {
     xrHandInputsRef.current = xrHandInputs;
@@ -1266,13 +1404,66 @@ export default function App() {
     void loadSceneFromFile(file);
   }
 
-  function importMeshFiles(files: readonly File[]) {
+  function clearScene() {
+    const root = createRootActuator(initialRigId);
+    setEditorState({
+      actuators: [root],
+      selectedRigId: initialRigId,
+      selectedActuatorId: root.id,
+      selectedActuatorIds: [root.id],
+    });
+    setImportedMeshes([]);
+    setCollapsedNodeIds(new Set());
+  }
+
+  /** Find texture files that match a mesh file by name stem; returns blob URLs for color/normal/roughness. */
+  function findTextureUrisForMeshFile(meshFileName: string, allFiles: readonly File[]): { colorMapUri?: string; normalMapUri?: string; roughnessMapUri?: string } {
+    const dot = meshFileName.lastIndexOf(".");
+    const stem = (dot <= 0 ? meshFileName : meshFileName.slice(0, dot)).toLowerCase();
+    const imageExt = new Set([".png", ".jpg", ".jpeg", ".webp"]);
+    const result: { colorMapUri?: string; normalMapUri?: string; roughnessMapUri?: string } = {};
+    const bySuffix: { color?: File; normal?: File; roughness?: File } = {};
+    for (const f of allFiles) {
+      const name = f.name.toLowerCase();
+      const ext = name.slice(name.lastIndexOf("."));
+      if (!imageExt.has(ext)) continue;
+      const fileStem = name.slice(0, name.lastIndexOf("."));
+      if (!fileStem.startsWith(stem) && !stem.startsWith(fileStem)) continue;
+      const suffix = fileStem === stem ? "" : fileStem.slice(stem.length).replace(/^[-_]/, "").replace(/[-_]/g, "_");
+      const suffixNorm = suffix.toLowerCase();
+      if (
+        /^(col|color|diffuse|albedo|base_color|basecolor)$/.test(suffixNorm) &&
+        bySuffix.color === undefined
+      ) {
+        bySuffix.color = f;
+      } else if (/^(norm|normal)$/.test(suffixNorm) && bySuffix.normal === undefined) {
+        bySuffix.normal = f;
+      } else if (
+        /^(pbr|roughness|metal|metalness)$/.test(suffixNorm) &&
+        bySuffix.roughness === undefined
+      ) {
+        bySuffix.roughness = f;
+      } else if (fileStem === stem && bySuffix.color === undefined) {
+        bySuffix.color = f;
+      }
+    }
+    if (bySuffix.color) result.colorMapUri = URL.createObjectURL(bySuffix.color);
+    if (bySuffix.normal) result.normalMapUri = URL.createObjectURL(bySuffix.normal);
+    if (bySuffix.roughness) result.roughnessMapUri = URL.createObjectURL(bySuffix.roughness);
+    return result;
+  }
+
+  async function importMeshFiles(files: readonly File[], replaceMeshes: ImportedMeshDocument[] = importedMeshes) {
     if (files.length === 0) return;
     const nextMessages: string[] = [];
-    let nextMeshes = importedMeshes.slice();
+    let nextMeshes = replaceMeshes.slice();
     const existingIds = new Set(nextMeshes.map((mesh) => mesh.id));
 
     for (const file of files) {
+      const isMesh =
+        /\.(fbx|glb|gltf)$/i.test(file.name);
+      if (!isMesh) continue;
+
       const sourceUri = URL.createObjectURL(file);
       const normalized = normalizeMeshImport(
         {
@@ -1290,11 +1481,35 @@ export default function App() {
         nextMessages.push(normalized.message);
         continue;
       }
+      const textures = findTextureUrisForMeshFile(file.name, files);
+      const meshDoc: ImportedMeshDocument = {
+        ...normalized.mesh,
+        ...(textures.colorMapUri && { colorMapUri: textures.colorMapUri }),
+        ...(textures.normalMapUri && { normalMapUri: textures.normalMapUri }),
+        ...(textures.roughnessMapUri && { roughnessMapUri: textures.roughnessMapUri }),
+      };
+      if (normalized.mesh.format === "fbx" || normalized.mesh.format === "glb") {
+        try {
+          const geometry = await loadMeshGeometryForInspection(sourceUri, normalized.mesh.format);
+          if (geometry !== null) {
+            const defaults = suggestImportDefaults(geometry);
+            meshDoc.importScale = defaults.importScale;
+            meshDoc.upAxis = defaults.upAxis;
+          }
+        } catch {
+          /* keep meshDoc defaults */
+        }
+      }
       existingIds.add(normalized.mesh.id);
-      nextMeshes = integrateImportedMesh(nextMeshes, normalized.mesh);
+      nextMeshes = integrateImportedMesh(nextMeshes, meshDoc);
       nextMessages.push(`Imported ${file.name} as ${normalized.mesh.id}.`);
     }
 
+    undoStackRef.current.push({
+      editorState: cloneEditorState(editorStateRef.current),
+      importedMeshes: cloneImportedMeshes(importedMeshesRef.current),
+    });
+    redoStackRef.current = [];
     setImportedMeshes(nextMeshes);
     if (nextMessages.length > 0) {
       setMeshImportStatus(nextMessages.join(" "));
@@ -1303,9 +1518,32 @@ export default function App() {
 
   function handleMeshFileInputChange(event: ChangeEvent<HTMLInputElement>) {
     const files = event.target.files;
-    event.target.value = "";
     if (files === null || files.length === 0) return;
-    importMeshFiles(Array.from(files));
+    const fileList = Array.from(files);
+    event.target.value = "";
+    const hasExistingScene = importedMeshes.length > 0 || editorState.actuators.length > 1;
+    if (hasExistingScene && fileList.length > 0) {
+      setPendingImportFiles(fileList);
+      return;
+    }
+    setMeshImportStatus(`Importing ${fileList.length} file(s)...`);
+    importMeshFiles(fileList);
+  }
+
+  function resolvePendingImport(clearFirst: boolean) {
+    const files = pendingImportFiles;
+    setPendingImportFiles(null);
+    if (files === null || files.length === 0) return;
+    const meshFileCount = files.filter((f) => /\.(fbx|glb|gltf)$/i.test(f.name)).length;
+    setMeshImportStatus(`Importing ${files.length} file(s)...`);
+    if (clearFirst && meshFileCount > 0) {
+      clearScene();
+      importMeshFiles(files, []);
+    } else if (clearFirst && meshFileCount === 0) {
+      setMeshImportStatus("No mesh files (.fbx, .glb, .gltf) in selection. Scene unchanged.");
+    } else {
+      importMeshFiles(files);
+    }
   }
 
   function captureBakeFromCurrentState() {
@@ -1557,6 +1795,10 @@ export default function App() {
     return () => cancelAnimationFrame(frameId);
   }, [bindBlendNonce]);
 
+  function cloneImportedMeshes(meshes: ImportedMeshDocument[]): ImportedMeshDocument[] {
+    return meshes.map((m) => ({ ...m }));
+  }
+
   function cloneEditorState(state: EditorState): EditorState {
     return {
       selectedRigId: state.selectedRigId,
@@ -1583,7 +1825,10 @@ export default function App() {
     setEditorState((previous) => {
       const next = updater(previous);
       if (next === previous) return previous;
-      undoStackRef.current.push(cloneEditorState(previous));
+      undoStackRef.current.push({
+        editorState: cloneEditorState(previous),
+        importedMeshes: cloneImportedMeshes(importedMeshesRef.current),
+      });
       redoStackRef.current = [];
       editorStateRef.current = next;
       return next;
@@ -1611,6 +1856,7 @@ export default function App() {
         : (rigConstrained[0] ?? null);
     const nextRigId = primaryRigId;
 
+    if (sortedUnique.length > 0) setSelectedMeshSourceId(null);
     commitEditorChange((previous) => {
       const samePrimary = previous.selectedActuatorId === nextPrimary;
       const sameRig = previous.selectedRigId === nextRigId;
@@ -1862,6 +2108,93 @@ export default function App() {
     });
   }
 
+  function applyPropertiesTransform(
+    ids: string[],
+    patch: Partial<{ position: Vec3; rotation: Quat; scale: Vec3; size: Vec3 }>,
+  ) {
+    if (ids.length === 0) return;
+    const idSet = new Set(ids);
+    const updater = (previous: EditorState): EditorState => {
+      const nextActuators = previous.actuators.map((actuator) => {
+        if (!idSet.has(actuator.id)) return actuator;
+        const next: ActuatorEntity = { ...actuator };
+        if (patch.position != null) {
+          next.transform = { ...next.transform, position: { ...patch.position } };
+        }
+        if (patch.rotation != null) {
+          next.transform = { ...next.transform, rotation: { ...patch.rotation } };
+        }
+        if (patch.scale != null) {
+          next.transform = { ...next.transform, scale: { ...patch.scale } };
+        }
+        if (patch.size != null) {
+          next.size = { ...patch.size };
+        }
+        return next;
+      });
+      return { ...previous, actuators: nextActuators };
+    };
+    if (propertiesBatchTimerRef.current !== null) {
+      clearTimeout(propertiesBatchTimerRef.current);
+      propertiesBatchTimerRef.current = null;
+    }
+    const shouldPushUndo = !propertiesBatchHasPushedRef.current;
+    if (shouldPushUndo) {
+      propertiesBatchHasPushedRef.current = true;
+      commitEditorChange(updater);
+    } else {
+      setEditorState((previous) => {
+        const next = updater(previous);
+        if (next === previous) return previous;
+        editorStateRef.current = next;
+        return next;
+      });
+    }
+    propertiesBatchTimerRef.current = setTimeout(() => {
+      propertiesBatchHasPushedRef.current = false;
+      propertiesBatchTimerRef.current = null;
+    }, PROPERTIES_UNDO_BATCH_MS);
+  }
+
+  function applyPropertiesPhysicsOverrides(ids: string[], overrides: ActuatorPhysicsOverrides) {
+    if (ids.length === 0) return;
+    const idSet = new Set(ids);
+    const updater = (previous: EditorState): EditorState => {
+      const nextActuators = previous.actuators.map((actuator) => {
+        if (!idSet.has(actuator.id)) return actuator;
+        const merged: ActuatorPhysicsOverrides = {
+          ...actuator.physicsOverrides,
+          ...overrides,
+        };
+        return {
+          ...actuator,
+          physicsOverrides: Object.keys(merged).length > 0 ? merged : undefined,
+        };
+      });
+      return { ...previous, actuators: nextActuators };
+    };
+    if (propertiesBatchTimerRef.current !== null) {
+      clearTimeout(propertiesBatchTimerRef.current);
+      propertiesBatchTimerRef.current = null;
+    }
+    const shouldPushUndo = !propertiesBatchHasPushedRef.current;
+    if (shouldPushUndo) {
+      propertiesBatchHasPushedRef.current = true;
+      commitEditorChange(updater);
+    } else {
+      setEditorState((previous) => {
+        const next = updater(previous);
+        if (next === previous) return previous;
+        editorStateRef.current = next;
+        return next;
+      });
+    }
+    propertiesBatchTimerRef.current = setTimeout(() => {
+      propertiesBatchHasPushedRef.current = false;
+      propertiesBatchTimerRef.current = null;
+    }, PROPERTIES_UNDO_BATCH_MS);
+  }
+
   function commitDrawDraftActuators(rigId: string, draftActuators: ActuatorEntity[]) {
     commitEditorChange((previous) => {
       const createdIds: string[] = [];
@@ -1987,6 +2320,26 @@ export default function App() {
     setSelection([id], id);
   }
 
+  function selectMeshSource(meshId: string) {
+    setSelectedMeshSourceId(meshId);
+    setSelection([], null);
+  }
+
+  function onMeshImportSettingsChange(
+    meshId: string,
+    patch: Partial<{
+      upAxis: ImportedMeshDocument["upAxis"];
+      importScale: number;
+      positionOffset: Vec3;
+      rotationOffset: Vec3;
+      flipNormals: boolean;
+    }>,
+  ) {
+    setImportedMeshes((prev) =>
+      prev.map((m) => (m.id !== meshId ? m : { ...m, ...patch })),
+    );
+  }
+
   function canReparentSourcesToTarget(sourceIds: string[], targetParentId: string): boolean {
     if (!workflowAllowsRigAuthoring || physicsEnabled || appMode !== "Rig") return false;
     const byId = new Map(actuators.map((actuator) => [actuator.id, actuator]));
@@ -2066,6 +2419,7 @@ export default function App() {
   }
 
   function clearSelection() {
+    setSelectedMeshSourceId(null);
     setSelection([], null);
   }
 
@@ -2136,21 +2490,37 @@ export default function App() {
       requestAppMode("Rig");
       return;
     }
-    setEditorState((previous) => {
-      const snapshot = undoStackRef.current.pop();
-      if (snapshot === undefined) return previous;
-      redoStackRef.current.push(cloneEditorState(previous));
-      return snapshot;
+    const snapshot = undoStackRef.current.pop();
+    if (snapshot === undefined) return;
+    redoStackRef.current.push({
+      editorState: cloneEditorState(editorState),
+      importedMeshes: cloneImportedMeshes(importedMeshes),
     });
+    setEditorState(snapshot.editorState);
+    setImportedMeshes(snapshot.importedMeshes);
+    if (
+      selectedMeshSourceId !== null &&
+      !snapshot.importedMeshes.some((m) => m.id === selectedMeshSourceId)
+    ) {
+      setSelectedMeshSourceId(null);
+    }
   }
 
   function redo() {
-    setEditorState((previous) => {
-      const snapshot = redoStackRef.current.pop();
-      if (snapshot === undefined) return previous;
-      undoStackRef.current.push(cloneEditorState(previous));
-      return snapshot;
+    const snapshot = redoStackRef.current.pop();
+    if (snapshot === undefined) return;
+    undoStackRef.current.push({
+      editorState: cloneEditorState(editorState),
+      importedMeshes: cloneImportedMeshes(importedMeshes),
     });
+    setEditorState(snapshot.editorState);
+    setImportedMeshes(snapshot.importedMeshes);
+    if (
+      selectedMeshSourceId !== null &&
+      !snapshot.importedMeshes.some((m) => m.id === selectedMeshSourceId)
+    ) {
+      setSelectedMeshSourceId(null);
+    }
   }
 
   function applyTransformChange(
@@ -2343,7 +2713,10 @@ export default function App() {
     setEditorState((current) => {
       const changed = JSON.stringify(startSnapshot.actuators) !== JSON.stringify(current.actuators);
       if (!changed) return current;
-      undoStackRef.current.push(startSnapshot);
+      undoStackRef.current.push({
+        editorState: startSnapshot,
+        importedMeshes: cloneImportedMeshes(importedMeshesRef.current),
+      });
       redoStackRef.current = [];
       return current;
     });
@@ -2389,8 +2762,6 @@ export default function App() {
     }
 
     function onKeyDown(event: KeyboardEvent) {
-      if (isTypingTarget(event.target)) return;
-
       const key = event.key.toLowerCase();
       const isPrimaryModifier = event.ctrlKey || event.metaKey;
       if (isPrimaryModifier) {
@@ -2410,6 +2781,9 @@ export default function App() {
           return;
         }
       }
+
+      if (isTypingTarget(event.target)) return;
+
 
       if (event.code === "Space") {
         event.preventDefault();
@@ -2505,6 +2879,7 @@ export default function App() {
 
   function onCanvasPointerMissed() {
     if (gizmoMode === "draw") return;
+    if (appMode === "Pose") return; // keep selection when releasing grab
     if (Date.now() < suppressClearSelectionUntilRef.current) return;
     if (marqueeDragRef.current !== null) return;
     if (isTransformDragging) return;
@@ -2901,7 +3276,7 @@ export default function App() {
       maxDistance: Math.max(0.18, drawRadius * 1.25),
     });
     if (target === null) {
-      if (!toggle) {
+      if (!toggle && appMode !== "Pose") {
         clearSelection();
       }
       return false;
@@ -3129,118 +3504,110 @@ export default function App() {
     [editorState, workflowMode, selectedActuatorIds],
   );
 
-  return (
-    <EditorProvider value={editorContextValue}>
-    <main className="app">
-      <AppHeader
-        workflowMode={workflowMode}
-        appMode={appMode}
-        physicsEnabled={physicsEnabled}
-        workflowTool={workflowTool}
-        skinningBusy={skinningBusy}
-        completedSkinningRevision={completedSkinningRevision}
-        xrMode={xrMode}
-        vrSupported={vrSupported}
-        xrBusy={xrBusy}
-        onRequestWorkflowMode={requestWorkflowMode}
-        onEnterVr={requestEnterVr}
-        onExitVr={requestExitVr}
-      />
-      <section className="app__viewport">
-        <aside className="app__panel">
-          <ActionsPanel
-            workflowAllowsRigAuthoring={workflowAllowsRigAuthoring}
-            physicsEnabled={physicsEnabled}
-            appMode={appMode}
-            actuators={actuators}
-            selectedActuatorIds={selectedActuatorIds}
-            undoStackLength={undoStackRef.current.length}
-            redoStackLength={redoStackRef.current.length}
-            ioStatus={ioStatus}
-            meshImportStatus={meshImportStatus}
-            sceneLoadInputRef={sceneLoadInputRef}
-            meshImportInputRef={meshImportInputRef}
-            onCreateRig={createRig}
-            onCreateActuator={createActuator}
-            onDeleteSelected={deleteSelectedActuator}
-            onUndo={undo}
-            onRedo={redo}
-            onSaveScene={saveSceneToFile}
-            onRequestLoadScene={() => sceneLoadInputRef.current?.click()}
-            onRequestImportMesh={() => meshImportInputRef.current?.click()}
-            onSceneFileChange={handleSceneFileInputChange}
-            onMeshFileChange={handleMeshFileInputChange}
-          />
-
-          <ToolsPanel
-            appMode={appMode}
-            workflowMode={workflowMode}
-            workflowAllowsRigAuthoring={workflowAllowsRigAuthoring}
-            workflowAllowsDraw={workflowAllowsDraw}
-            gizmoMode={gizmoMode}
-            gizmoSpace={gizmoSpace}
-            pivotMode={pivotMode}
-            newActuatorShape={newActuatorShape}
-            presetSelectValue={presetSelectValue}
-            drawRadius={drawRadius}
-            drawMirrorEnabled={drawMirrorEnabled}
-            drawSnapEnabled={drawSnapEnabled}
-            deltaMushEnabled={deltaMushEnabled}
-            deltaMushSettings={deltaMushSettings}
-            onSetGizmoMode={setGizmoMode}
-            onSetGizmoSpace={setGizmoSpace}
-            onSetPivotMode={setPivotMode}
-            onSetNewActuatorShape={setNewActuatorShape}
-            onPresetChange={(preset) => {
-              setNewActuatorPreset(preset);
-              applyPresetToSelection(preset);
-            }}
-            onSetDrawRadius={setDrawRadius}
-            onSetDrawMirrorEnabled={setDrawMirrorEnabled}
-            onSetDrawSnapEnabled={setDrawSnapEnabled}
-            onSetDeltaMushEnabled={setDeltaMushEnabled}
-            onSetDeltaMushSettings={setDeltaMushSettings}
-          />
-          <SceneIOPanel
-            workflowMode={workflowMode}
-            workflowAllowsAnimationLane={workflowAllowsAnimationLane}
-            bakeStartFrame={bakeStartFrame}
-            bakeEndFrame={bakeEndFrame}
-            exportFormat={exportFormat}
-            exportCapabilities={exportCapabilities}
-            lastBakeCache={lastBakeCache}
-            exportStatus={exportStatus}
-            onBakeStartFrameChange={setBakeStartFrame}
-            onBakeEndFrameChange={setBakeEndFrame}
-            onCaptureBake={captureBakeFromCurrentState}
-            onExportFormatChange={setExportFormat}
-            onExportBake={exportCapturedBake}
-          />
-          <OutlinerPanel
-            entries={outlinerEntries}
-            selectedActuatorIds={selectedActuatorIds}
-            collapsedNodeIds={collapsedNodeIds}
-            outlinerParentDragSourceId={outlinerParentDragSourceId}
-            outlinerParentDropTargetId={outlinerParentDropTargetId}
-            onToggleNode={toggleOutlinerNode}
-            onBeginParentDrag={beginOutlinerParentDrag}
-            onUpdateParentDropTarget={updateOutlinerParentDropTarget}
-            onClearParentDropTarget={(targetId) => {
-              if (outlinerParentDropTargetId === targetId) setOutlinerParentDropTargetId(null);
-            }}
-            onCompleteParentDrag={completeOutlinerParentDrag}
-            onSelectActuator={selectActuator}
-          />
-          <StatusPanel
-            sceneId={sceneId}
-            workflowMode={workflowMode}
-            selectedRigId={selectedRigId}
-            selectedActuatorId={selectedActuatorId}
-            selectedActuatorIds={selectedActuatorIds}
-            skinningStats={skinningStats}
-            lastBakeCache={lastBakeCache}
-          />
-        </aside>
+  const panelContextValue = useMemo(
+    () => ({
+      actions: {
+        workflowAllowsRigAuthoring,
+        physicsEnabled,
+        appMode,
+        actuators,
+        selectedActuatorIds,
+        undoStackLength: undoStackRef.current.length,
+        redoStackLength: redoStackRef.current.length,
+        ioStatus,
+        meshImportStatus,
+        sceneLoadInputRef,
+        onCreateRig: createRig,
+        onCreateActuator: createActuator,
+        onDeleteSelected: deleteSelectedActuator,
+        onUndo: undo,
+        onRedo: redo,
+        onSaveScene: saveSceneToFile,
+        onRequestLoadScene: () => sceneLoadInputRef.current?.click(),
+        onSceneFileChange: handleSceneFileInputChange,
+      },
+      tools: {
+        appMode,
+        workflowMode,
+        workflowAllowsRigAuthoring,
+        workflowAllowsDraw,
+        gizmoMode,
+        gizmoSpace,
+        pivotMode,
+        newActuatorShape,
+        presetSelectValue,
+        drawRadius,
+        drawMirrorEnabled,
+        drawSnapEnabled,
+        deltaMushEnabled,
+        deltaMushSettings,
+        onSetGizmoMode: setGizmoMode,
+        onSetGizmoSpace: setGizmoSpace,
+        onSetPivotMode: setPivotMode,
+        onSetNewActuatorShape: setNewActuatorShape,
+        onPresetChange: (preset: ActuatorPreset) => {
+          setNewActuatorPreset(preset);
+          applyPresetToSelection(preset);
+        },
+        onSetDrawRadius: setDrawRadius,
+        onSetDrawMirrorEnabled: setDrawMirrorEnabled,
+        onSetDrawSnapEnabled: setDrawSnapEnabled,
+        onSetDeltaMushEnabled: setDeltaMushEnabled,
+        onSetDeltaMushSettings: setDeltaMushSettings,
+      },
+      sceneIO: {
+        workflowMode,
+        workflowAllowsAnimationLane,
+        bakeStartFrame,
+        bakeEndFrame,
+        exportFormat,
+        exportCapabilities,
+        lastBakeCache,
+        exportStatus,
+        onBakeStartFrameChange: setBakeStartFrame,
+        onBakeEndFrameChange: setBakeEndFrame,
+        onCaptureBake: captureBakeFromCurrentState,
+        onExportFormatChange: setExportFormat,
+        onExportBake: exportCapturedBake,
+      },
+      outliner: {
+        entries: outlinerEntries,
+        selectedActuatorIds,
+        selectedMeshSourceId,
+        collapsedNodeIds,
+        outlinerParentDragSourceId,
+        outlinerParentDropTargetId,
+        onToggleNode: toggleOutlinerNode,
+        onBeginParentDrag: beginOutlinerParentDrag,
+        onUpdateParentDropTarget: updateOutlinerParentDropTarget,
+        onClearParentDropTarget: (targetId: string) => {
+          if (outlinerParentDropTargetId === targetId) setOutlinerParentDropTargetId(null);
+        },
+        onCompleteParentDrag: completeOutlinerParentDrag,
+        onSelectActuator: selectActuator,
+        onSelectMesh: selectMeshSource,
+      },
+      status: {
+        sceneId,
+        workflowMode,
+        selectedRigId,
+        selectedActuatorId,
+        selectedActuatorIds,
+        skinningStats,
+        lastBakeCache,
+      },
+      properties: {
+        actuators,
+        selectedActuatorIds,
+        selectedMeshSourceId,
+        importedMeshes,
+        worldGravityY,
+        onWorldGravityYChange: setWorldGravityY,
+        onTransformChange: applyPropertiesTransform,
+        onPhysicsOverridesChange: applyPropertiesPhysicsOverrides,
+        onMeshImportSettingsChange,
+      },
+      sceneContent: (
         <div
           ref={canvasWrapRef}
           className="app__canvas-wrap"
@@ -3294,6 +3661,7 @@ export default function App() {
                 deltaMushEnabled={deltaMushEnabled}
                 deltaMushSettings={deltaMushSettings}
                 physicsTuning={physicsTuning}
+                worldGravityY={worldGravityY}
                 onSkinningStats={onSkinningStats}
                 onSkinningComputationStatus={onSkinningComputationStatus}
                 gizmoMode={gizmoMode}
@@ -3308,6 +3676,11 @@ export default function App() {
                 onTransformEnd={endTransformChange}
                 onPosePullDraggingChange={setIsPosePullDragging}
                 onDrawSurfaceRef={setDrawSurfaceRef}
+                onUpAxisDetected={(meshId) => {
+                  setImportedMeshes((prev) =>
+                    prev.map((m) => (m.id === meshId ? { ...m, upAxis: "Z" as const } : m)),
+                  );
+                }}
                 drawHoverActuatorId={drawHoverActuatorId}
                 xrActiveToolsByHand={xrToolState.toolsByHand}
                 xrAltModeByHand={xrToolState.altModeByHand}
@@ -3342,6 +3715,109 @@ export default function App() {
             />
           ) : null}
         </div>
+      ),
+    }),
+    [
+      actuators,
+      appMode,
+      bakeStartFrame,
+      bakeEndFrame,
+      collapsedNodeIds,
+      deltaMushEnabled,
+      deltaMushSettings,
+      drawCursor,
+      drawCursorHasInRangeAnchor,
+      drawCursorRadiusPx,
+      drawMirrorEnabled,
+      drawSnapEnabled,
+      drawRadius,
+      exportCapabilities,
+      exportFormat,
+      focusNonce,
+      focusRequest,
+      gizmoMode,
+      gizmoSpace,
+      importedMeshes,
+      ioStatus,
+      isTransformDragging,
+      lastBakeCache,
+      marqueeRect,
+      meshImportStatus,
+      newActuatorShape,
+      outlinerEntries,
+      outlinerParentDropTargetId,
+      outlinerParentDragSourceId,
+      pendingPoseRevision,
+      physicsEnabled,
+      physicsTuning,
+      pivotMode,
+      poseTargetActuators,
+      presetSelectValue,
+      sceneActuators,
+      sceneMeshSources,
+      selectedActuatorId,
+      selectedActuatorIds,
+      selectedMeshSourceId,
+      skinningRevision,
+      skinningStats,
+      viewDirectionNonce,
+      viewDirectionRequest,
+      viewProjection,
+      workflowAllowsAnimationLane,
+      workflowAllowsDraw,
+      workflowMode,
+      workflowAllowsRigAuthoring,
+      workflowAllowsDraw,
+      worldGravityY,
+      xrToolState.altModeByHand,
+      xrToolState.toolsByHand,
+    ],
+  );
+
+  return (
+    <EditorProvider value={editorContextValue}>
+    <input
+      id="app-mesh-import-input"
+      ref={meshImportInputRef}
+      type="file"
+      accept=".fbx,.glb,.gltf,.obj,.png,.jpg,.jpeg,.webp,model/gltf-binary,model/gltf+json,image/png,image/jpeg,image/webp"
+      multiple
+      style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
+      onChange={handleMeshFileInputChange}
+    />
+    {pendingImportFiles !== null ? (
+      <div className="app__modal-overlay" role="dialog" aria-modal="true" aria-labelledby="app-clear-scene-title">
+        <div className="app__modal">
+          <h2 id="app-clear-scene-title" className="app__modal-title">Clear the scene?</h2>
+          <p className="app__modal-text">
+            Yes = Clear current scene and rig, then import the selected file(s).
+            <br />
+            No = Add the file(s) to the current scene.
+          </p>
+          <div className="app__modal-actions">
+            <button type="button" className="app__modal-btn app__modal-btn--primary" onClick={() => resolvePendingImport(true)}>Yes</button>
+            <button type="button" className="app__modal-btn" onClick={() => resolvePendingImport(false)}>No</button>
+          </div>
+        </div>
+      </div>
+    ) : null}
+    <main className="app">
+      <AppHeader
+        workflowMode={workflowMode}
+        appMode={appMode}
+        physicsEnabled={physicsEnabled}
+        workflowTool={workflowTool}
+        skinningBusy={skinningBusy}
+        completedSkinningRevision={completedSkinningRevision}
+        xrMode={xrMode}
+        vrSupported={vrSupported}
+        xrBusy={xrBusy}
+        onRequestWorkflowMode={requestWorkflowMode}
+        onEnterVr={requestEnterVr}
+        onExitVr={requestExitVr}
+      />
+      <section className="app__viewport app__viewport--dock">
+        <DockLayout panelContextValue={panelContextValue} />
       </section>
     </main>
     </EditorProvider>
