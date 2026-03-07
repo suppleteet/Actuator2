@@ -708,7 +708,7 @@ function ActiveSkinnedMeshFBX({
               .clone()
               .multiply(bindCapsuleRotation.invert())
               .normalize();
-            if (rootRotationDelta.dot(capsuleRotationDelta) < 0) capsuleRotationDelta.negate();
+            if (rootRotationDelta.dot(capsuleRotationDelta) < 0) capsuleRotationDelta.set(-capsuleRotationDelta.x, -capsuleRotationDelta.y, -capsuleRotationDelta.z, -capsuleRotationDelta.w);
             scratchQuat.slerpQuaternions(rootRotationDelta, capsuleRotationDelta, binding.weight);
             effectiveRotation = scratchQuat;
           }
@@ -1285,7 +1285,7 @@ function ActiveSkinnedMeshGLB({
               .clone()
               .multiply(bindCapsuleRotation.invert())
               .normalize();
-            if (rootRotationDelta.dot(capsuleRotationDelta) < 0) capsuleRotationDelta.negate();
+            if (rootRotationDelta.dot(capsuleRotationDelta) < 0) capsuleRotationDelta.set(-capsuleRotationDelta.x, -capsuleRotationDelta.y, -capsuleRotationDelta.z, -capsuleRotationDelta.w);
             scratchQuat.slerpQuaternions(rootRotationDelta, capsuleRotationDelta, binding.weight);
             effectiveRotation = scratchQuat;
           }

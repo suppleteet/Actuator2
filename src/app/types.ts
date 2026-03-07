@@ -87,6 +87,16 @@ export type PhysicsTuning = {
   pullStiffness: number;
   pullDamping: number;
   pullMaxForce: number;
+  /** Scale applied to root mover spring stiffness (softer when < 1). */
+  rootMoverStiffnessScale: number;
+  /** Scale applied to root mover damping (tune with stiffness for critical damping). */
+  rootMoverDampingScale: number;
+  /** Scale applied to all actuator masses (heavier when > 1). */
+  massScale: number;
+  /** Contact ERP tuning: lower = softer contact, less jitter (react-three-rapier contactNaturalFrequency). */
+  contactNaturalFrequency: number;
+  /** Penetration tolerance in meters; slightly higher can reduce contact chatter. */
+  allowedLinearError: number;
 };
 
 export type SkinningComputationStatus = {

@@ -2,6 +2,7 @@ import { createRef, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, 
 import { useFrame, useThree } from "@react-three/fiber";
 import { TransformControls } from "@react-three/drei";
 import {
+  CoefficientCombineRule,
   useAfterPhysicsStep,
   BallCollider,
   CapsuleCollider,
@@ -26,6 +27,7 @@ import {
   getCapsuleHalfAxis,
   worldPointToActuatorLocal,
 } from "../../runtime/physicsAuthoring";
+import { DEFAULT_PHYSICS_TUNING, PHYSICS_COLLISION } from "../constants";
 import {
   defaultPresetForActuatorType,
   getActuatorMass,
@@ -369,6 +371,10 @@ function PosePhysicsBridge({
         body.setAngvel({ x: 0, y: 0, z: 0 }, true);
         continue;
       }
+      // Lock rotation while grabbed: zero angular velocity so the body doesn't spin.
+      if (actuator.id === grabbedActuatorId) {
+        body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+      }
       const drive = getRuntimeDriveFromPreset(actuator);
       const positionSpring = {
         // Pose recovery should always provide some positional return force,
@@ -390,11 +396,13 @@ function PosePhysicsBridge({
       if (actuator.parentId === null) {
         hasRoot = true;
         const rootMass = Math.max(1, body.mass());
-        const moverStiffness = Math.max(280, Math.min(18000, positionSpring.stiffness * 32));
+        const stiffnessScale = Math.max(0.1, physicsTuning.rootMoverStiffnessScale ?? 1);
+        const dampingScale = Math.max(0.1, physicsTuning.rootMoverDampingScale ?? 1);
+        const moverStiffness = Math.max(140, Math.min(9000, positionSpring.stiffness * 16 * stiffnessScale));
         const criticalDamping = 2 * Math.sqrt(rootMass * moverStiffness);
         const moverDamping = Math.max(
-          60,
-          Math.min(3200, Math.max(positionSpring.damping * 10, criticalDamping * 0.92)),
+          40,
+          Math.min(3200, Math.max(positionSpring.damping * 8, criticalDamping * 0.92) * dampingScale),
         );
         const moverTarget = actuator.id === grabbedActuatorId ? sampledPosition : target.position;
         ensureRootMoverBridge(actuator.id, body, moverTarget, moverStiffness, moverDamping);
@@ -1200,6 +1208,8 @@ export function SceneContent({
         interpolate
         numSolverIterations={Math.max(1, Math.round(physicsTuning.solverIterations))}
         numInternalPgsIterations={Math.max(1, Math.round(physicsTuning.internalPgsIterations))}
+        contactNaturalFrequency={Math.max(1, physicsTuning.contactNaturalFrequency ?? DEFAULT_PHYSICS_TUNING.contactNaturalFrequency)}
+        allowedLinearError={physicsTuning.allowedLinearError ?? DEFAULT_PHYSICS_TUNING.allowedLinearError}
         paused={!physicsEnabled}
       >
         <RapierAccessBridge
@@ -1293,7 +1303,7 @@ export function SceneContent({
               }
               gravityScale={physicsEnabled && isRoot ? 0 : 1}
               enabledRotations={[true, true, true]}
-              mass={poseRootMass}
+              mass={poseRootMass * Math.max(0.1, physicsTuning.massScale ?? 1)}
               position={displayPositionArr}
               quaternion={displayQuat}
             >
@@ -1477,12 +1487,31 @@ export function SceneContent({
                   metalness={0.03}
                 />
               </mesh>
-              {actuator.shape === "capsule" ? <CapsuleCollider ref={colliderRefById[actuator.id]} args={[capsuleHalfAxis, radius]} /> : null}
-              {actuator.shape === "sphere" ? <BallCollider ref={colliderRefById[actuator.id]} args={[radius]} /> : null}
+              {actuator.shape === "capsule" ? (
+                <CapsuleCollider
+                  ref={colliderRefById[actuator.id]}
+                  args={[capsuleHalfAxis, radius]}
+                  restitution={PHYSICS_COLLISION.restitution}
+                  friction={PHYSICS_COLLISION.friction}
+                  restitutionCombineRule={CoefficientCombineRule.Min}
+                />
+              ) : null}
+              {actuator.shape === "sphere" ? (
+                <BallCollider
+                  ref={colliderRefById[actuator.id]}
+                  args={[radius]}
+                  restitution={PHYSICS_COLLISION.restitution}
+                  friction={PHYSICS_COLLISION.friction}
+                  restitutionCombineRule={CoefficientCombineRule.Min}
+                />
+              ) : null}
               {actuator.shape === "box" ? (
                 <CuboidCollider
                   ref={colliderRefById[actuator.id]}
                   args={[actuator.size.x * 0.5, actuator.size.y * 0.5, actuator.size.z * 0.5]}
+                  restitution={PHYSICS_COLLISION.restitution}
+                  friction={PHYSICS_COLLISION.friction}
+                  restitutionCombineRule={CoefficientCombineRule.Min}
                 />
               ) : null}
             </RigidBody>
@@ -1582,7 +1611,14 @@ export function SceneContent({
           />
         ) : null}
 
-        <RigidBody type="fixed" colliders="cuboid">
+        <RigidBody type="fixed" colliders={false}>
+          <CuboidCollider
+            args={[100, 0.1, 100]}
+            position={[0, -0.1, 0]}
+            restitution={PHYSICS_COLLISION.restitution}
+            friction={PHYSICS_COLLISION.floorFriction}
+            restitutionCombineRule={CoefficientCombineRule.Min}
+          />
           <mesh
             position={[0, -0.1, 0]}
             receiveShadow

@@ -6,6 +6,16 @@ import type {
 } from "./types";
 import type { WorkflowMode } from "../runtime/workflow";
 
+/** Physics constants for collision and contact (used by SceneContent). */
+export const PHYSICS_COLLISION = {
+  /** Actuator/floor restitution: 0 = no bounce, soft contact. */
+  restitution: 0,
+  /** Actuator friction (tangential resistance). */
+  friction: 0.5,
+  /** Floor friction for grip. */
+  floorFriction: 0.8,
+} as const;
+
 export const DEFAULT_PHYSICS_TUNING: PhysicsTuning = {
   solverIterations: 10,
   internalPgsIterations: 3,
@@ -18,6 +28,11 @@ export const DEFAULT_PHYSICS_TUNING: PhysicsTuning = {
   pullStiffness: 240,
   pullDamping: 42,
   pullMaxForce: 4200,
+  rootMoverStiffnessScale: 0.5,
+  rootMoverDampingScale: 1,
+  massScale: 1,
+  contactNaturalFrequency: 18,
+  allowedLinearError: 0.0012,
 };
 
 export const DEFAULT_DELTA_MUSH_SETTINGS: DeltaMushSettings = {

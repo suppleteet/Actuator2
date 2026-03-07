@@ -142,3 +142,15 @@ Recommendation: Start with **option 1** (zero angvel while grabbed). If we want 
 - **Collision correctness:** Set restitution/friction on all colliders and verify contact filtering and groups so actuator–actuator and actuator–floor contacts work as expected.
 
 Implementing in the order above (collision → root spring → grab lock → tuning/mass) keeps each step testable and minimizes regressions.
+
+---
+
+## 6. Implementation status (feat/physics-overhaul)
+
+- **Phase 1:** Done. `PHYSICS_COLLISION` in `src/app/constants.ts`; actuator colliders and floor use `restitution`, `friction`, `restitutionCombineRule={CoefficientCombineRule.Min}`. `<Physics>` uses `contactNaturalFrequency` and `allowedLinearError` from tuning (defaults 18 and 0.0012).
+- **Phase 2:** Done. Root mover uses `rootMoverStiffnessScale` (default 0.5) and `rootMoverDampingScale` (default 1); stiffness formula uses `* 16` and max 9000; damping uses `* 8` and scaling.
+- **Phase 3:** Done. In `useBeforePhysicsStep`, when `actuator.id === grabbedActuatorId`, `body.setAngvel({ x: 0, y: 0, z: 0 }, true)` so the grabbed body does not spin.
+- **Phase 4:** Done. `PhysicsTuning` has `rootMoverStiffnessScale`, `rootMoverDampingScale`, `massScale`, `contactNaturalFrequency`, `allowedLinearError`. RigidBody `mass` multiplied by `physicsTuning.massScale`.
+- **Phase 5:** Done. Constants in `constants.ts`; build and tests pass.
+
+**Optional follow-up:** Expose the new tuning fields in the UI (e.g. a physics debug panel or settings) so users can adjust without code changes.
