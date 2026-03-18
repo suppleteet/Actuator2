@@ -93,6 +93,10 @@ export type PhysicsTuning = {
   rootMoverDampingScale: number;
   /** Scale applied to all actuator masses (heavier when > 1). */
   massScale: number;
+  /** Scale for pose recovery drive (rotation/position spring back to target). */
+  driveStiffnessScale: number;
+  /** Multiplier applied to preset-derived drive stiffness/damping so sliders have more range. */
+  driveDefaultMultiplier: number;
   /** Contact ERP tuning: lower = softer contact, less jitter (react-three-rapier contactNaturalFrequency). */
   contactNaturalFrequency: number;
   /** Penetration tolerance in meters; slightly higher can reduce contact chatter. */

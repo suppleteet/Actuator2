@@ -227,8 +227,13 @@ function SimulationOverlapFilter({ physicsEnabled, actuators, colliderRefs }: Si
 
   useFilterContactPair((collider1, collider2) => {
     if (!physicsEnabled) return null;
-    if (pendingBootstrapRef.current) return rapier.SolverFlags.EMPTY;
-    return disabledPairKeysRef.current.has(makeColliderPairKey(collider1, collider2)) ? rapier.SolverFlags.EMPTY : null;
+    if (pendingBootstrapRef.current) return null;
+    const handle1 = typeof collider1 === "number" ? collider1 : (collider1 as RapierCollider)?.handle;
+    const handle2 = typeof collider2 === "number" ? collider2 : (collider2 as RapierCollider)?.handle;
+    if (handle1 == null || handle2 == null) return null;
+    const key = makeColliderPairKey(handle1, handle2);
+    if (disabledPairKeysRef.current.has(key)) return rapier.SolverFlags.EMPTY;
+    return rapier.SolverFlags.COMPUTE_IMPULSE;
   });
 
   return null;
@@ -376,16 +381,19 @@ function PosePhysicsBridge({
         body.setAngvel({ x: 0, y: 0, z: 0 }, true);
       }
       const drive = getRuntimeDriveFromPreset(actuator);
+      const defaultMult = Math.max(0.2, physicsTuning.driveDefaultMultiplier ?? 1);
+      const driveScale = Math.max(0.2, physicsTuning.driveStiffnessScale ?? 1);
       const positionSpring = {
-        // Pose recovery should always provide some positional return force,
-        // even for presets with zero authored position spring.
-        stiffness: Math.max(8, drive.positionStiffness),
-        damping: Math.max(1.2, drive.positionDamping),
-        maxLinearSpeed: Math.max(1, drive.positionStiffness * 0.04),
+        stiffness: Math.max(8, drive.positionStiffness * defaultMult * driveScale),
+        damping: Math.max(1.2, drive.positionDamping * defaultMult),
+        maxLinearSpeed: Math.max(1, drive.positionStiffness * defaultMult * 0.04 * driveScale),
         deadband: 0.0012,
       };
       const rotationSpring = {
-        stiffness: Math.max(0.01, drive.rotationStiffness * Math.max(0, physicsTuning.rotationStiffness)),
+        stiffness: Math.max(
+          0.01,
+          drive.rotationStiffness * Math.max(0, physicsTuning.rotationStiffness) * defaultMult * driveScale,
+        ),
         velocityBlend: Math.max(
           0.08,
           Math.min(1, drive.rotationVelocityBlend * Math.max(0, physicsTuning.rotationVelocityBlend)),
@@ -398,11 +406,11 @@ function PosePhysicsBridge({
         const rootMass = Math.max(1, body.mass());
         const stiffnessScale = Math.max(0.1, physicsTuning.rootMoverStiffnessScale ?? 1);
         const dampingScale = Math.max(0.1, physicsTuning.rootMoverDampingScale ?? 1);
-        const moverStiffness = Math.max(140, Math.min(9000, positionSpring.stiffness * 16 * stiffnessScale));
+        const moverStiffness = Math.max(60, Math.min(5000, positionSpring.stiffness * 6 * stiffnessScale));
         const criticalDamping = 2 * Math.sqrt(rootMass * moverStiffness);
         const moverDamping = Math.max(
-          40,
-          Math.min(3200, Math.max(positionSpring.damping * 8, criticalDamping * 0.92) * dampingScale),
+          25,
+          Math.min(2000, Math.max(positionSpring.damping * 4, criticalDamping * 0.9) * dampingScale),
         );
         const moverTarget = actuator.id === grabbedActuatorId ? sampledPosition : target.position;
         ensureRootMoverBridge(actuator.id, body, moverTarget, moverStiffness, moverDamping);
@@ -1618,6 +1626,7 @@ export function SceneContent({
             restitution={PHYSICS_COLLISION.restitution}
             friction={PHYSICS_COLLISION.floorFriction}
             restitutionCombineRule={CoefficientCombineRule.Min}
+            frictionCombineRule={CoefficientCombineRule.Max}
           />
           <mesh
             position={[0, -0.1, 0]}

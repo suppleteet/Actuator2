@@ -12,27 +12,29 @@ export const PHYSICS_COLLISION = {
   restitution: 0,
   /** Actuator friction (tangential resistance). */
   friction: 0.5,
-  /** Floor friction for grip. */
-  floorFriction: 0.8,
+  /** Floor friction for grip so feet don't slide. */
+  floorFriction: 1.6,
 } as const;
 
 export const DEFAULT_PHYSICS_TUNING: PhysicsTuning = {
   solverIterations: 10,
   internalPgsIterations: 3,
   additionalSolverIterations: 6,
-  bodyLinearDamping: 1.1,
-  bodyAngularDamping: 1.2,
-  rotationStiffness: 1.25,
-  rotationVelocityBlend: 0.92,
-  maxAngularSpeed: 1.0,
+  bodyLinearDamping: 0.75,
+  bodyAngularDamping: 0.55,
+  rotationStiffness: 1.9,
+  rotationVelocityBlend: 0.96,
+  maxAngularSpeed: 1.2,
   pullStiffness: 240,
   pullDamping: 42,
   pullMaxForce: 4200,
   rootMoverStiffnessScale: 0.5,
   rootMoverDampingScale: 1,
-  massScale: 1,
-  contactNaturalFrequency: 18,
-  allowedLinearError: 0.0012,
+  massScale: 0.45,
+  driveStiffnessScale: 1.6,
+  driveDefaultMultiplier: 2.2,
+  contactNaturalFrequency: 14,
+  allowedLinearError: 0.002,
 };
 
 export const DEFAULT_DELTA_MUSH_SETTINGS: DeltaMushSettings = {

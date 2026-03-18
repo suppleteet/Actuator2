@@ -44,6 +44,7 @@ import {
   defaultPresetForActuatorType,
 } from "./runtime/physicsPresets";
 import { resolvePublicAssetUrl } from "./runtime/assetPaths";
+import { saveMeshBlob, getMeshBlob } from "./runtime/meshBlobStorage";
 import {
   integrateImportedMesh,
   loadMeshGeometryForInspection,
@@ -127,6 +128,8 @@ export default function App() {
     }),
     [],
   );
+  /** Resolved blob URLs for imported meshes (survives refresh via IndexedDB). */
+  const [resolvedMeshBlobUrls, setResolvedMeshBlobUrls] = useState<Record<string, string>>({});
   const [importedMeshes, setImportedMeshes] = useState<ImportedMeshDocument[]>(() => [
     {
       id: "mesh_steve",
@@ -147,7 +150,7 @@ export default function App() {
         .map((mesh) => ({
           id: mesh.id,
           format: mesh.format,
-          meshUri: mesh.sourceUri,
+          meshUri: resolvedMeshBlobUrls[mesh.id] ?? mesh.sourceUri,
           colorMapUri:
             mesh.format === "fbx"
               ? (mesh.colorMapUri ?? textureUris.colorMapUri)
@@ -178,7 +181,7 @@ export default function App() {
           upAxis: mesh.upAxis === "Z" ? "Z" : "Y",
           flipNormals: mesh.flipNormals === true,
         })),
-    [importedMeshes, textureUris.colorMapUri, textureUris.normalMapUri, textureUris.roughnessMapUri],
+    [importedMeshes, resolvedMeshBlobUrls, textureUris.colorMapUri, textureUris.normalMapUri, textureUris.roughnessMapUri],
   );
   const [sceneId, setSceneId] = useState("scene_main");
   const [sceneCreatedAtUtc, setSceneCreatedAtUtc] = useState(() => new Date().toISOString());
@@ -750,6 +753,46 @@ export default function App() {
     bakeEndFrameRef.current = bakeEndFrame;
   }, [sceneId, sceneCreatedAtUtc, workflowMode, importedMeshes, bakeStartFrame, bakeEndFrame]);
 
+  // Resolve blob URLs from IndexedDB so imported meshes stick after refresh
+  useEffect(() => {
+    const blobMeshes = importedMeshes.filter((m) => m.sourceUri.startsWith("blob:"));
+    if (blobMeshes.length === 0) {
+      setResolvedMeshBlobUrls((prev) => {
+        if (Object.keys(prev).length === 0) return prev;
+        Object.values(prev).forEach((url) => URL.revokeObjectURL(url));
+        return {};
+      });
+      return;
+    }
+    let cancelled = false;
+    Promise.all(
+      blobMeshes.map(async (mesh) => {
+        try {
+          const blob = await getMeshBlob(mesh.id);
+          return blob ? { id: mesh.id, url: URL.createObjectURL(blob) } : null;
+        } catch {
+          return null;
+        }
+      }),
+    ).then((results) => {
+      if (cancelled) {
+        results.forEach((r) => r?.url && URL.revokeObjectURL(r.url));
+        return;
+      }
+      const next: Record<string, string> = {};
+      results.forEach((r) => {
+        if (r) next[r.id] = r.url;
+      });
+      setResolvedMeshBlobUrls((prev) => {
+        Object.values(prev).forEach((url) => URL.revokeObjectURL(url));
+        return next;
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [importedMeshes]);
+
   // Debug: restore drawn actuators from last session so we don't have to redraw on reload
   useEffect(() => {
     try {
@@ -762,7 +805,9 @@ export default function App() {
       setEditorState(nextState);
       setSceneId(snapshot.sceneId);
       setSceneCreatedAtUtc(snapshot.createdAtUtc);
-      setImportedMeshes(snapshot.importedMeshes);
+      if (snapshot.importedMeshes.length > 0) {
+        setImportedMeshes(snapshot.importedMeshes);
+      }
       setWorkflowMode(snapshot.workflowMode);
       syncCreationIndicesFromState(nextState);
       undoStackRef.current = [];
@@ -1503,6 +1548,11 @@ export default function App() {
       existingIds.add(normalized.mesh.id);
       nextMeshes = integrateImportedMesh(nextMeshes, meshDoc);
       nextMessages.push(`Imported ${file.name} as ${normalized.mesh.id}.`);
+      try {
+        await saveMeshBlob(normalized.mesh.id, file);
+      } catch {
+        // Non-fatal: mesh will still work until refresh
+      }
     }
 
     undoStackRef.current.push({

@@ -493,11 +493,17 @@ export function parseSceneEnvelope(payload: string | unknown, migrators: SceneEn
                   ro && Number.isFinite(Number(ro.x)) && Number.isFinite(Number(ro.y)) && Number.isFinite(Number(ro.z))
                     ? { x: Number(ro.x), y: Number(ro.y), z: Number(ro.z) }
                     : DEFAULT_ROTATION_OFFSET;
+                const sourceUri = String(meshRecord.sourceUri ?? "");
+                const inferredFormat = inferMeshFormatFromPath(sourceUri);
+                const format =
+                  meshRecord.format === "fbx" || meshRecord.format === "glb"
+                    ? meshRecord.format
+                    : inferredFormat;
                 return {
                   id: String(meshRecord.id ?? ""),
-                  format: inferMeshFormatFromPath(String(meshRecord.sourceUri ?? "")),
+                  format,
                   displayName: String(meshRecord.displayName ?? meshRecord.id ?? "mesh"),
-                  sourceUri: String(meshRecord.sourceUri ?? ""),
+                  sourceUri,
                   importedAtUtc: String(meshRecord.importedAtUtc ?? nowUtcIso()),
                   upAxis,
                   importScale,
